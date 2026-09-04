@@ -1,0 +1,182 @@
+diff --git a/sotopia/envs/evaluators.py b/sotopia/envs/evaluators.py
+index d7d9655..0a334a6 100644
+--- a/sotopia/envs/evaluators.py
++++ b/sotopia/envs/evaluators.py
+@@ -205,13 +205,15 @@ class EpisodeLLMEvaluator(Evaluator, Generic[T_eval_dim]):
+             )
+ 
+         try:
+-            # Count actual participating agents (exclude Environment)
+-            participating_agents = set()
+-            if messages:
++            # Count actual participating agents (exclude Environment). Re-eval
++            # paths may pass rendered history only, so accept an explicit hint.
++            num_agents = int(kwargs["num_agents"]) if "num_agents" in kwargs else 0
++            if num_agents <= 0 and messages:
++                participating_agents = set()
+                 for speaker, _ in messages:
+                     if speaker != "Environment":
+                         participating_agents.add(speaker)
+-            num_agents = len(participating_agents)
++                num_agents = len(participating_agents)
+ 
+             # Build explicit agent label instruction to avoid ambiguous dynamic keys in structured output
+             agent_instruction = ""
+@@ -244,6 +246,7 @@ class EpisodeLLMEvaluator(Evaluator, Generic[T_eval_dim]):
+                 ),
+                 temperature=temperature,
+                 structured_output=use_structured_output,
++                bad_output_process_model=self.model_name,
+             )
+             response_list = []
+             # Only process evaluations for the actual number of agents
+@@ -252,16 +255,18 @@ class EpisodeLLMEvaluator(Evaluator, Generic[T_eval_dim]):
+             ):
+                 # Map agent names to expected format (agent_1, agent_2, etc.)
+                 agent_key = f"agent_{i+1}"
+-                for dimension in evaluation.model_dump().keys():
++                for dimension, payload in evaluation.model_dump().items():
++                    if isinstance(payload, dict):
++                        reasoning = payload["reasoning"]
++                        score = payload["score"]
++                    else:
++                        reasoning, score = payload
+                     response_list.append(
+                         (
+                             agent_key,
+                             (
+-                                (
+-                                    dimension,
+-                                    evaluation.model_dump()[dimension][1],
+-                                ),
+-                                evaluation.model_dump()[dimension][0],
++                                (dimension, score),
++                                reasoning,
+                             ),
+                         )
+                     )
+diff --git a/sotopia/generation_utils/generate.py b/sotopia/generation_utils/generate.py
+index 58724c7..fe2b8ce 100644
+--- a/sotopia/generation_utils/generate.py
++++ b/sotopia/generation_utils/generate.py
+@@ -1,5 +1,6 @@
+ import logging
+ import os
++import re
+ from litellm import acompletion
+ from litellm.utils import supports_response_schema
+ from litellm.litellm_core_utils.get_supported_openai_params import (
+@@ -61,6 +62,24 @@ DEFAULT_BAD_OUTPUT_PROCESS_MODEL = "gpt-5-mini-2025-08-07"
+ DEFAULT_TEMPERATURE = 0.7
+ 
+ 
++def _strip_thinking_tags(content: str | None) -> str | None:
++    if content is None:
++        return None
++    cleaned = re.sub(r"(?is)<think>.*?</think>", "", content).strip()
++    fenced = re.search(r"(?is)```(?:json)?\s*(.*?)\s*```", cleaned)
++    if fenced:
++        cleaned = fenced.group(1).strip()
++    starts = [pos for pos in (cleaned.find("{"), cleaned.find("[")) if pos != -1]
++    if starts:
++        start = min(starts)
++        cleaned = cleaned[start:].strip()
++    if cleaned.startswith("{") and "}" in cleaned:
++        cleaned = cleaned[: cleaned.rfind("}") + 1]
++    elif cleaned.startswith("[") and "]" in cleaned:
++        cleaned = cleaned[: cleaned.rfind("]") + 1]
++    return cleaned.strip()
++
++
+ @validate_call
+ async def format_bad_output(
+     ill_formed_output: str,
+@@ -84,21 +103,30 @@ async def format_bad_output(
+         "format_instructions": format_instructions,
+     }
+     content = template.format(**input_values)
++    api_key = None
++    if model_name.startswith("custom"):
++        if "@" in model_name:
++            base_url = model_name.split("@", 1)[1]
++        model_name = model_name.split("@", 1)[0].replace("custom/", "openai/")
++        api_key = os.environ.get("CUSTOM_API_KEY", "EMPTY")
++    elif base_url is not None:
++        api_key = os.environ.get("CUSTOM_API_KEY", "EMPTY")
++
++    completion_kwargs = {
++        "model": model_name,
++        "messages": [{"role": "user", "content": content}],
++        "drop_params": True,
++        "base_url": base_url,
++        "api_key": api_key,
++    }
+     if isinstance(output_parser, PydanticOutputParser):
+-        response_format = _build_json_schema_response_format(
++        completion_kwargs["response_format"] = _build_json_schema_response_format(
+             output_parser.pydantic_object,
+         )
+-        response = await acompletion(
+-            model=model_name,
+-            response_format=response_format,
+-            messages=[{"role": "user", "content": content}],
+-        )
+-    else:
+-        response = await acompletion(
+-            model=model_name,
+-            messages=[{"role": "user", "content": content}],
+-        )
++    response = await acompletion(**completion_kwargs)
+     content = response.choices[0].message.content
++    if isinstance(output_parser, PydanticOutputParser):
++        content = _strip_thinking_tags(content)
+     if content is None:
+         raise ValueError("Response content is None")
+     return content
+@@ -286,6 +314,8 @@ async def agenerate(
+             completion_kwargs["temperature"] = temperature_value
+         response = await acompletion(**completion_kwargs)
+     result = response.choices[0].message.content
++    if isinstance(output_parser, PydanticOutputParser):
++        result = _strip_thinking_tags(result)
+ 
+     # Only PydanticOutputParser supports context parameter
+     parse_kwargs = (
+diff --git a/sotopia/server.py b/sotopia/server.py
+index 6952364..3d9c0e2 100644
+--- a/sotopia/server.py
++++ b/sotopia/server.py
+@@ -195,13 +195,18 @@ async def arun_one_episode(
+                     action = await agents[agent_name].aact(
+                         environment_messages[agent_name]
+                     )
+-                    AgentAction.model_validate(
+-                        action.model_dump(),
+-                        context={
+-                            "agent_names": env.agents,
+-                            "sender": agent_name,
+-                        },
+-                    )
++                    try:
++                        AgentAction.model_validate(
++                            action.model_dump(),
++                            context={
++                                "agent_names": env.agents,
++                                "sender": agent_name,
++                            },
++                        )
++                    except ValueError:
++                        # In a two-agent environment, a public action preserves
++                        # delivery when a local model misspells the recipient.
++                        action = action.model_copy(update={"to": []})
+ 
+                 agent_messages[agent_name] = action
+ 
+@@ -503,6 +508,7 @@ async def aevaluate_one_episode(
+                             turn_number=-1,
+                             history=history,
+                             messages=None,
++                            num_agents=len(episode.agents),
+                         )
+                         for single_evaluator in [evaluator]
+                     ]
