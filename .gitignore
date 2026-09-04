@@ -1,0 +1,13 @@
+/.venv/
+/engine/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+/data/*
+!/data/README.md
+/checkpoints/*
+!/checkpoints/README.md
+/outputs/
+/reports/

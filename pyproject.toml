@@ -1,0 +1,17 @@
+[project]
+name = "talktopia"
+version = "0.1.0"
+description = "A SOTOPIA-based social interaction pipeline"
+requires-python = ">=3.10,<3.13"
+
+[project.scripts]
+talktopia = "talktopia.pipeline:main"
+talktopia-load-profiles = "talktopia.load_geminilight_profiles:main"
+talktopia-models = "talktopia.models.servers:main"
+
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["talktopia*"]
