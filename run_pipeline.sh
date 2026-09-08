@@ -14,7 +14,7 @@ export SOTOPIA_STORAGE_BACKEND="${SOTOPIA_STORAGE_BACKEND:-local}"
 export CUSTOM_API_KEY="${CUSTOM_API_KEY:-EMPTY}"
 
 for arg in "$@"; do
-  if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+  if [[ "$arg" == "--help" || "$arg" == "-h" || "$arg" == "--dry-run" ]]; then
     exec "$PYTHON_BIN" -m talktopia.pipeline "$@"
   fi
 done

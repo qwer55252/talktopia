@@ -1,9 +1,10 @@
-"""Sample SOTOPIA scenarios and run turn-based speech conversations."""
+"""Sample scenarios, run speech conversations, and evaluate saved episodes."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -27,7 +28,9 @@ if TYPE_CHECKING:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     models = default_pipeline_models()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", choices=["all", "sample", "simulate"], default="all")
+    parser.add_argument(
+        "--stage", choices=["all", "sample", "simulate", "reevaluate"], default="all"
+    )
     parser.add_argument(
         "--storage-backend",
         choices=["local", "redis"],
@@ -41,6 +44,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     for role in ("env", "agent1", "agent2"):
         parser.add_argument(f"--{role}-model", default=models[role])
+    parser.add_argument("--evaluator-model", default=models["evaluator"])
+    parser.add_argument(
+        "--episode-json", type=Path, help="One saved EpisodeLog JSON to evaluate."
+    )
+    parser.add_argument("--reeval-tag", default="talktopia_pipeline_reeval")
+    parser.add_argument("--reeval-max-retries", type=int, default=2)
     parser.add_argument(
         "--bad-output-process-model",
         default=models["agent2"],
@@ -65,7 +74,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Write samples only; no inference or DB writes.",
+        help="Prepare samples or evaluation inputs only; no inference or DB writes.",
     )
     speech_options = {
         "asr-base-url": SPEECH_BASE_URL,
@@ -87,9 +96,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.num_envs < 0:
         parser.error("--num-envs must be nonnegative (0 means all)")
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.tag):
-        parser.error("--tag must use letters, digits, dots, underscores or hyphens")
-    if args.stage != "sample" and not args.dry_run:
+    for name in ("tag", "reeval_tag"):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", getattr(args, name)):
+            parser.error(
+                f"--{name.replace('_', '-')} must use letters, digits, dots, underscores or hyphens"
+            )
+    if args.reeval_max_retries < 0:
+        parser.error("--reeval-max-retries must be nonnegative")
+    if args.stage == "reevaluate":
+        if args.episode_json is None:
+            parser.error("--episode-json is required for --stage reevaluate")
+        if args.sample_manifest or args.env_id or args.environment_list_pk:
+            parser.error(
+                "--stage reevaluate uses --episode-json, not sampling selections"
+            )
+        if not args.evaluator_model.strip():
+            parser.error("--evaluator-model must not be blank")
+    elif args.episode_json is not None:
+        parser.error("--episode-json requires --stage reevaluate")
+    if args.stage in {"all", "simulate"} and not args.dry_run:
         for kind in ("asr", "tts"):
             url = urlsplit(getattr(args, f"{kind}_base_url"))
             if (
@@ -109,6 +134,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             if not getattr(args, name.replace("-", "_")).strip():
                 parser.error(f"--{name} must not be blank")
     return args
+
+
+def safe_error(exc: Exception) -> str:
+    message = f"{type(exc).__name__}: {exc}"
+    for name in (
+        "CUSTOM_API_KEY",
+        "OPENAI_API_KEY",
+        "TALKTOPIA_ASR_API_KEY",
+        "TALKTOPIA_TTS_API_KEY",
+    ):
+        secret = os.environ.get(name, "")
+        if secret and secret != "EMPTY":
+            message = message.replace(secret, "[redacted]")
+    return message
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -493,16 +532,12 @@ async def stage_3_simulate(
                 env, agents = build_episode(record, args, asr_client, tts_client)
                 result = await run_one_episode(env, agents, args, run_dir, episode_id)
             except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-                for secret in (asr_key, tts_key, os.environ.get("CUSTOM_API_KEY", "")):
-                    if secret and secret != "EMPTY":
-                        error = error.replace(secret, "[redacted]")
                 result = {
                     "episode_id": episode_id,
                     "status": "failed",
                     "env_id": record["env_id"],
                     "agent_ids": record["agent_ids"],
-                    "error": error,
+                    "error": safe_error(exc),
                     "conversation_audio": None,
                     "evaluation_status": "not_performed",
                 }
@@ -537,6 +572,218 @@ async def stage_3_simulate(
     return 1 if failed else 0
 
 
+async def stage_4_reevaluate_existing(args: argparse.Namespace, run_dir: Path) -> int:
+    from pydantic import Field, field_validator
+    from sotopia.database import EpisodeLog, SotopiaDimensions
+    from sotopia.envs.evaluators import (
+        EpisodeLLMEvaluator,
+        EvaluationForAgents,
+        unweighted_aggregate_evaluate,
+    )
+
+    def specify_agent_keys(schema: dict[str, Any]) -> None:
+        dimension_schema = schema["additionalProperties"]
+        schema.update(
+            properties={key: dimension_schema for key in ("agent_1", "agent_2")},
+            required=["agent_1", "agent_2"],
+            additionalProperties=False,
+        )
+
+    class TwoAgentEvaluation(EvaluationForAgents[SotopiaDimensions]):
+        evaluations: dict[str, SotopiaDimensions] = Field(
+            json_schema_extra=specify_agent_keys
+        )
+
+        @field_validator("evaluations")
+        @classmethod
+        def validate_agents(
+            cls, values: dict[str, SotopiaDimensions]
+        ) -> dict[str, SotopiaDimensions]:
+            if set(values) != {"agent_1", "agent_2"}:
+                raise ValueError("Expected exactly agent_1 and agent_2 evaluations")
+            for evaluation in values.values():
+                if any(
+                    not item["reasoning"].strip()
+                    for item in evaluation.model_dump().values()
+                ):
+                    raise ValueError(
+                        "Every evaluation dimension needs a nonempty reason"
+                    )
+            # The engine iterates dict values; fix their order before it assigns labels.
+            return {key: values[key] for key in ("agent_1", "agent_2")}
+
+    source_path = args.episode_json.expanduser().resolve()
+    summary_path = run_dir / "04_sotopia_eval_reevaluate_existing.json"
+    summary: dict[str, Any] = {
+        "run_id": run_dir.name,
+        "source_episode": str(source_path),
+        "source_sha256": None,
+        "reeval_tag": args.reeval_tag,
+        "evaluator_model": args.evaluator_model,
+        "temperature": 0.0,
+        "max_retries": args.reeval_max_retries,
+        "push_to_db": args.push_to_db,
+        "status": "running",
+        "attempts": 0,
+        "attempt_errors": [],
+        "history": None,
+        "original": None,
+        "readable": None,
+        "episode_pk": None,
+    }
+    write_json(summary_path, summary)
+    try:
+        source_bytes = source_path.read_bytes()
+        summary["source_sha256"] = hashlib.sha256(source_bytes).hexdigest()
+        source = EpisodeLog.model_validate_json(source_bytes)
+        if len(source.agents) != 2 or len(set(source.agents)) != 2:
+            raise ValueError("Evaluation requires two distinct agents")
+        if not source.models or len(source.models) != 3:
+            raise ValueError(
+                "Episode models must contain the environment and two agent models"
+            )
+        if not source.messages or len(source.messages[0]) < 2:
+            raise ValueError("Episode is missing the two initial agent perspectives")
+        profiles, turns = source.render_for_humans()
+        names = [
+            f"{profile.first_name} {profile.last_name}".strip() for profile in profiles
+        ]
+        if len(set(names)) != 2 or any(
+            sender != "Environment" or receiver != names[index]
+            for index, (sender, receiver, _) in enumerate(source.messages[0][:2])
+        ):
+            raise ValueError(
+                "Initial perspectives must match the episode's agent order"
+            )
+        if args.push_to_db and args.reeval_tag == source.tag:
+            raise ValueError(
+                "--reeval-tag must differ from the source tag when saving to DB"
+            )
+        history = "\n".join(turns[:-2])
+        history_path = run_dir / "evaluation/history/episode_0001.txt"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history_path.write_text(history, encoding="utf-8")
+        summary.update(
+            source_tag=source.tag,
+            source_episode_pk=source.pk or None,
+            env_id=source.environment,
+            agent_ids=source.agents,
+            agent_names=names,
+            history=str(history_path.relative_to(run_dir)),
+        )
+        if args.dry_run:
+            summary["status"] = "dry_run"
+            print(
+                "Prepared one episode for evaluation; no inference or DB writes.",
+                flush=True,
+            )
+            return 0
+
+        evaluator = EpisodeLLMEvaluator(
+            model_name=args.evaluator_model, response_format_class=TwoAgentEvaluation
+        )
+        expected = {
+            (agent, dimension)
+            for agent in ("agent_1", "agent_2")
+            for dimension in SotopiaDimensions.model_fields
+        }
+        for attempt in range(1, args.reeval_max_retries + 2):
+            summary["attempts"] = attempt
+            write_json(summary_path, summary)
+            print(
+                f"SOTOPIA evaluation: attempt {attempt}/{args.reeval_max_retries + 1}",
+                flush=True,
+            )
+            try:
+                responses = await evaluator.__acall__(
+                    turn_number=-1,
+                    messages=None,
+                    history=history,
+                    num_agents=2,
+                    temperature=0.0,
+                )
+                if (
+                    len(responses) != len(expected)
+                    or {(agent, dimension) for agent, ((dimension, _), _) in responses}
+                    != expected
+                ):
+                    raise ValueError(
+                        "Evaluator did not return all 14 dimension scores and reasons"
+                    )
+                response = unweighted_aggregate_evaluate(responses)
+                break
+            except Exception as exc:
+                error = safe_error(exc)
+                summary["attempt_errors"].append(error)
+                print(error, file=sys.stderr, flush=True)
+        else:
+            raise RuntimeError(
+                f"SOTOPIA evaluation failed after {summary['attempts']} attempts"
+            )
+
+        evaluated = EpisodeLog(
+            **{
+                **source.model_dump(),
+                "pk": "",
+                "tag": args.reeval_tag,
+                "models": [args.evaluator_model, *source.models[1:]],
+                "rewards": [response.p1_rate, response.p2_rate],
+                "reasoning": response.comments,
+                # The engine does not expose the completed prompt; save history separately.
+                "rewards_prompt": "",
+            }
+        )
+        original_path = run_dir / "evaluation/original/episode_0001.json"
+        readable_path = run_dir / "evaluation/readable/episode_0001.md"
+        lines = [
+            "# SOTOPIA episode evaluation",
+            "",
+            f"Evaluator: {args.evaluator_model}",
+            "",
+            f"| Dimension | {names[0]} (agent1) | {names[1]} (agent2) |",
+            "|---|---:|---:|",
+        ]
+        for dimension in (*SotopiaDimensions.model_fields, "overall_score"):
+            lines.append(
+                f"| {dimension} | {evaluated.rewards[0][1][dimension]:g} | {evaluated.rewards[1][1][dimension]:g} |"
+            )
+        lines.extend(
+            [
+                "",
+                "Overall score is the unweighted mean of the seven original scores; it is not normalized.",
+                "",
+            ]
+        )
+        for index, name in enumerate(names, start=1):
+            lines.extend([f"## {name} (agent{index})", ""])
+            for agent, ((dimension, score), reason) in responses:
+                if agent == f"agent_{index}":
+                    lines.extend([f"### {dimension}: {score}", "", reason.strip(), ""])
+        write_json(original_path, evaluated.model_dump(mode="json"))
+        readable_path.parent.mkdir(parents=True, exist_ok=True)
+        readable_path.write_text("\n".join(lines), encoding="utf-8")
+        if args.push_to_db:
+            evaluated.save()
+            write_json(original_path, evaluated.model_dump(mode="json"))
+        summary.update(
+            status="completed",
+            original=str(original_path.relative_to(run_dir)),
+            readable=str(readable_path.relative_to(run_dir)),
+            episode_pk=evaluated.pk or None,
+        )
+        print("SOTOPIA evaluation: completed (2 agents, 7 dimensions each)", flush=True)
+        return 0
+    except Exception as exc:
+        summary.update(status="failed", error=safe_error(exc))
+        print(summary["error"], file=sys.stderr, flush=True)
+        return 1
+    except BaseException:
+        summary["status"] = "interrupted"
+        raise
+    finally:
+        write_json(summary_path, summary)
+
+
 def run_pipeline(args: argparse.Namespace) -> int:
     # SOTOPIA chooses its database classes at import time.
     os.environ["SOTOPIA_STORAGE_BACKEND"] = args.storage_backend
@@ -545,12 +792,37 @@ def run_pipeline(args: argparse.Namespace) -> int:
     db_path = configure_database(args.storage_backend)
     print(f"Talktopia DB: {db_path}")
     os.environ.setdefault("CUSTOM_API_KEY", "EMPTY")
-    manifest = read_manifest(args.sample_manifest) if args.sample_manifest else None
-    profiles = stage_1_sample_env_profiles(args, manifest)
-    records = stage_2_sample_characters(profiles, args, manifest)
-    run_dir = create_run_directory(args.out_dir, args.tag)
+    if args.stage != "reevaluate":
+        manifest = read_manifest(args.sample_manifest) if args.sample_manifest else None
+        profiles = stage_1_sample_env_profiles(args, manifest)
+        records = stage_2_sample_characters(profiles, args, manifest)
+    run_dir = create_run_directory(
+        args.out_dir, args.reeval_tag if args.stage == "reevaluate" else args.tag
+    )
     print(f"Run started; output: {run_dir}", flush=True)
     try:
+        config = {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        }
+        write_json(
+            run_dir / "run_config.json",
+            {**config, "run_id": run_dir.name},
+        )
+        if not args.dry_run and args.stage != "sample":
+            import gin
+            from sotopia.generation_utils import generate
+
+            generate.DEFAULT_BAD_OUTPUT_PROCESS_MODEL = args.bad_output_process_model
+            gin.parse_config_file(
+                str(
+                    REPO_ROOT / "engine/sotopia_conf/generation_utils_conf/generate.gin"
+                ),
+                skip_unknown=True,
+            )
+        if args.stage == "reevaluate":
+            return asyncio.run(stage_4_reevaluate_existing(args, run_dir))
+
         write_json(
             run_dir / "01_scenarios_and_social_goals.json",
             [
@@ -562,33 +834,11 @@ def run_pipeline(args: argparse.Namespace) -> int:
             ],
         )
         write_json(run_dir / "02_sampled_characters.json", records)
-        config = {
-            key: str(value) if isinstance(value, Path) else value
-            for key, value in vars(args).items()
-        }
-        write_json(
-            run_dir / "run_config.json",
-            {**config, "run_id": run_dir.name},
-        )
         if args.stage == "sample" or args.dry_run:
             print(f"Sampled {len(profiles)} environments and {len(records)} pairs.")
             print("No inference requests or DB writes performed.")
             return 0
 
-        import gin
-        from sotopia.generation_utils import generate
-
-        generate.DEFAULT_BAD_OUTPUT_PROCESS_MODEL = args.bad_output_process_model
-        gin.parse_config_file(
-            str(
-                REPO_ROOT
-                / "engine"
-                / "sotopia_conf"
-                / "generation_utils_conf"
-                / "generate.gin"
-            ),
-            skip_unknown=True,
-        )
         return asyncio.run(stage_3_simulate(records, args, run_dir))
     finally:
         print(f"Run finished; output: {run_dir}", flush=True)
