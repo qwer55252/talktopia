@@ -9,9 +9,11 @@ import os
 import random
 import re
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from talktopia.models.config import REPO_ROOT, SPEECH_BASE_URL, default_pipeline_models
 
@@ -32,7 +34,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("SOTOPIA_STORAGE_BACKEND", "local"),
     )
     parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "outputs")
-    parser.add_argument("--tag", default="talktopia_pipeline")
+    parser.add_argument(
+        "--tag",
+        default="talktopia_pipeline",
+        help="Run label and directory prefix; each run adds a UTC timestamp and unique suffix.",
+    )
     for role in ("env", "agent1", "agent2"):
         parser.add_argument(f"--{role}-model", default=models[role])
     parser.add_argument(
@@ -110,6 +116,19 @@ def write_json(path: Path, value: Any) -> None:
     with path.open("w", encoding="utf-8") as output:
         json.dump(value, output, indent=2, ensure_ascii=False)
         output.write("\n")
+
+
+def create_run_directory(out_dir: Path, tag: str) -> Path:
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    run_id = f"{tag}_{timestamp}_{uuid4().hex[:8]}"
+    run_dir = out_dir.expanduser().resolve() / run_id
+    try:
+        run_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as exc:
+        raise ValueError(
+            f"Output already exists: {run_dir}; nothing was overwritten."
+        ) from exc
+    return run_dir
 
 
 def model_names(args: argparse.Namespace) -> dict[str, str]:
@@ -295,6 +314,7 @@ async def run_one_episode(
     from sotopia.database import EpisodeLog
     from sotopia.messages import AgentAction
     from sotopia.messages.message_classes import ScriptBackground
+    from talktopia.speech_agent import combine_conversation_audio, prepare_tts_text
 
     agents = Agents({agent.agent_name: agent for agent in agent_list})
     observations = env.reset(agents=agents, omniscient=False)
@@ -315,6 +335,7 @@ async def run_one_episode(
     ]
     speech_path = run_dir / "simulation" / "speech" / f"{episode_id}.jsonl"
     speech_path.parent.mkdir(parents=True, exist_ok=True)
+    utterances: list[tuple[Path, int]] = []
     with speech_path.open("x", encoding="utf-8") as speech_output:
         while True:
             actions = {}
@@ -334,38 +355,50 @@ async def run_one_episode(
                     )
                 if action.action_type == "speak":
                     listener = agent_list[1 - index]
-                    filename = f"{env.turn_number + 1:04d}_agent{index + 1}.wav"
-                    wav_path = run_dir / "simulation" / "audio" / episode_id / filename
-                    audio = await agent.synthesize(action.argument)
-                    wav_path.parent.mkdir(parents=True, exist_ok=True)
-                    wav_path.write_bytes(audio)
+                    tts_text = prepare_tts_text(action.argument)
                     speech_record = {
                         "turn": env.turn_number + 1,
                         "speaker": agent.agent_name,
                         "listener": listener.agent_name,
                         "to": action.to,
                         "llm_text": action.argument,
+                        "tts_text": tts_text,
                         "tts_model": agent.tts_model,
                         "voice": agent.voice,
-                        "wav_path": str(wav_path.relative_to(run_dir)),
+                        "wav_path": None,
                         "asr_model": listener.asr_model,
                         "asr_text": None,
                     }
-                    try:
-                        transcript = await listener.transcribe(audio, filename)
-                    except Exception:
-                        speech_record["status"] = "asr_failed"
-                        speech_output.write(
-                            json.dumps(speech_record, ensure_ascii=False) + "\n"
+                    if not tts_text:
+                        speech_record.update(
+                            status="tts_skipped", reason="no_spoken_text"
                         )
-                        speech_output.flush()
-                        raise
-                    speech_record.update(asr_text=transcript, status="completed")
+                        action = AgentAction(action_type="none", argument="", to=[])
+                    else:
+                        filename = f"{env.turn_number + 1:04d}_agent{index + 1}.wav"
+                        wav_path = (
+                            run_dir / "simulation" / "audio" / episode_id / filename
+                        )
+                        audio = await agent.synthesize(tts_text)
+                        wav_path.parent.mkdir(parents=True, exist_ok=True)
+                        wav_path.write_bytes(audio)
+                        speech_record["wav_path"] = str(wav_path.relative_to(run_dir))
+                        try:
+                            transcript = await listener.transcribe(audio, filename)
+                        except Exception:
+                            speech_record["status"] = "asr_failed"
+                            speech_output.write(
+                                json.dumps(speech_record, ensure_ascii=False) + "\n"
+                            )
+                            speech_output.flush()
+                            raise
+                        speech_record.update(asr_text=transcript, status="completed")
+                        utterances.append((wav_path, index))
+                        action = action.model_copy(update={"argument": transcript})
                     speech_output.write(
                         json.dumps(speech_record, ensure_ascii=False) + "\n"
                     )
                     speech_output.flush()
-                    action = action.model_copy(update={"argument": transcript})
                 actions[agent.agent_name] = action
                 messages[-1].append(
                     (agent.agent_name, "Environment", action.to_natural_language())
@@ -381,6 +414,10 @@ async def run_one_episode(
             if all(terminated.values()):
                 break
 
+    conversation_audio = combine_conversation_audio(
+        utterances,
+        run_dir / "simulation" / "audio" / episode_id / "conversation.wav",
+    )
     episode = EpisodeLog(
         environment=env.profile.pk,
         agents=[agent.profile.pk for agent in agent_list],
@@ -410,6 +447,9 @@ async def run_one_episode(
         "original": str(original_path.relative_to(run_dir)),
         "readable": str(readable_path.relative_to(run_dir)),
         "speech": str(speech_path.relative_to(run_dir)),
+        "conversation_audio": (
+            str(conversation_audio.relative_to(run_dir)) if conversation_audio else None
+        ),
     }
 
 
@@ -420,6 +460,7 @@ async def stage_3_simulate(
 
     summary: dict[str, Any] = {
         "tag": args.tag,
+        "run_id": run_dir.name,
         "status": "running",
         "evaluation_status": "not_performed",
         "canonical_text": "asr_transcript",
@@ -462,6 +503,7 @@ async def stage_3_simulate(
                     "env_id": record["env_id"],
                     "agent_ids": record["agent_ids"],
                     "error": error,
+                    "conversation_audio": None,
                     "evaluation_status": "not_performed",
                 }
             print(f"{episode_id}: {result['status']}", flush=True)
@@ -503,50 +545,53 @@ def run_pipeline(args: argparse.Namespace) -> int:
     db_path = configure_database(args.storage_backend)
     print(f"Talktopia DB: {db_path}")
     os.environ.setdefault("CUSTOM_API_KEY", "EMPTY")
-    run_dir = args.out_dir.expanduser().resolve() / args.tag
-    if run_dir.exists():
-        raise ValueError(f"Output already exists: {run_dir}. Choose a new --tag.")
     manifest = read_manifest(args.sample_manifest) if args.sample_manifest else None
     profiles = stage_1_sample_env_profiles(args, manifest)
     records = stage_2_sample_characters(profiles, args, manifest)
-    run_dir.mkdir(parents=True, exist_ok=False)
-    write_json(
-        run_dir / "01_scenarios_and_social_goals.json",
-        [
-            {"env_id": profile.pk, **profile.model_dump(mode="json", exclude={"pk"})}
-            for profile in profiles
-        ],
-    )
-    write_json(run_dir / "02_sampled_characters.json", records)
-    write_json(
-        run_dir / "run_config.json",
-        {
+    run_dir = create_run_directory(args.out_dir, args.tag)
+    print(f"Run started; output: {run_dir}", flush=True)
+    try:
+        write_json(
+            run_dir / "01_scenarios_and_social_goals.json",
+            [
+                {
+                    "env_id": profile.pk,
+                    **profile.model_dump(mode="json", exclude={"pk"}),
+                }
+                for profile in profiles
+            ],
+        )
+        write_json(run_dir / "02_sampled_characters.json", records)
+        config = {
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
-        },
-    )
-    if args.stage == "sample" or args.dry_run:
-        print(
-            f"Sampled {len(profiles)} environments and {len(records)} pairs in {run_dir}."
+        }
+        write_json(
+            run_dir / "run_config.json",
+            {**config, "run_id": run_dir.name},
         )
-        print("No inference requests or DB writes performed.")
-        return 0
+        if args.stage == "sample" or args.dry_run:
+            print(f"Sampled {len(profiles)} environments and {len(records)} pairs.")
+            print("No inference requests or DB writes performed.")
+            return 0
 
-    import gin
-    from sotopia.generation_utils import generate
+        import gin
+        from sotopia.generation_utils import generate
 
-    generate.DEFAULT_BAD_OUTPUT_PROCESS_MODEL = args.bad_output_process_model
-    gin.parse_config_file(
-        str(
-            REPO_ROOT
-            / "engine"
-            / "sotopia_conf"
-            / "generation_utils_conf"
-            / "generate.gin"
-        ),
-        skip_unknown=True,
-    )
-    return asyncio.run(stage_3_simulate(records, args, run_dir))
+        generate.DEFAULT_BAD_OUTPUT_PROCESS_MODEL = args.bad_output_process_model
+        gin.parse_config_file(
+            str(
+                REPO_ROOT
+                / "engine"
+                / "sotopia_conf"
+                / "generation_utils_conf"
+                / "generate.gin"
+            ),
+            skip_unknown=True,
+        )
+        return asyncio.run(stage_3_simulate(records, args, run_dir))
+    finally:
+        print(f"Run finished; output: {run_dir}", flush=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
