@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOTOPIA_DATA_DIR="$HOME/.sotopia/data"
 GEMINILIGHT_DATA_DIR="${TALKTOPIA_GEMINILIGHT_DATA_DIR:-$HOME/.cache/talktopia/geminilight_sotopia_dataset}"
 OLLAMA_MODELS_DIR="${OLLAMA_MODELS:-$HOME/.ollama/models}"
+TALKTOPIA_DATA_DIR="${TALKTOPIA_DB_DIR:-$HOME/.sotopia/talktopia/data}"
 
 link_source() {
   local target="$1"
@@ -21,5 +22,6 @@ link_source() {
 
 echo "Talktopia project sources:"
 link_source "$SOTOPIA_DATA_DIR" "$ROOT/data/sotopia_db"
+link_source "$TALKTOPIA_DATA_DIR" "$ROOT/data/talktopia_db"
 link_source "$GEMINILIGHT_DATA_DIR" "$ROOT/data/geminilight_sotopia_dataset"
 link_source "$OLLAMA_MODELS_DIR" "$ROOT/checkpoints/ollama_models"
