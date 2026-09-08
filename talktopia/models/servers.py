@@ -1,13 +1,16 @@
-from __future__ import annotations
-
 import argparse
+import io
 import json
+import logging
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
+import threading
 import urllib.request
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -23,9 +26,329 @@ from .config import (
     REPO_ROOT,
     RUNTIME_DIR,
     VLLM_ENDPOINTS,
+    SPEECH_BASE_URL,
+    SPEECH_GPU,
+    SPEECH_HOST,
+    SPEECH_PORT,
+    ASR_REPO,
+    ASR_REVISION,
+    TTS_REPO,
+    TTS_REVISION,
     default_ollama_models,
     default_pipeline_models,
 )
+
+from talktopia.task_space import database_path
+
+
+def speech_health() -> dict[str, Any]:
+    data = get_json(f"http://{SPEECH_HOST}:{SPEECH_PORT}/health", timeout=2)
+    if (
+        data.get("service") != "talktopia-speech"
+        or not data.get("ready")
+        or data.get("database") != str(database_path())
+        or data.get("asr_revision") != ASR_REVISION
+        or data.get("tts_revision") != TTS_REVISION
+        or data.get("gpu") != SPEECH_GPU
+    ):
+        raise ValueError(
+            "Incompatible speech service or database at configured speech port"
+        )
+    return data
+
+
+def start_speech(restart: bool = False) -> None:
+    if restart:
+        stop_pidfile(pid_path("speech"))
+    try:
+        get_json(f"http://{SPEECH_HOST}:{SPEECH_PORT}/health", timeout=2)
+    except Exception:
+        try:
+            with socket.create_connection((SPEECH_HOST, SPEECH_PORT), timeout=1):
+                pass
+        except OSError:
+            pass
+        else:
+            raise ValueError(
+                f"Another service occupies speech port {SPEECH_HOST}:{SPEECH_PORT}"
+            )
+    else:
+        speech_health()
+        print(f"speech: already responds at {SPEECH_BASE_URL}")
+        return
+    from talktopia.speech_agent import load_voice_registry
+
+    load_voice_registry(database_path())
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with log_path("speech").open("w") as output:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "talktopia.models.servers", "serve-speech"],
+            cwd=str(REPO_ROOT),
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": SPEECH_GPU},
+            start_new_session=True,
+        )
+    pid_path("speech").write_text(str(process.pid))
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Speech server exited ({process.returncode}); see {log_path('speech')}"
+            )
+        try:
+            speech_health()
+            print(f"speech: started pid={process.pid} url={SPEECH_BASE_URL}")
+            return
+        except Exception:
+            time.sleep(1)
+    raise TimeoutError(f"Speech startup exceeded 300 seconds; see {log_path('speech')}")
+
+
+def prepare_speech_models() -> None:
+    from huggingface_hub import snapshot_download
+
+    for repo, revision in ((ASR_REPO, ASR_REVISION), (TTS_REPO, TTS_REVISION)):
+        # Cached files are reused; missing files from interrupted downloads resume.
+        print(snapshot_download(repo, revision=revision))
+
+
+class SpeechBackend:
+    """One GPU worker, shared inference lock, lazy per-profile voice prompts."""
+
+    def __init__(self, db: Path):
+        from talktopia.speech_agent import load_voice_registry
+
+        self.voices = load_voice_registry(db)
+        self.lock = threading.Lock()
+        self.prompts: dict[str, Any] = {}
+        import numpy as np
+        import torch
+        from faster_whisper import WhisperModel
+        from huggingface_hub import snapshot_download
+        from omnivoice import OmniVoice
+        from scipy.signal import resample_poly
+        from silero_vad import get_speech_timestamps, load_silero_vad
+
+        self.np, self.torch = np, torch
+        self.resample_poly = resample_poly
+        self.get_speech_timestamps = get_speech_timestamps
+        self.vad = load_silero_vad(onnx=True)
+        self.asr = WhisperModel(
+            snapshot_download(ASR_REPO, revision=ASR_REVISION, local_files_only=True),
+            device="cuda",
+            device_index=0,
+            compute_type="float16",
+            local_files_only=True,
+        )
+        self.tts = OmniVoice.from_pretrained(
+            snapshot_download(TTS_REPO, revision=TTS_REVISION, local_files_only=True),
+            device_map="cuda:0",
+            dtype=torch.float16,
+            local_files_only=True,
+        )
+        if int(self.tts.sampling_rate) != 24000:
+            raise ValueError("OmniVoice must return 24000 Hz audio")
+
+    def synthesize(self, text: str, voice_id: str) -> bytes:
+        voice = self.voices[voice_id]
+        with self.lock:
+            if voice_id not in self.prompts:
+                self.prompts[voice_id] = self.tts.create_voice_clone_prompt(
+                    ref_audio=str(voice["wav_path"]),
+                    ref_text=voice["voice_reference_text"],
+                )
+            audio = self.tts.generate(
+                text=text,
+                language="English",
+                voice_clone_prompt=self.prompts[voice_id],
+            )[0]
+            samples = self.np.asarray(audio, dtype=self.np.float32).reshape(-1)
+            if not len(samples) or not self.np.isfinite(samples).all():
+                raise RuntimeError("OmniVoice returned empty or non-finite audio")
+            pcm = (self.np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
+        result = io.BytesIO()
+        with wave.open(result, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(24000)
+            wav.writeframes(pcm)
+        return result.getvalue()
+
+    def transcribe(self, audio: bytes) -> str:
+        from math import gcd
+        from talktopia.speech_agent import read_pcm_wav
+
+        pcm, rate = read_pcm_wav(audio)
+        with self.lock:
+            samples = (
+                self.np.frombuffer(pcm, dtype="<i2").astype(self.np.float32) / 32768
+            )
+            if rate != 16000:
+                divisor = gcd(rate, 16000)
+                samples = self.resample_poly(
+                    samples, 16000 // divisor, rate // divisor
+                ).astype(self.np.float32)
+            timestamps = self.get_speech_timestamps(
+                self.torch.from_numpy(samples),
+                self.vad,
+                sampling_rate=16000,
+                min_speech_duration_ms=100,
+                min_silence_duration_ms=100,
+                speech_pad_ms=30,
+            )
+            if not timestamps:
+                return ""
+            samples = self.np.concatenate(
+                [samples[item["start"] : item["end"]] for item in timestamps]
+            )
+            segments, _ = self.asr.transcribe(
+                samples,
+                language="en",
+                beam_size=1,
+                best_of=1,
+                condition_on_previous_text=False,
+                vad_filter=False,
+            )
+            return " ".join(segment.text.strip() for segment in segments).strip()
+
+
+def create_speech_app(backend: Any = None, db: Path | None = None) -> Any:
+    # Management commands do not need to import the application or load models.
+    from contextlib import asynccontextmanager
+    from fastapi import FastAPI, HTTPException, Request
+    from fastapi.responses import Response
+    from starlette.concurrency import run_in_threadpool
+    from talktopia.speech_agent import read_pcm_wav
+
+    db = db or database_path()
+
+    @asynccontextmanager
+    async def lifespan(app):
+        app.state.backend = backend or await run_in_threadpool(SpeechBackend, db)
+        yield
+
+    app = FastAPI(title="Talktopia speech API", lifespan=lifespan)
+
+    def worker():
+        value = getattr(app.state, "backend", None)
+        if value is None:
+            raise HTTPException(503, "Speech models are not ready")
+        return value
+
+    @app.get("/health")
+    async def health():
+        value = worker()
+        return dict(
+            service="talktopia-speech",
+            ready=True,
+            database=str(db),
+            gpu=SPEECH_GPU,
+            voices=len(value.voices),
+            asr_model=ASR_REPO,
+            asr_revision=ASR_REVISION,
+            tts_model=TTS_REPO,
+            tts_revision=TTS_REVISION,
+        )
+
+    @app.get("/v1/models")
+    async def models():
+        worker()
+        return {
+            "object": "list",
+            "data": [
+                dict(id=name, object="model", created=0, owned_by="talktopia")
+                for name in ("whisper-1", "tts-1")
+            ],
+        }
+
+    async def inference(function, *args):
+        try:
+            return await run_in_threadpool(function, *args)
+        except Exception as exc:
+            logging.exception("Speech inference failed")
+            raise HTTPException(500, "Speech inference failed; see speech.log") from exc
+
+    @app.post("/v1/audio/speech")
+    async def speech(request: Request):
+        value = worker()
+        try:
+            data = await request.json()
+        except ValueError as exc:
+            raise HTTPException(400, "Expected a JSON object") from exc
+        if not isinstance(data, dict):
+            raise HTTPException(400, "Expected a JSON object")
+        if (
+            data.get("model") != "tts-1"
+            or data.get("response_format", "wav") != "wav"
+            or data.get("speed", 1) != 1
+        ):
+            raise HTTPException(
+                400, "Supported: model=tts-1, response_format=wav, speed=1"
+            )
+        voice, text = data.get("voice"), data.get("input")
+        if not isinstance(voice, str) or voice not in value.voices:
+            raise HTTPException(400, "Unknown profile voice_id")
+        if not isinstance(text, str) or not text.strip():
+            raise HTTPException(400, "input must contain text")
+        audio = await inference(value.synthesize, text.strip(), voice)
+        return Response(content=audio, media_type="audio/wav")
+
+    @app.post("/v1/audio/transcriptions")
+    async def transcriptions(request: Request):
+        value = worker()
+        async with request.form() as form:
+            if (
+                form.get("model") != "whisper-1"
+                or form.get("language", "en") != "en"
+                or form.get("response_format", "json") != "json"
+                or "prompt" in form
+            ):
+                raise HTTPException(
+                    400,
+                    "Supported: model=whisper-1, language=en, response_format=json, no prompt",
+                )
+            upload = form.get("file")
+            if not hasattr(upload, "read"):
+                raise HTTPException(400, "file must be a WAV upload")
+            audio = await upload.read(20 * 1024 * 1024 + 1)
+        if len(audio) > 20 * 1024 * 1024:
+            raise HTTPException(413, "WAV upload exceeds 20 MiB")
+        try:
+            read_pcm_wav(audio)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"text": await inference(value.transcribe, audio)}
+
+    return app
+
+
+def serve_speech() -> None:
+    # Set CUDA library lookup before importing torch/ctranslate2 or loading models.
+    import site
+
+    libraries = [
+        str(path)
+        for root in site.getsitepackages()
+        for path in Path(root).glob("nvidia/*/lib")
+    ]
+    if os.environ.get("TALKTOPIA_SPEECH_CUDA_READY") != "1":
+        env = {
+            **os.environ,
+            "TALKTOPIA_SPEECH_CUDA_READY": "1",
+            "CUDA_VISIBLE_DEVICES": SPEECH_GPU,
+            "LD_LIBRARY_PATH": ":".join(
+                libraries + [os.environ.get("LD_LIBRARY_PATH", "")]
+            ),
+        }
+        os.execve(
+            sys.executable,
+            [sys.executable, "-m", "talktopia.models.servers", "serve-speech"],
+            env,
+        )
+    import uvicorn
+
+    uvicorn.run(create_speech_app(), host=SPEECH_HOST, port=SPEECH_PORT)
 
 
 def pid_path(name: str) -> Path:
@@ -208,19 +531,35 @@ def assert_required_models() -> None:
 
 
 def start(restart: bool = False) -> None:
-    for name in OLLAMA_ENDPOINTS:
-        start_ollama(name, restart=restart)
-    assert_required_models()
-    start_proxy(restart=restart)
+    if restart:
+        stop()
+    names = [*OLLAMA_ENDPOINTS, "proxy", "speech"]
+    previous = {name: read_pid(pid_path(name)) for name in names}
+    try:
+        for name in OLLAMA_ENDPOINTS:
+            start_ollama(name, restart=False)
+        assert_required_models()
+        start_proxy(restart=False)
+        start_speech(restart=False)
+    except BaseException:
+        for name in reversed(names):
+            if read_pid(pid_path(name)) != previous[name]:
+                stop_pidfile(pid_path(name))
+        raise
     print(
         json.dumps(
-            {"proxy": PROXY_BASE_URL, "pipeline_models": default_pipeline_models()},
+            {
+                "proxy": PROXY_BASE_URL,
+                "speech": SPEECH_BASE_URL,
+                "pipeline_models": default_pipeline_models(),
+            },
             indent=2,
         )
     )
 
 
 def stop() -> None:
+    stop_pidfile(pid_path("speech"))
     stop_pidfile(pid_path("proxy"))
     for name in OLLAMA_ENDPOINTS:
         stop_pidfile(pid_path(name))
@@ -236,6 +575,13 @@ def status() -> None:
             return False
 
     payload = {
+        "speech": {
+            "url": SPEECH_BASE_URL,
+            "gpu": SPEECH_GPU,
+            "pid": read_pid(pid_path("speech")),
+            "alive": is_alive(read_pid(pid_path("speech"))),
+            "responds": responds(f"http://{SPEECH_HOST}:{SPEECH_PORT}/health"),
+        },
         "proxy": {
             "url": PROXY_BASE_URL,
             "pid": read_pid(pid_path("proxy")),
@@ -248,6 +594,10 @@ def status() -> None:
         "aliases": MODEL_ALIASES,
         "available_models": sorted(available_model_names()),
     }
+    try:
+        payload["speech"].update(compatible=True, health=speech_health())
+    except Exception:
+        payload["speech"]["compatible"] = False
     for name, endpoint in OLLAMA_ENDPOINTS.items():
         payload["ollama"][name] = {
             "url": endpoint["url"],
@@ -268,7 +618,17 @@ def status() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Manage talktopia local model API.")
-    parser.add_argument("command", choices=["start", "stop", "restart", "status"])
+    parser.add_argument(
+        "command",
+        choices=[
+            "start",
+            "stop",
+            "restart",
+            "status",
+            "serve-speech",
+            "prepare-speech-models",
+        ],
+    )
     args = parser.parse_args()
 
     if args.command == "start":
@@ -279,6 +639,10 @@ def main() -> None:
         stop()
     elif args.command == "status":
         status()
+    elif args.command == "serve-speech":
+        serve_speech()
+    elif args.command == "prepare-speech-models":
+        prepare_speech_models()
 
 
 if __name__ == "__main__":

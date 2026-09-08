@@ -2,7 +2,7 @@
 name = "talktopia"
 version = "0.1.0"
 description = "A SOTOPIA-based social interaction pipeline"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
 
 [project.scripts]
 talktopia = "talktopia.pipeline:main"

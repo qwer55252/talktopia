@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) echo "Usage: ./install.sh (Python 3.12; includes speech models)"; exit 0 ;;
+    *) echo "Unknown option: $arg" >&2; exit 1 ;;
+  esac
+done
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE_DIR="$ROOT/engine"
 VENV_DIR="${TALKTOPIA_VENV:-$ROOT/.venv}"
@@ -10,7 +17,7 @@ REQUIREMENTS_LOCK="$ROOT/requirements.lock"
 source "$ROOT/engine.lock"
 
 command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
-BOOTSTRAP_PYTHON="${TALKTOPIA_BOOTSTRAP_PYTHON:-python3}"
+BOOTSTRAP_PYTHON="${TALKTOPIA_BOOTSTRAP_PYTHON:-python3.12}"
 
 if [[ ! -e "$ENGINE_DIR" ]]; then
   git init -q "$ENGINE_DIR"
@@ -48,30 +55,17 @@ if [[ -n "${TALKTOPIA_PYTHON:-}" ]]; then
   fi
 elif [[ -x "$VENV_DIR/bin/python" ]] && "$VENV_DIR/bin/python" -m pip --version >/dev/null 2>&1; then
   PYTHON_BIN="$VENV_DIR/bin/python"
+elif [[ -e "$VENV_DIR" ]]; then
+  echo "$VENV_DIR exists but is not a usable Python environment; it was not changed." >&2
+  echo "Back it up before creating a replacement." >&2
+  exit 1
 else
-  command -v "$BOOTSTRAP_PYTHON" >/dev/null || {
-    echo "$BOOTSTRAP_PYTHON is required" >&2
-    exit 1
-  }
-
-  VENV_EXISTED=0
-  if [[ -e "$VENV_DIR" ]]; then
-    VENV_EXISTED=1
-  fi
-
-  if "$BOOTSTRAP_PYTHON" -c 'import sys; assert (3, 10) <= sys.version_info[:2] < (3, 13)' \
-    && "$BOOTSTRAP_PYTHON" -m venv "$VENV_DIR" >/dev/null 2>&1; then
+  if command -v "$BOOTSTRAP_PYTHON" >/dev/null \
+    && "$BOOTSTRAP_PYTHON" -c 'import sys, venv, ensurepip; assert sys.version_info[:2] == (3, 12)' >/dev/null 2>&1; then
+    "$BOOTSTRAP_PYTHON" -m venv "$VENV_DIR"
     PYTHON_BIN="$VENV_DIR/bin/python"
   else
-    if [[ "$VENV_EXISTED" -eq 1 ]]; then
-      echo "$VENV_DIR exists but is not a usable Python environment" >&2
-      exit 1
-    fi
-    if [[ -e "$VENV_DIR" ]]; then
-      rm -rf -- "$VENV_DIR"
-    fi
-
-    echo "Standard venv unavailable; using Conda for Python 3.11"
+    echo "Python 3.12 venv unavailable; using Conda for Python 3.12"
     CONDA_BIN="${CONDA_EXE:-}"
     if [[ -z "$CONDA_BIN" ]]; then
       CONDA_BIN="$(command -v conda 2>/dev/null || true)"
@@ -84,16 +78,16 @@ else
     fi
     if [[ -z "$CONDA_BIN" ]]; then
       echo "Could not create a venv and Conda was not found." >&2
-      echo "Install python3-venv or set TALKTOPIA_PYTHON to a Python 3.10-3.12 executable." >&2
+      echo "Install Python 3.12 with venv support, or set TALKTOPIA_PYTHON to a prepared Python 3.12 environment." >&2
       exit 1
     fi
-    "$CONDA_BIN" create --quiet -y -p "$VENV_DIR" python=3.11 pip
+    "$CONDA_BIN" create --quiet -y -p "$VENV_DIR" python=3.12 pip
     PYTHON_BIN="$VENV_DIR/bin/python"
   fi
   "$PYTHON_BIN" -m pip install --quiet --upgrade pip
 fi
 
-"$PYTHON_BIN" -c 'import sys; assert (3, 10) <= sys.version_info[:2] < (3, 13), "Python 3.10-3.12 is required"'
+"$PYTHON_BIN" -c 'import sys; assert sys.version_info[:2] == (3, 12), "Python 3.12 is required. Back up an older environment before replacing it."'
 "$PYTHON_BIN" -m pip install --quiet -r "$REQUIREMENTS_LOCK"
 "$PYTHON_BIN" -m pip install --quiet --no-deps -e "$ENGINE_DIR"
 "$PYTHON_BIN" -m pip install --quiet --no-deps -e "$ROOT"
@@ -111,6 +105,8 @@ case "$TALKTOPIA_PATH" in
 esac
 
 "$ROOT/link_sources.sh"
+
+"$PYTHON_BIN" -m talktopia.models.servers prepare-speech-models
 
 echo
 echo "Talktopia installation complete"

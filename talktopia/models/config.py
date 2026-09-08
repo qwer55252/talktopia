@@ -11,6 +11,14 @@ RUNTIME_DIR = HOME / ".sotopia" / "talktopia_models"
 PROXY_HOST = os.environ.get("TALKTOPIA_MODEL_PROXY_HOST", "127.0.0.1")
 PROXY_PORT = int(os.environ.get("TALKTOPIA_MODEL_PROXY_PORT", "18084"))
 PROXY_BASE_URL = f"http://{PROXY_HOST}:{PROXY_PORT}/v1"
+SPEECH_HOST = os.environ.get("TALKTOPIA_SPEECH_HOST", "127.0.0.1")
+SPEECH_PORT = int(os.environ.get("TALKTOPIA_SPEECH_PORT", "18086"))
+SPEECH_BASE_URL = f"http://{SPEECH_HOST}:{SPEECH_PORT}/v1"
+SPEECH_GPU = os.environ.get("TALKTOPIA_SPEECH_GPU", "1")
+ASR_REPO = "Systran/faster-whisper-small.en"
+ASR_REVISION = "d1d751a5f8271d482d14ca55d9e2deeebbae577f"
+TTS_REPO = "k2-fsa/OmniVoice"
+TTS_REVISION = "c5fdb5ccb189668d56333f77ba2629f4cd7535f4"
 OLLAMA_NUM_PARALLEL = int(os.environ.get("OLLAMA_NUM_PARALLEL", "2"))
 OLLAMA_CONTEXT_LENGTH = int(os.environ.get("OLLAMA_CONTEXT_LENGTH", "32768"))
 
