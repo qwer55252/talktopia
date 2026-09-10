@@ -1,5 +1,4 @@
 import argparse
-import io
 import json
 import logging
 import os
@@ -8,9 +7,7 @@ import socket
 import subprocess
 import sys
 import time
-import threading
 import urllib.request
-import wave
 from pathlib import Path
 from typing import Any
 
@@ -30,79 +27,128 @@ from .config import (
     SPEECH_GPU,
     SPEECH_HOST,
     SPEECH_PORT,
+    SPEECH_ENDPOINTS,
+    TTS_BATCH_SIZE,
+    speech_url,
     ASR_REPO,
     ASR_REVISION,
     TTS_REPO,
     TTS_REVISION,
     default_ollama_models,
     default_pipeline_models,
+    local_alias,
 )
 
 from talktopia.task_space import database_path
 
 
-def speech_health() -> dict[str, Any]:
-    data = get_json(f"http://{SPEECH_HOST}:{SPEECH_PORT}/health", timeout=2)
+def speech_spec(endpoint: str | None = None) -> dict[str, Any]:
+    endpoint = endpoint or f"gpu{SPEECH_GPU}"
+    spec = SPEECH_ENDPOINTS[endpoint]
+    name = "speech" if endpoint == f"gpu{SPEECH_GPU}" else f"speech-{endpoint}"
+    return {**spec, "name": name, "worker": endpoint}
+
+
+def speech_health(
+    endpoint: str | None = None, *, require_ready: bool = True
+) -> dict[str, Any]:
+    spec = speech_spec(endpoint)
+    data = get_json(f"http://{spec['host']}:{spec['port']}/health", timeout=2)
     if (
         data.get("service") != "talktopia-speech"
-        or not data.get("ready")
         or data.get("database") != str(database_path())
         or data.get("asr_revision") != ASR_REVISION
         or data.get("tts_revision") != TTS_REVISION
-        or data.get("gpu") != SPEECH_GPU
+        or data.get("gpu") != spec["gpu"]
+        or data.get("tts_batch_size") != TTS_BATCH_SIZE
+        or data.get("worker") != spec["worker"]
     ):
         raise ValueError(
             "Incompatible speech service or database at configured speech port"
         )
+    if require_ready and not data.get("ready"):
+        raise RuntimeError(f"{spec['worker']}: speech backend is not ready")
     return data
 
 
-def start_speech(restart: bool = False) -> None:
+def start_speech(restart: bool = False, endpoint: str | None = None) -> None:
+    spec = speech_spec(endpoint)
+    host, port, name = spec["host"], spec["port"], spec["name"]
+    url = f"http://{host}:{port}/v1"
     if restart:
-        stop_pidfile(pid_path("speech"))
+        stop_pidfile(pid_path(name))
     try:
-        get_json(f"http://{SPEECH_HOST}:{SPEECH_PORT}/health", timeout=2)
+        get_json(f"http://{host}:{port}/health", timeout=2)
     except Exception:
         try:
-            with socket.create_connection((SPEECH_HOST, SPEECH_PORT), timeout=1):
+            with socket.create_connection((host, port), timeout=1):
                 pass
         except OSError:
             pass
         else:
-            raise ValueError(
-                f"Another service occupies speech port {SPEECH_HOST}:{SPEECH_PORT}"
-            )
+            raise ValueError(f"Another service occupies speech port {host}:{port}")
     else:
-        speech_health()
-        print(f"speech: already responds at {SPEECH_BASE_URL}")
+        speech_health(endpoint)
+        print(f"{name}: already responds at {url}")
         return
     from talktopia.speech_agent import load_voice_registry
 
     load_voice_registry(database_path())
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    with log_path("speech").open("w") as output:
+    with log_path(name).open("a") as output:
         process = subprocess.Popen(
             [sys.executable, "-m", "talktopia.models.servers", "serve-speech"],
             cwd=str(REPO_ROOT),
             stdout=output,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "CUDA_VISIBLE_DEVICES": SPEECH_GPU},
+            env={
+                **os.environ,
+                "CUDA_VISIBLE_DEVICES": spec["gpu"],
+                "TALKTOPIA_SPEECH_GPU": spec["gpu"],
+                "TALKTOPIA_SPEECH_HOST": host,
+                "TALKTOPIA_SPEECH_PORT": str(port),
+                "TALKTOPIA_SPEECH_WORKER": spec["worker"],
+            },
             start_new_session=True,
         )
-    pid_path("speech").write_text(str(process.pid))
-    deadline = time.monotonic() + 300
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(
-                f"Speech server exited ({process.returncode}); see {log_path('speech')}"
-            )
-        try:
-            speech_health()
-            print(f"speech: started pid={process.pid} url={SPEECH_BASE_URL}")
-            return
-        except Exception:
-            time.sleep(1)
-    raise TimeoutError(f"Speech startup exceeded 300 seconds; see {log_path('speech')}")
+    pid_path(name).write_text(str(process.pid))
+    try:
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"Speech server exited ({process.returncode}); see {log_path(name)}"
+                )
+            try:
+                speech_health(endpoint)
+                print(f"{name}: started pid={process.pid} url={url}")
+                return
+            except Exception:
+                time.sleep(1)
+        raise TimeoutError(f"Speech startup exceeded 300 seconds; see {log_path(name)}")
+    except BaseException:
+        if read_pid(pid_path(name)) == process.pid:
+            stop_pidfile(pid_path(name))
+        raise
+
+
+def ensure_speech_ready(endpoint: str) -> bool:
+    """Called only while the pipeline holds this worker's episode lock."""
+    try:
+        health = speech_health(endpoint, require_ready=False)
+        # A just-finished HTTP call may precede the batch's final bookkeeping.
+        if health.get("ready") and not health.get("idle", False):
+            time.sleep(0.1)
+            health = speech_health(endpoint, require_ready=False)
+        if health.get("ready") and health.get("idle", False):
+            return False
+    except ValueError:
+        # Never replace a different application or database on this port.
+        raise
+    except (OSError, RuntimeError):
+        pass
+    start_speech(restart=True, endpoint=endpoint)
+    return True
 
 
 def prepare_speech_models() -> None:
@@ -113,122 +159,27 @@ def prepare_speech_models() -> None:
         print(snapshot_download(repo, revision=revision))
 
 
-class SpeechBackend:
-    """One GPU worker, shared inference lock, lazy per-profile voice prompts."""
-
-    def __init__(self, db: Path):
-        from talktopia.speech_agent import load_voice_registry
-
-        self.voices = load_voice_registry(db)
-        self.lock = threading.Lock()
-        self.prompts: dict[str, Any] = {}
-        import numpy as np
-        import torch
-        from faster_whisper import WhisperModel
-        from huggingface_hub import snapshot_download
-        from omnivoice import OmniVoice
-        from scipy.signal import resample_poly
-        from silero_vad import get_speech_timestamps, load_silero_vad
-
-        self.np, self.torch = np, torch
-        self.resample_poly = resample_poly
-        self.get_speech_timestamps = get_speech_timestamps
-        self.vad = load_silero_vad(onnx=True)
-        self.asr = WhisperModel(
-            snapshot_download(ASR_REPO, revision=ASR_REVISION, local_files_only=True),
-            device="cuda",
-            device_index=0,
-            compute_type="float16",
-            local_files_only=True,
-        )
-        self.tts = OmniVoice.from_pretrained(
-            snapshot_download(TTS_REPO, revision=TTS_REVISION, local_files_only=True),
-            device_map="cuda:0",
-            dtype=torch.float16,
-            local_files_only=True,
-        )
-        if int(self.tts.sampling_rate) != 24000:
-            raise ValueError("OmniVoice must return 24000 Hz audio")
-
-    def synthesize(self, text: str, voice_id: str) -> bytes:
-        voice = self.voices[voice_id]
-        with self.lock:
-            if voice_id not in self.prompts:
-                self.prompts[voice_id] = self.tts.create_voice_clone_prompt(
-                    ref_audio=str(voice["wav_path"]),
-                    ref_text=voice["voice_reference_text"],
-                )
-            audio = self.tts.generate(
-                text=text,
-                language="English",
-                voice_clone_prompt=self.prompts[voice_id],
-            )[0]
-            samples = self.np.asarray(audio, dtype=self.np.float32).reshape(-1)
-            if not len(samples) or not self.np.isfinite(samples).all():
-                raise RuntimeError("OmniVoice returned empty or non-finite audio")
-            pcm = (self.np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
-        result = io.BytesIO()
-        with wave.open(result, "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(24000)
-            wav.writeframes(pcm)
-        return result.getvalue()
-
-    def transcribe(self, audio: bytes) -> str:
-        from math import gcd
-        from talktopia.speech_agent import read_pcm_wav
-
-        pcm, rate = read_pcm_wav(audio)
-        with self.lock:
-            samples = (
-                self.np.frombuffer(pcm, dtype="<i2").astype(self.np.float32) / 32768
-            )
-            if rate != 16000:
-                divisor = gcd(rate, 16000)
-                samples = self.resample_poly(
-                    samples, 16000 // divisor, rate // divisor
-                ).astype(self.np.float32)
-            timestamps = self.get_speech_timestamps(
-                self.torch.from_numpy(samples),
-                self.vad,
-                sampling_rate=16000,
-                min_speech_duration_ms=100,
-                min_silence_duration_ms=100,
-                speech_pad_ms=30,
-            )
-            if not timestamps:
-                return ""
-            samples = self.np.concatenate(
-                [samples[item["start"] : item["end"]] for item in timestamps]
-            )
-            segments, _ = self.asr.transcribe(
-                samples,
-                language="en",
-                beam_size=1,
-                best_of=1,
-                condition_on_previous_text=False,
-                vad_filter=False,
-            )
-            return " ".join(segment.text.strip() for segment in segments).strip()
-
-
 def create_speech_app(backend: Any = None, db: Path | None = None) -> Any:
     # Management commands do not need to import the application or load models.
     from contextlib import asynccontextmanager
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import Response
     from starlette.concurrency import run_in_threadpool
-    from talktopia.speech_agent import read_pcm_wav
+    from talktopia.speech_agent import read_pcm_wav, SpeechBackend
 
     db = db or database_path()
 
     @asynccontextmanager
     async def lifespan(app):
         app.state.backend = backend or await run_in_threadpool(SpeechBackend, db)
-        yield
+        try:
+            yield
+        finally:
+            if hasattr(app.state.backend, "close"):
+                await run_in_threadpool(app.state.backend.close)
 
     app = FastAPI(title="Talktopia speech API", lifespan=lifespan)
+    app.state.inference_requests = 0
 
     def worker():
         value = getattr(app.state, "backend", None)
@@ -239,9 +190,20 @@ def create_speech_app(backend: Any = None, db: Path | None = None) -> Any:
     @app.get("/health")
     async def health():
         value = worker()
+        queued = value.requests.qsize() if hasattr(value, "requests") else 0
+        active = getattr(value, "tts_active_requests", 0)
         return dict(
             service="talktopia-speech",
-            ready=True,
+            ready=not getattr(value, "fatal_error", None)
+            and not getattr(value, "closed", False),
+            idle=app.state.inference_requests == 0 and active == 0 and queued == 0,
+            active_requests=app.state.inference_requests,
+            tts_active_requests=active,
+            worker=os.environ.get("TALKTOPIA_SPEECH_WORKER", f"gpu{SPEECH_GPU}"),
+            error=getattr(value, "fatal_error", None),
+            tts_batch_size=getattr(value, "batch_size", TTS_BATCH_SIZE),
+            tts_metrics=dict(getattr(value, "metrics", {})),
+            tts_queue_size=queued,
             database=str(db),
             gpu=SPEECH_GPU,
             voices=len(value.voices),
@@ -263,11 +225,23 @@ def create_speech_app(backend: Any = None, db: Path | None = None) -> Any:
         }
 
     async def inference(function, *args):
+        app.state.inference_requests += 1
         try:
             return await run_in_threadpool(function, *args)
+        except TimeoutError as exc:
+            logging.exception("Speech inference timed out")
+            raise HTTPException(
+                504,
+                "Speech inference timed out; see speech.log",
+                headers={"x-should-retry": "false"},
+            ) from exc
         except Exception as exc:
+            if "out of memory" in str(exc).lower() or "cuda error" in str(exc).lower():
+                worker().fatal_error = f"Speech GPU failed: {type(exc).__name__}"
             logging.exception("Speech inference failed")
             raise HTTPException(500, "Speech inference failed; see speech.log") from exc
+        finally:
+            app.state.inference_requests -= 1
 
     @app.post("/v1/audio/speech")
     async def speech(request: Request):
@@ -348,6 +322,9 @@ def serve_speech() -> None:
         )
     import uvicorn
 
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     uvicorn.run(create_speech_app(), host=SPEECH_HOST, port=SPEECH_PORT)
 
 
@@ -367,11 +344,12 @@ def read_pid(path: Path) -> int | None:
 
 
 def is_alive(pid: int | None) -> bool:
-    if pid is None:
+    if pid is None or pid <= 1:
         return False
     try:
         os.kill(pid, 0)
-        return True
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        return state not in {"Z", "X"}
     except OSError:
         return False
 
@@ -382,6 +360,53 @@ def stop_pidfile(path: Path) -> None:
         path.unlink(missing_ok=True)
         return
     assert pid is not None
+    try:
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except FileNotFoundError:
+        path.unlink(missing_ok=True)
+        return
+    if path.stem.startswith("speech"):
+        owned = b"talktopia.models.servers" in command and b"serve-speech" in command
+    elif path.stem == "proxy":
+        owned = b"talktopia.models.ollama_proxy" in command
+    else:
+        owned = (
+            bool(command)
+            and Path(os.fsdecode(command[0])).name == "ollama"
+            and b"serve" in command
+        )
+    if not owned:
+        raise ValueError(
+            f"Refusing to stop PID {pid}: command does not match managed service {path.stem}"
+        )
+    if path.stem.startswith("speech"):
+        specs = [speech_spec(key) for key in SPEECH_ENDPOINTS]
+        spec = next((spec for spec in specs if spec["name"] == path.stem), None)
+        try:
+            environment = dict(
+                entry.split(b"=", 1)
+                for entry in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+                if b"=" in entry
+            )
+        except FileNotFoundError:
+            path.unlink(missing_ok=True)
+            return
+        expected = (
+            {}
+            if spec is None
+            else {
+                "TALKTOPIA_SPEECH_GPU": str(spec["gpu"]),
+                "TALKTOPIA_SPEECH_HOST": spec["host"],
+                "TALKTOPIA_SPEECH_PORT": str(spec["port"]),
+            }
+        )
+        if not expected or any(
+            environment.get(key.encode()) != value.encode()
+            for key, value in expected.items()
+        ):
+            raise ValueError(
+                f"Refusing to stop PID {pid}: speech worker identity differs for {path.stem}"
+            )
     try:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -402,6 +427,33 @@ def stop_pidfile(path: Path) -> None:
 def get_json(url: str, timeout: float = 3) -> dict[str, Any]:
     with urllib.request.urlopen(url, timeout=timeout) as response:
         return json.load(response)
+
+
+def release_worker_models(args, *, keep_models: list[str]) -> None:
+    """Unload only this worker's selected models which the next phase does not use."""
+    if not getattr(args, "worker_gpu", None):
+        return
+
+    all_models = {
+        MODEL_ALIASES[local_alias(value)]["model"]
+        for value in (
+            args.agent1_model,
+            args.agent2_model,
+            args.evaluator_model,
+            args.bad_output_process_model,
+        )
+    }
+    keep = {MODEL_ALIASES[local_alias(value)]["model"] for value in keep_models}
+    url = OLLAMA_ENDPOINTS[args.worker_gpu]["url"]
+    loaded = {item["name"] for item in get_json(f"{url}/api/ps").get("models", [])}
+    for name in sorted((loaded & all_models) - keep):
+        request = urllib.request.Request(
+            f"{url}/api/generate",
+            data=json.dumps(dict(model=name, keep_alive=0)).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response.read()
 
 
 def wait_json(url: str, timeout: int = 120) -> dict[str, Any]:
@@ -437,10 +489,12 @@ def start_ollama(name: str, restart: bool) -> None:
 
     try:
         wait_json(f"{endpoint['url']}/api/tags", timeout=2)
-        print(f"{name}: Ollama already responds at {endpoint['url']}")
-        return
     except Exception:
         pass
+    else:
+        validate_ollama_settings(name)
+        print(f"{name}: Ollama already responds at {endpoint['url']}")
+        return
 
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     env = {
@@ -462,6 +516,35 @@ def start_ollama(name: str, restart: bool) -> None:
     pid_path(name).write_text(str(process.pid))
     wait_json(f"{endpoint['url']}/api/tags", timeout=120)
     print(f"{name}: started Ollama pid={process.pid} url={endpoint['url']}")
+
+
+def validate_ollama_settings(name: str) -> None:
+    """Never label an already-running server with settings it did not start with."""
+    pid = read_pid(pid_path(name))
+    try:
+        data = Path(f"/proc/{pid}/environ").read_bytes()
+        environment = dict(
+            entry.split(b"=", 1) for entry in data.split(b"\0") if b"=" in entry
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"{name}: responding Ollama has no readable managed PID; cannot verify its settings"
+        ) from exc
+    expected = {
+        "OLLAMA_NUM_PARALLEL": str(OLLAMA_NUM_PARALLEL),
+        "OLLAMA_CONTEXT_LENGTH": str(OLLAMA_CONTEXT_LENGTH),
+        "CUDA_VISIBLE_DEVICES": OLLAMA_ENDPOINTS[name]["gpu"],
+        "OLLAMA_HOST": OLLAMA_ENDPOINTS[name]["host"],
+    }
+    mismatched = [
+        key
+        for key, value in expected.items()
+        if environment.get(key.encode()) != value.encode()
+    ]
+    if mismatched:
+        raise ValueError(
+            f"{name}: running settings differ for {', '.join(mismatched)}; restart the managed servers with the intended settings"
+        )
 
 
 def start_proxy(restart: bool) -> None:
@@ -533,14 +616,19 @@ def assert_required_models() -> None:
 def start(restart: bool = False) -> None:
     if restart:
         stop()
-    names = [*OLLAMA_ENDPOINTS, "proxy", "speech"]
+    names = [
+        *OLLAMA_ENDPOINTS,
+        "proxy",
+        *[speech_spec(key)["name"] for key in SPEECH_ENDPOINTS],
+    ]
     previous = {name: read_pid(pid_path(name)) for name in names}
     try:
         for name in OLLAMA_ENDPOINTS:
             start_ollama(name, restart=False)
         assert_required_models()
         start_proxy(restart=False)
-        start_speech(restart=False)
+        for endpoint in SPEECH_ENDPOINTS:
+            start_speech(restart=False, endpoint=endpoint)
     except BaseException:
         for name in reversed(names):
             if read_pid(pid_path(name)) != previous[name]:
@@ -559,7 +647,8 @@ def start(restart: bool = False) -> None:
 
 
 def stop() -> None:
-    stop_pidfile(pid_path("speech"))
+    for endpoint in SPEECH_ENDPOINTS:
+        stop_pidfile(pid_path(speech_spec(endpoint)["name"]))
     stop_pidfile(pid_path("proxy"))
     for name in OLLAMA_ENDPOINTS:
         stop_pidfile(pid_path(name))
@@ -575,6 +664,7 @@ def status() -> None:
             return False
 
     payload = {
+        "speech_workers": {},
         "speech": {
             "url": SPEECH_BASE_URL,
             "gpu": SPEECH_GPU,
@@ -606,6 +696,16 @@ def status() -> None:
             "alive": is_alive(read_pid(pid_path(name))),
             "responds": responds(f"{endpoint['url']}/api/tags"),
         }
+    for name in SPEECH_ENDPOINTS:
+        spec = speech_spec(name)
+        row = dict(
+            url=speech_url(name), gpu=spec["gpu"], pid=read_pid(pid_path(spec["name"]))
+        )
+        try:
+            row.update(compatible=True, health=speech_health(name))
+        except Exception as exc:
+            row.update(compatible=False, error=str(exc))
+        payload["speech_workers"][name] = row
     for name, endpoint in VLLM_ENDPOINTS.items():
         payload["vllm"][name] = {
             "url": endpoint["url"],
