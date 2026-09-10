@@ -4,19 +4,52 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 import random
 import re
+import signal
+import shutil
+import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 from urllib.parse import urlsplit
-from uuid import uuid4
 
-from talktopia.models.config import REPO_ROOT, SPEECH_BASE_URL, default_pipeline_models
+from talktopia import evaluation
+from talktopia import utils
+from talktopia.utils import (
+    completed_result,
+    configure_generation,
+    create_run_directory,
+    file_hash,
+    input_fingerprints,
+    lock_run,
+    read_manifest,
+    result_artifacts,
+    safe_error,
+    save_run_config,
+    validate_run_inputs,
+    write_json,
+)
+from talktopia.models.config import (
+    REPO_ROOT,
+    SPEECH_BASE_URL,
+    default_pipeline_models,
+    MODEL_ALIASES,
+    OLLAMA_ENDPOINTS,
+    SPEECH_ENDPOINTS,
+    OLLAMA_NUM_PARALLEL,
+    OLLAMA_CONTEXT_LENGTH,
+    TTS_BATCH_SIZE,
+    SPEECH_WORKERS_PER_GPU,
+    speech_worker_keys,
+    local_alias,
+    model_on_gpu,
+    speech_url,
+)
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
@@ -27,7 +60,8 @@ if TYPE_CHECKING:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     models = default_pipeline_models()
-    parser = argparse.ArgumentParser(description=__doc__)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument(
         "--stage", choices=["all", "sample", "simulate", "reevaluate"], default="all"
     )
@@ -44,12 +78,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     for role in ("env", "agent1", "agent2"):
         parser.add_argument(f"--{role}-model", default=models[role])
-    parser.add_argument("--evaluator-model", default=models["evaluator"])
     parser.add_argument(
-        "--episode-json", type=Path, help="One saved EpisodeLog JSON to evaluate."
+        "--agent1-models",
+        nargs="+",
+        help="Local aliases for matrix rows; requires --agent2-models.",
     )
-    parser.add_argument("--reeval-tag", default="talktopia_pipeline_reeval")
-    parser.add_argument("--reeval-max-retries", type=int, default=2)
+    parser.add_argument(
+        "--agent2-models",
+        nargs="+",
+        help="Local aliases for matrix columns; same-model pairs are included.",
+    )
+    parser.add_argument(
+        "--worker-gpu", choices=list(OLLAMA_ENDPOINTS), help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--resume-run",
+        type=Path,
+        help="Resume saved settings and unfinished episodes only.",
+    )
+    parser.add_argument(
+        "--episode-limit",
+        type=int,
+        default=0,
+        help="Maximum unfinished episodes to run this invocation; 0 means all.",
+    )
+    parser.add_argument(
+        "--use-stored-combos",
+        action="store_true",
+        help="Use stored character pairs instead of sampling new pairs.",
+    )
     parser.add_argument(
         "--bad-output-process-model",
         default=models["agent2"],
@@ -86,7 +143,58 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     for name, default in speech_options.items():
         env_name = "TALKTOPIA_" + name.replace("-", "_").upper()
         parser.add_argument(f"--{name}", default=os.environ.get(env_name, default))
+    evaluation.add_arguments(parser, models)
     args = parser.parse_args(argv)
+    if args.episode_limit < 0:
+        parser.error("--episode-limit must be nonnegative")
+    if args.resume_run:
+        allowed = {
+            "--resume-run",
+            "--episode-limit",
+            "--dry-run",
+            "--evaluate-after-simulation",
+            "--no-evaluate-after-simulation",
+        }
+        if any(
+            token.split("=", 1)[0] not in allowed
+            for token in argv
+            if token.startswith("-")
+        ):
+            parser.error(
+                "--resume-run only accepts --episode-limit, --dry-run and the automatic evaluation switch; experiment settings are loaded from the saved run"
+            )
+        return args
+    if bool(args.agent1_models) != bool(args.agent2_models):
+        parser.error("--agent1-models and --agent2-models must be supplied together")
+    if args.agent1_models:
+        if args.stage == "reevaluate" or args.worker_gpu or args.push_to_db:
+            parser.error(
+                "Matrix mode requires sampling/simulation, no --worker-gpu and no --push-to-db"
+            )
+        if any(
+            token.split("=", 1)[0] in {"--agent1-model", "--agent2-model"}
+            for token in argv
+        ):
+            parser.error(
+                "Model lists cannot be combined with singular agent model options"
+            )
+        try:
+            for role in ("agent1", "agent2"):
+                aliases = [
+                    local_alias(name) for name in getattr(args, f"{role}_models")
+                ]
+                tags = [MODEL_ALIASES[name]["model"] for name in aliases]
+                if len(set(tags)) != len(tags) or any(
+                    MODEL_ALIASES[name]["role"] != "agent" for name in aliases
+                ):
+                    raise ValueError(
+                        "Each agent list must contain distinct agent models"
+                    )
+                setattr(args, f"{role}_models", aliases)
+            local_alias(args.env_model)
+            local_alias(args.bad_output_process_model)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.storage_backend != "local":
         parser.error(
             "Talktopia requires --storage-backend local; Redis is not supported"
@@ -96,24 +204,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.num_envs < 0:
         parser.error("--num-envs must be nonnegative (0 means all)")
-    for name in ("tag", "reeval_tag"):
+    for name in ("tag",):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", getattr(args, name)):
             parser.error(
                 f"--{name.replace('_', '-')} must use letters, digits, dots, underscores or hyphens"
             )
-    if args.reeval_max_retries < 0:
-        parser.error("--reeval-max-retries must be nonnegative")
-    if args.stage == "reevaluate":
-        if args.episode_json is None:
-            parser.error("--episode-json is required for --stage reevaluate")
-        if args.sample_manifest or args.env_id or args.environment_list_pk:
-            parser.error(
-                "--stage reevaluate uses --episode-json, not sampling selections"
-            )
-        if not args.evaluator_model.strip():
-            parser.error("--evaluator-model must not be blank")
-    elif args.episode_json is not None:
-        parser.error("--episode-json requires --stage reevaluate")
+    evaluation.validate_arguments(parser, args)
+    if args.use_stored_combos and args.sample_manifest:
+        parser.error("--use-stored-combos and --sample-manifest cannot be combined")
     if args.stage in {"all", "simulate"} and not args.dry_run:
         for kind in ("asr", "tts"):
             url = urlsplit(getattr(args, f"{kind}_base_url"))
@@ -136,40 +234,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def safe_error(exc: Exception) -> str:
-    message = f"{type(exc).__name__}: {exc}"
-    for name in (
-        "CUSTOM_API_KEY",
-        "OPENAI_API_KEY",
-        "TALKTOPIA_ASR_API_KEY",
-        "TALKTOPIA_TTS_API_KEY",
-    ):
-        secret = os.environ.get(name, "")
-        if secret and secret != "EMPTY":
-            message = message.replace(secret, "[redacted]")
-    return message
-
-
-def write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as output:
-        json.dump(value, output, indent=2, ensure_ascii=False)
-        output.write("\n")
-
-
-def create_run_directory(out_dir: Path, tag: str) -> Path:
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    run_id = f"{tag}_{timestamp}_{uuid4().hex[:8]}"
-    run_dir = out_dir.expanduser().resolve() / run_id
-    try:
-        run_dir.mkdir(parents=True, exist_ok=False)
-    except FileExistsError as exc:
-        raise ValueError(
-            f"Output already exists: {run_dir}; nothing was overwritten."
-        ) from exc
-    return run_dir
-
-
 def model_names(args: argparse.Namespace) -> dict[str, str]:
     return {
         role: getattr(args, f"{role}_model") for role in ("env", "agent1", "agent2")
@@ -189,27 +253,6 @@ def env_params(args: argparse.Namespace) -> dict[str, Any]:
         ],
         "terminal_evaluators": [],
     }
-
-
-def read_manifest(path: Path) -> list[dict[str, Any]]:
-    records = json.loads(path.expanduser().read_text(encoding="utf-8"))
-    if not isinstance(records, list) or not records:
-        raise ValueError("Sample manifest must contain a nonempty list")
-    for index, record in enumerate(records, start=1):
-        if not isinstance(record, dict) or not isinstance(record.get("env_id"), str):
-            raise ValueError(f"Manifest record {index} must have an env_id string")
-        agent_ids = record.get("agent_ids")
-        if (
-            not record["env_id"]
-            or not isinstance(agent_ids, list)
-            or len(agent_ids) != 2
-            or not all(isinstance(pk, str) and pk for pk in agent_ids)
-            or agent_ids[0] == agent_ids[1]
-        ):
-            raise ValueError(
-                f"Manifest record {index} needs an env_id and two distinct agent_ids"
-            )
-    return records
 
 
 def stage_1_sample_env_profiles(
@@ -281,6 +324,33 @@ def stage_2_sample_characters(
         for record in manifest:
             profiles = [AgentProfile.get(pk) for pk in record["agent_ids"]]
             add_record(environments[record["env_id"]], profiles)
+            for key in ("episode_id", "combo_id"):
+                if key in record:
+                    records[-1][key] = record[key]
+        return records
+
+    if args.use_stored_combos:
+        from sotopia.database import EnvAgentComboStorage
+
+        combos = sorted(
+            EnvAgentComboStorage.all(), key=lambda combo: (combo.env_id, combo.pk)
+        )
+        for env in sorted(env_profiles, key=lambda profile: profile.pk):
+            selected = [combo for combo in combos if combo.env_id == env.pk]
+            if len(selected) < args.pairs_per_env:
+                raise ValueError(
+                    f"Environment {env.pk} has {len(selected)} stored combos; requested {args.pairs_per_env}"
+                )
+            for combo in selected[: args.pairs_per_env]:
+                if len(combo.agent_ids) != 2 or len(set(combo.agent_ids)) != 2:
+                    raise ValueError(f"Invalid stored combo {combo.pk}")
+                add_record(env, [AgentProfile.get(pk) for pk in combo.agent_ids])
+                records[-1]["combo_id"] = combo.pk
+        if len({(row["env_id"], tuple(row["agent_ids"])) for row in records}) != len(
+            records
+        ):
+            raise ValueError("Stored combos contain duplicate environment/agent pairs")
+        random.Random(args.seed).shuffle(records)
         return records
 
     # SOTOPIA's sampler uses the module RNG; limit its seed to synchronous sampling.
@@ -310,6 +380,7 @@ def build_episode(
     args: argparse.Namespace,
     asr_client: AsyncOpenAI,
     tts_client: AsyncOpenAI,
+    tts_semaphore: asyncio.Semaphore | None = None,
 ) -> tuple[ParallelSotopiaEnv, list[CascadedSpeechAgent]]:
     from sotopia.database import EnvironmentProfile
     from sotopia.envs import ParallelSotopiaEnv
@@ -324,6 +395,7 @@ def build_episode(
             model_name=getattr(args, f"agent{index}_model"),
             asr_client=asr_client,
             tts_client=tts_client,
+            tts_semaphore=tts_semaphore,
             asr_model=args.asr_model,
             tts_model=args.tts_model,
             asr_language=args.asr_language,
@@ -348,6 +420,8 @@ async def run_one_episode(
     args: argparse.Namespace,
     run_dir: Path,
     episode_id: str,
+    *,
+    artifact_dir: Path | None = None,
 ) -> dict[str, Any]:
     from sotopia.agents import Agents
     from sotopia.database import EpisodeLog
@@ -372,7 +446,8 @@ async def run_one_episode(
             for name, obs in observations.items()
         ]
     ]
-    speech_path = run_dir / "simulation" / "speech" / f"{episode_id}.jsonl"
+    artifact_dir = artifact_dir or run_dir
+    speech_path = artifact_dir / "simulation" / "speech" / f"{episode_id}.jsonl"
     speech_path.parent.mkdir(parents=True, exist_ok=True)
     utterances: list[tuple[Path, int]] = []
     with speech_path.open("x", encoding="utf-8") as speech_output:
@@ -416,7 +491,11 @@ async def run_one_episode(
                     else:
                         filename = f"{env.turn_number + 1:04d}_agent{index + 1}.wav"
                         wav_path = (
-                            run_dir / "simulation" / "audio" / episode_id / filename
+                            artifact_dir
+                            / "simulation"
+                            / "audio"
+                            / episode_id
+                            / filename
                         )
                         audio = await agent.synthesize(tts_text)
                         wav_path.parent.mkdir(parents=True, exist_ok=True)
@@ -455,7 +534,7 @@ async def run_one_episode(
 
     conversation_audio = combine_conversation_audio(
         utterances,
-        run_dir / "simulation" / "audio" / episode_id / "conversation.wav",
+        artifact_dir / "simulation" / "audio" / episode_id / "conversation.wav",
     )
     episode = EpisodeLog(
         environment=env.profile.pk,
@@ -467,8 +546,8 @@ async def run_one_episode(
         reasoning="Not evaluated. " + info[agent_list[0].agent_name]["comments"],
         rewards=[0.0, 0.0],
     )
-    original_path = run_dir / "simulation" / "original" / f"{episode_id}.json"
-    readable_path = run_dir / "simulation" / "readable" / f"{episode_id}.md"
+    original_path = artifact_dir / "simulation" / "original" / f"{episode_id}.json"
+    readable_path = artifact_dir / "simulation" / "readable" / f"{episode_id}.md"
     write_json(original_path, episode.model_dump(mode="json"))
     readable_path.parent.mkdir(parents=True, exist_ok=True)
     readable_path.write_text(episode_markdown(episode), encoding="utf-8")
@@ -492,21 +571,87 @@ async def run_one_episode(
     }
 
 
+async def run_simulation_batch(
+    records, args, run_dir, runner, *, concurrency_limit=None
+) -> int:
+    concurrency = args.batch_size
+    if concurrency_limit is not None:
+        concurrency = min(concurrency, concurrency_limit)
+    return await utils.run_episode_batch(
+        records,
+        args,
+        run_dir,
+        "simulation",
+        runner,
+        summary_path=run_dir / "03_simulation.json",
+        initial_summary={
+            "tag": args.tag,
+            "evaluation_status": "not_performed",
+            "canonical_text": "asr_transcript",
+        },
+        concurrency=concurrency,
+        max_attempts=3,
+        validate_artifacts=result_artifacts,
+        error_fields={"conversation_audio": None, "evaluation_status": "not_performed"},
+        attempt_fields=("speech_worker",),
+    )
+
+
+def prepare_simulation_run(args, run_dir, db_path, records=None):
+    manifest_path = run_dir / "02_sampled_characters.json"
+    if args.resume_run:
+        if args.stage == "sample":
+            raise ValueError("Resume requires a simulation or batch evaluation run")
+        validate_run_inputs(run_dir, db_path, manifest_path)
+        return read_manifest(manifest_path)
+    write_json(manifest_path, records)
+    save_run_config(args, run_dir, db_path, manifest_path)
+    return records
+
+
+def matrix_report(run_dir: Path, state: dict) -> None:
+    pairs = []
+    for pair in state["pairs"]:
+        row = {
+            key: pair.get(key)
+            for key in (
+                "pair_id",
+                "agent1_model",
+                "agent2_model",
+                "gpu",
+                "status",
+                "run_dir",
+                "error",
+            )
+        }
+        row.update(
+            simulation_total=state["episodes_per_pair"],
+            simulation_completed=0,
+            simulation_failed=0,
+        )
+        if pair.get("run_dir"):
+            sim_path = Path(pair["run_dir"]) / "03_simulation.json"
+            if sim_path.exists():
+                sim = json.loads(sim_path.read_text())
+                row.update(
+                    simulation_completed=sim["completed"],
+                    simulation_failed=sim["failed"],
+                    simulation_wall_seconds=sim.get("wall_seconds", 0),
+                )
+        pairs.append(row)
+    evaluation.write_matrix_report(run_dir, state, pairs)
+
+
 async def stage_3_simulate(
     records: Sequence[dict[str, Any]], args: argparse.Namespace, run_dir: Path
 ) -> int:
     from openai import AsyncOpenAI
+    from talktopia.speech_agent import SpeechServerPool
 
-    summary: dict[str, Any] = {
-        "tag": args.tag,
-        "run_id": run_dir.name,
-        "status": "running",
-        "evaluation_status": "not_performed",
-        "canonical_text": "asr_transcript",
-        "episodes": [],
-    }
-    summary_path = run_dir / "03_simulation.json"
-    write_json(summary_path, summary)
+    records = [
+        {**record, "episode_id": record.get("episode_id", f"episode_{index:04d}")}
+        for index, record in enumerate(records, start=1)
+    ]
     asr_key = (
         os.environ.get("TALKTOPIA_ASR_API_KEY")
         or os.environ.get("OPENAI_API_KEY")
@@ -517,274 +662,74 @@ async def stage_3_simulate(
         or os.environ.get("OPENAI_API_KEY")
         or "EMPTY"
     )
+    if args.worker_gpu:
+        workers = speech_worker_keys(args.worker_gpu)
+    elif args.asr_base_url == args.tts_base_url == SPEECH_BASE_URL:
+        workers = speech_worker_keys()
+    else:
+        workers = []  # Explicit external APIs retain their configured routing.
+    if workers:
+        pool = SpeechServerPool(workers)
+
+        async def run(record, artifact_dir, result_path):
+            async with pool.lease(record["episode_id"]) as (worker, url):
+                record["speech_worker"] = worker
+                async with (
+                    AsyncOpenAI(
+                        base_url=url, api_key=asr_key, timeout=120, max_retries=0
+                    ) as asr_client,
+                    AsyncOpenAI(
+                        base_url=url, api_key=tts_key, timeout=120, max_retries=0
+                    ) as tts_client,
+                ):
+                    env, agents = build_episode(record, args, asr_client, tts_client)
+                    return await run_one_episode(
+                        env,
+                        agents,
+                        args,
+                        run_dir,
+                        record["episode_id"],
+                        artifact_dir=artifact_dir,
+                    )
+
+        return await run_simulation_batch(
+            records, args, run_dir, run, concurrency_limit=len(workers)
+        )
     async with (
         AsyncOpenAI(
             base_url=args.asr_base_url, api_key=asr_key, timeout=120, max_retries=2
         ) as asr_client,
         AsyncOpenAI(
-            base_url=args.tts_base_url, api_key=tts_key, timeout=120, max_retries=2
+            base_url=args.tts_base_url, api_key=tts_key, timeout=120, max_retries=0
         ) as tts_client,
     ):
+        # Wait here, before the HTTP timeout starts, instead of filling the TTS
+        # server queue with more requests than it can generate in one batch.
+        tts_semaphore = asyncio.Semaphore(TTS_BATCH_SIZE)
 
-        async def run(index: int, record: dict[str, Any]) -> dict[str, Any]:
-            episode_id = f"episode_{index:04d}"
-            try:
-                env, agents = build_episode(record, args, asr_client, tts_client)
-                result = await run_one_episode(env, agents, args, run_dir, episode_id)
-            except Exception as exc:
-                result = {
-                    "episode_id": episode_id,
-                    "status": "failed",
-                    "env_id": record["env_id"],
-                    "agent_ids": record["agent_ids"],
-                    "error": safe_error(exc),
-                    "conversation_audio": None,
-                    "evaluation_status": "not_performed",
-                }
-            print(f"{episode_id}: {result['status']}", flush=True)
-            if result["status"] == "failed":
-                print(result["error"], file=sys.stderr, flush=True)
-            return result
-
-        try:
-            for start in range(0, len(records), args.batch_size):
-                results = await asyncio.gather(
-                    *[
-                        run(index, record)
-                        for index, record in enumerate(
-                            records[start : start + args.batch_size], start=start + 1
-                        )
-                    ]
-                )
-                summary["episodes"].extend(results)
-                write_json(summary_path, summary)
-        except BaseException:
-            summary["status"] = "interrupted"
-            write_json(summary_path, summary)
-            raise
-    failed = sum(result["status"] == "failed" for result in summary["episodes"])
-    summary.update(
-        status="failed" if failed else "completed",
-        failed=failed,
-        completed=len(records) - failed,
-    )
-    write_json(summary_path, summary)
-    return 1 if failed else 0
-
-
-async def stage_4_reevaluate_existing(args: argparse.Namespace, run_dir: Path) -> int:
-    from pydantic import Field, field_validator
-    from sotopia.database import EpisodeLog, SotopiaDimensions
-    from sotopia.envs.evaluators import (
-        EpisodeLLMEvaluator,
-        EvaluationForAgents,
-        unweighted_aggregate_evaluate,
-    )
-
-    def specify_agent_keys(schema: dict[str, Any]) -> None:
-        dimension_schema = schema["additionalProperties"]
-        schema.update(
-            properties={key: dimension_schema for key in ("agent_1", "agent_2")},
-            required=["agent_1", "agent_2"],
-            additionalProperties=False,
-        )
-
-    class TwoAgentEvaluation(EvaluationForAgents[SotopiaDimensions]):
-        evaluations: dict[str, SotopiaDimensions] = Field(
-            json_schema_extra=specify_agent_keys
-        )
-
-        @field_validator("evaluations")
-        @classmethod
-        def validate_agents(
-            cls, values: dict[str, SotopiaDimensions]
-        ) -> dict[str, SotopiaDimensions]:
-            if set(values) != {"agent_1", "agent_2"}:
-                raise ValueError("Expected exactly agent_1 and agent_2 evaluations")
-            for evaluation in values.values():
-                if any(
-                    not item["reasoning"].strip()
-                    for item in evaluation.model_dump().values()
-                ):
-                    raise ValueError(
-                        "Every evaluation dimension needs a nonempty reason"
-                    )
-            # The engine iterates dict values; fix their order before it assigns labels.
-            return {key: values[key] for key in ("agent_1", "agent_2")}
-
-    source_path = args.episode_json.expanduser().resolve()
-    summary_path = run_dir / "04_sotopia_eval_reevaluate_existing.json"
-    summary: dict[str, Any] = {
-        "run_id": run_dir.name,
-        "source_episode": str(source_path),
-        "source_sha256": None,
-        "reeval_tag": args.reeval_tag,
-        "evaluator_model": args.evaluator_model,
-        "temperature": 0.0,
-        "max_retries": args.reeval_max_retries,
-        "push_to_db": args.push_to_db,
-        "status": "running",
-        "attempts": 0,
-        "attempt_errors": [],
-        "history": None,
-        "original": None,
-        "readable": None,
-        "episode_pk": None,
-    }
-    write_json(summary_path, summary)
-    try:
-        source_bytes = source_path.read_bytes()
-        summary["source_sha256"] = hashlib.sha256(source_bytes).hexdigest()
-        source = EpisodeLog.model_validate_json(source_bytes)
-        if len(source.agents) != 2 or len(set(source.agents)) != 2:
-            raise ValueError("Evaluation requires two distinct agents")
-        if not source.models or len(source.models) != 3:
-            raise ValueError(
-                "Episode models must contain the environment and two agent models"
+        async def run(record, artifact_dir, result_path):
+            env, agents = build_episode(
+                record, args, asr_client, tts_client, tts_semaphore
             )
-        if not source.messages or len(source.messages[0]) < 2:
-            raise ValueError("Episode is missing the two initial agent perspectives")
-        profiles, turns = source.render_for_humans()
-        names = [
-            f"{profile.first_name} {profile.last_name}".strip() for profile in profiles
-        ]
-        if len(set(names)) != 2 or any(
-            sender != "Environment" or receiver != names[index]
-            for index, (sender, receiver, _) in enumerate(source.messages[0][:2])
-        ):
-            raise ValueError(
-                "Initial perspectives must match the episode's agent order"
-            )
-        if args.push_to_db and args.reeval_tag == source.tag:
-            raise ValueError(
-                "--reeval-tag must differ from the source tag when saving to DB"
-            )
-        history = "\n".join(turns[:-2])
-        history_path = run_dir / "evaluation/history/episode_0001.txt"
-        history_path.parent.mkdir(parents=True, exist_ok=True)
-        history_path.write_text(history, encoding="utf-8")
-        summary.update(
-            source_tag=source.tag,
-            source_episode_pk=source.pk or None,
-            env_id=source.environment,
-            agent_ids=source.agents,
-            agent_names=names,
-            history=str(history_path.relative_to(run_dir)),
-        )
-        if args.dry_run:
-            summary["status"] = "dry_run"
-            print(
-                "Prepared one episode for evaluation; no inference or DB writes.",
-                flush=True,
-            )
-            return 0
-
-        evaluator = EpisodeLLMEvaluator(
-            model_name=args.evaluator_model, response_format_class=TwoAgentEvaluation
-        )
-        expected = {
-            (agent, dimension)
-            for agent in ("agent_1", "agent_2")
-            for dimension in SotopiaDimensions.model_fields
-        }
-        for attempt in range(1, args.reeval_max_retries + 2):
-            summary["attempts"] = attempt
-            write_json(summary_path, summary)
-            print(
-                f"SOTOPIA evaluation: attempt {attempt}/{args.reeval_max_retries + 1}",
-                flush=True,
-            )
-            try:
-                responses = await evaluator.__acall__(
-                    turn_number=-1,
-                    messages=None,
-                    history=history,
-                    num_agents=2,
-                    temperature=0.0,
-                )
-                if (
-                    len(responses) != len(expected)
-                    or {(agent, dimension) for agent, ((dimension, _), _) in responses}
-                    != expected
-                ):
-                    raise ValueError(
-                        "Evaluator did not return all 14 dimension scores and reasons"
-                    )
-                response = unweighted_aggregate_evaluate(responses)
-                break
-            except Exception as exc:
-                error = safe_error(exc)
-                summary["attempt_errors"].append(error)
-                print(error, file=sys.stderr, flush=True)
-        else:
-            raise RuntimeError(
-                f"SOTOPIA evaluation failed after {summary['attempts']} attempts"
+            return await run_one_episode(
+                env,
+                agents,
+                args,
+                run_dir,
+                record["episode_id"],
+                artifact_dir=artifact_dir,
             )
 
-        evaluated = EpisodeLog(
-            **{
-                **source.model_dump(),
-                "pk": "",
-                "tag": args.reeval_tag,
-                "models": [args.evaluator_model, *source.models[1:]],
-                "rewards": [response.p1_rate, response.p2_rate],
-                "reasoning": response.comments,
-                # The engine does not expose the completed prompt; save history separately.
-                "rewards_prompt": "",
-            }
-        )
-        original_path = run_dir / "evaluation/original/episode_0001.json"
-        readable_path = run_dir / "evaluation/readable/episode_0001.md"
-        lines = [
-            "# SOTOPIA episode evaluation",
-            "",
-            f"Evaluator: {args.evaluator_model}",
-            "",
-            f"| Dimension | {names[0]} (agent1) | {names[1]} (agent2) |",
-            "|---|---:|---:|",
-        ]
-        for dimension in (*SotopiaDimensions.model_fields, "overall_score"):
-            lines.append(
-                f"| {dimension} | {evaluated.rewards[0][1][dimension]:g} | {evaluated.rewards[1][1][dimension]:g} |"
-            )
-        lines.extend(
-            [
-                "",
-                "Overall score is the unweighted mean of the seven original scores; it is not normalized.",
-                "",
-            ]
-        )
-        for index, name in enumerate(names, start=1):
-            lines.extend([f"## {name} (agent{index})", ""])
-            for agent, ((dimension, score), reason) in responses:
-                if agent == f"agent_{index}":
-                    lines.extend([f"### {dimension}: {score}", "", reason.strip(), ""])
-        write_json(original_path, evaluated.model_dump(mode="json"))
-        readable_path.parent.mkdir(parents=True, exist_ok=True)
-        readable_path.write_text("\n".join(lines), encoding="utf-8")
-        if args.push_to_db:
-            evaluated.save()
-            write_json(original_path, evaluated.model_dump(mode="json"))
-        summary.update(
-            status="completed",
-            original=str(original_path.relative_to(run_dir)),
-            readable=str(readable_path.relative_to(run_dir)),
-            episode_pk=evaluated.pk or None,
-        )
-        print("SOTOPIA evaluation: completed (2 agents, 7 dimensions each)", flush=True)
-        return 0
-    except Exception as exc:
-        summary.update(status="failed", error=safe_error(exc))
-        print(summary["error"], file=sys.stderr, flush=True)
-        return 1
-    except BaseException:
-        summary["status"] = "interrupted"
-        raise
-    finally:
-        write_json(summary_path, summary)
+        return await run_simulation_batch(records, args, run_dir, run)
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
+    if args.resume_run:
+        args = utils.restore_run(
+            args,
+            path_fields=("out_dir", "sample_manifest", *evaluation.PATH_OPTIONS),
+            overrides=evaluation.resume_overrides(args),
+        )
     # SOTOPIA chooses its database classes at import time.
     os.environ["SOTOPIA_STORAGE_BACKEND"] = args.storage_backend
     from talktopia.task_space import configure_database
@@ -792,56 +737,491 @@ def run_pipeline(args: argparse.Namespace) -> int:
     db_path = configure_database(args.storage_backend)
     print(f"Talktopia DB: {db_path}")
     os.environ.setdefault("CUSTOM_API_KEY", "EMPTY")
-    if args.stage != "reevaluate":
+    records = None
+    if args.resume_run:
+        run_dir = args.resume_run
+    elif args.stage != "reevaluate":
         manifest = read_manifest(args.sample_manifest) if args.sample_manifest else None
         profiles = stage_1_sample_env_profiles(args, manifest)
         records = stage_2_sample_characters(profiles, args, manifest)
-    run_dir = create_run_directory(
-        args.out_dir, args.reeval_tag if args.stage == "reevaluate" else args.tag
-    )
+        for index, record in enumerate(records, start=1):
+            record.setdefault("episode_id", f"episode_{index:04d}")
+    if not args.resume_run:
+        run_dir = create_run_directory(
+            args.out_dir, args.reeval_tag if args.stage == "reevaluate" else args.tag
+        )
     print(f"Run started; output: {run_dir}", flush=True)
     try:
-        config = {
-            key: str(value) if isinstance(value, Path) else value
-            for key, value in vars(args).items()
-        }
-        write_json(
-            run_dir / "run_config.json",
-            {**config, "run_id": run_dir.name},
-        )
-        if not args.dry_run and args.stage != "sample":
-            import gin
-            from sotopia.generation_utils import generate
-
-            generate.DEFAULT_BAD_OUTPUT_PROCESS_MODEL = args.bad_output_process_model
-            gin.parse_config_file(
-                str(
-                    REPO_ROOT / "engine/sotopia_conf/generation_utils_conf/generate.gin"
-                ),
-                skip_unknown=True,
-            )
-        if args.stage == "reevaluate":
-            return asyncio.run(stage_4_reevaluate_existing(args, run_dir))
-
-        write_json(
-            run_dir / "01_scenarios_and_social_goals.json",
-            [
-                {
-                    "env_id": profile.pk,
-                    **profile.model_dump(mode="json", exclude={"pk"}),
-                }
-                for profile in profiles
-            ],
-        )
-        write_json(run_dir / "02_sampled_characters.json", records)
-        if args.stage == "sample" or args.dry_run:
-            print(f"Sampled {len(profiles)} environments and {len(records)} pairs.")
-            print("No inference requests or DB writes performed.")
-            return 0
-
-        return asyncio.run(stage_3_simulate(records, args, run_dir))
+        with lock_run(run_dir):
+            return asyncio.run(run_locked_pipeline(args, run_dir, db_path, records))
     finally:
         print(f"Run finished; output: {run_dir}", flush=True)
+
+
+async def run_locked_pipeline(args, run_dir, db_path, records=None) -> int:
+    if args.stage == "reevaluate":
+        return await evaluation.run_evaluation(args, run_dir, db_path)
+    records = prepare_simulation_run(args, run_dir, db_path, records)
+    if getattr(args, "agent1_models", None):
+        return await run_matrix(args, run_dir, db_path, records)
+    if args.stage in {"all", "simulate"}:
+        status = await evaluation.resume_linked_evaluation(args, run_dir, db_path)
+        if status is not None:
+            return status
+    if not args.dry_run and args.stage != "sample":
+        configure_generation(args)
+    if args.dry_run and args.resume_run:
+        return await run_simulation_batch(records, args, run_dir, None)
+    if args.stage == "sample" or args.dry_run:
+        print(
+            "Sampled %s pairs. No inference requests or DB writes performed."
+            % len(records)
+        )
+        return 0
+    from talktopia.models.servers import release_worker_models
+
+    await asyncio.to_thread(
+        release_worker_models,
+        args,
+        keep_models=[
+            args.agent1_model,
+            args.agent2_model,
+            args.bad_output_process_model,
+        ],
+    )
+    status = await stage_3_simulate(records, args, run_dir)
+    return await evaluation.finish_simulation(args, run_dir, db_path, status)
+
+
+def gpu_snapshot() -> list[dict[str, Any]]:
+    output = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,uuid,utilization.gpu,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+        timeout=10,
+    )
+    rows = []
+    for line in output.splitlines():
+        index, uuid, utilization, used, total = [
+            value.strip() for value in line.split(",")
+        ]
+        rows.append(
+            dict(
+                index=int(index),
+                uuid=uuid,
+                utilization=int(utilization),
+                used_mib=int(used),
+                total_mib=int(total),
+            )
+        )
+    return rows
+
+
+def matrix_runtime(args) -> dict[str, Any]:
+    """Verify every selected tag on both servers; freeze actual model digests."""
+    from talktopia.models.servers import (
+        get_json,
+        speech_health,
+        validate_ollama_settings,
+    )
+
+    aliases = [
+        *args.agent1_models,
+        *args.agent2_models,
+        local_alias(args.evaluator_model),
+        local_alias(args.bad_output_process_model),
+    ]
+    required = {MODEL_ALIASES[alias]["model"] for alias in aliases}
+    digests = {}
+    for endpoint, spec in OLLAMA_ENDPOINTS.items():
+        validate_ollama_settings(endpoint)
+        for worker in speech_worker_keys(endpoint):
+            speech_health(worker)
+        available = {
+            item["name"]: item for item in get_json(f"{spec['url']}/api/tags")["models"]
+        }
+        missing = required - available.keys()
+        if missing:
+            raise ValueError(f"{endpoint}: missing selected models {sorted(missing)}")
+        digests[endpoint] = {
+            name: available[name]["digest"] for name in sorted(required)
+        }
+    if len({json.dumps(value, sort_keys=True) for value in digests.values()}) != 1:
+        raise ValueError("GPU servers have different model digests")
+    return dict(
+        model_digests=digests,
+        ollama_num_parallel=OLLAMA_NUM_PARALLEL,
+        ollama_context_length=OLLAMA_CONTEXT_LENGTH,
+        tts_batch_size=TTS_BATCH_SIZE,
+        speech_workers_per_gpu=SPEECH_WORKERS_PER_GPU,
+        ollama_endpoints=OLLAMA_ENDPOINTS,
+        speech_endpoints=SPEECH_ENDPOINTS,
+        gpu_uuids={str(row["index"]): row["uuid"] for row in gpu_snapshot()},
+    )
+
+
+def check_matrix_resources(
+    run_dir: Path, *, strict: bool = True
+) -> list[dict[str, Any]]:
+    from talktopia.models.servers import get_json, speech_health
+
+    if shutil.disk_usage(run_dir).free < 20 * 1024**3:
+        raise RuntimeError(
+            "Less than 20 GiB free; matrix paused before filling the disk"
+        )
+    warnings = []
+    for worker in SPEECH_ENDPOINTS:
+        try:
+            speech_health(worker)
+        except Exception as exc:
+            warnings.append(f"{worker}: {safe_error(exc)}")
+    for endpoint, spec in OLLAMA_ENDPOINTS.items():
+        try:
+            for model in get_json(f"{spec['url']}/api/ps").get("models", []):
+                if (
+                    model.get("size", 0)
+                    and model.get("size_vram", 0) < model["size"] * 0.98
+                ):
+                    warnings.append(
+                        f"{endpoint}: {model['name']} is partly offloaded to CPU"
+                    )
+        except Exception as exc:
+            warnings.append(f"{endpoint}: {safe_error(exc)}")
+    try:
+        rows = gpu_snapshot()
+    except Exception as exc:
+        rows = []
+        warnings.append(f"GPU monitoring: {safe_error(exc)}")
+    for row in rows:
+        if (
+            f"gpu{row['index']}" in OLLAMA_ENDPOINTS
+            and row["used_mib"] > row["total_mib"] * 0.9
+        ):
+            warnings.append(f"GPU {row['index']} exceeds the 90% memory budget")
+    if warnings:
+        message = "; ".join(warnings)
+        if strict:
+            raise RuntimeError(message)
+        print(
+            f"Resource warning; other work continues: {message}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return rows
+
+
+async def run_matrix(args, run_dir: Path, db_path: Path, records: list) -> int:
+    """Two GPU workers, each reusing the existing single-pair subprocess workflow."""
+    matrix_path = run_dir / "matrix_manifest.json"
+    state_path = run_dir / "matrix_progress.json"
+    config_path = run_dir / "run_config.json"
+    config = json.loads(config_path.read_text())
+    expected = [
+        dict(pair_id=f"pair_{index:02d}", agent1_model=left, agent2_model=right)
+        for index, (left, right) in enumerate(
+            (
+                (left, right)
+                for left in args.agent1_models
+                for right in args.agent2_models
+            ),
+            1,
+        )
+    ]
+    if matrix_path.exists():
+        if (
+            json.loads(matrix_path.read_text()) != expected
+            or file_hash(matrix_path) != config["matrix_manifest_sha256"]
+        ):
+            raise ValueError("Frozen model matrix changed; resume refused")
+    else:
+        write_json(matrix_path, expected)
+        config.update(
+            kind="model_matrix", matrix_manifest_sha256=file_hash(matrix_path)
+        )
+        write_json(config_path, config)
+    state = (
+        json.loads(state_path.read_text())
+        if state_path.exists()
+        else dict(
+            status="prepared",
+            episodes_per_pair=len(records),
+            pairs=[{**pair, "status": "pending"} for pair in expected],
+            wall_seconds=0,
+        )
+    )
+    if [
+        {key: pair[key] for key in ("pair_id", "agent1_model", "agent2_model")}
+        for pair in state["pairs"]
+    ] != expected or state["episodes_per_pair"] != len(records):
+        raise ValueError("Matrix progress does not match its frozen manifest")
+    if args.dry_run or args.stage == "sample":
+        if not state_path.exists():
+            write_json(state_path, state)
+            matrix_report(run_dir, state)
+        print(
+            f"Prepared {len(expected)} model pairs x {len(records)} episodes = {len(expected) * len(records)}; no inference.",
+            flush=True,
+        )
+        return 0
+    runtime = await asyncio.to_thread(matrix_runtime, args)
+    if config.get("runtime") and config["runtime"] != runtime:
+        raise ValueError(
+            "Models, GPU identities or server settings changed; resume refused"
+        )
+    config["runtime"] = runtime
+    write_json(config_path, config)
+    await asyncio.to_thread(check_matrix_resources, run_dir)
+    for pair in state["pairs"]:
+        if pair.get("run_dir"):
+            # An orphaned child may survive an ungraceful parent kill. Do not duplicate it.
+            with lock_run(Path(pair["run_dir"])):
+                pass
+            if pair["status"] in {"completed", "completed_with_failures"}:
+                await asyncio.to_thread(validate_matrix_pair, pair, records)
+                simulation = json.loads(
+                    (Path(pair["run_dir"]) / "03_simulation.json").read_text()
+                )
+                if evaluation.pair_needs_retry(args, simulation):
+                    pair["status"] = "pending"
+    started = time.monotonic()
+    previous_wall = state.get("wall_seconds", 0)
+    state["status"] = "running"
+
+    def checkpoint():
+        state["wall_seconds"] = previous_wall + time.monotonic() - started
+        write_json(state_path, state)
+
+    processed = set()
+
+    def claim(endpoint):
+        for pair in state["pairs"]:
+            if pair["pair_id"] in processed:
+                continue
+            if pair["status"] in {"completed", "completed_with_failures", "running"}:
+                continue
+            if pair.get("gpu") not in (None, endpoint):
+                continue
+            pair.update(gpu=endpoint, status="running")
+            checkpoint()
+            return pair
+        return None
+
+    # Only an in-flight state is reset. Terminal per-episode failures keep their
+    # frozen evaluation selection; explicit single-pair retry remains available.
+    for pair in state["pairs"]:
+        if pair["status"] == "running":
+            pair["status"] = "interrupted"
+    checkpoint()
+
+    async def worker(endpoint):
+        while (pair := claim(endpoint)) is not None:
+            if (
+                await asyncio.to_thread(input_fingerprints, db_path)
+                != config["input_fingerprints"]
+            ):
+                raise ValueError(
+                    "Code or data changed while matrix was running; stopped before the next pair"
+                )
+            if not pair.get("run_dir"):
+                pair_root = run_dir / "pairs" / pair["pair_id"]
+                values = {
+                    **vars(args),
+                    "agent1_models": None,
+                    "agent2_models": None,
+                    "worker_gpu": endpoint,
+                    "sample_manifest": run_dir / "02_sampled_characters.json",
+                    "use_stored_combos": False,
+                    "resume_run": None,
+                    "out_dir": pair_root,
+                    "tag": pair["pair_id"],
+                    **evaluation.pair_settings(args, pair["pair_id"], endpoint),
+                    "env_id": [],
+                    "environment_list_pk": "",
+                    "asr_base_url": speech_url(endpoint),
+                    "tts_base_url": speech_url(endpoint),
+                }
+                for role in ("agent1", "agent2"):
+                    values[f"{role}_model"] = model_on_gpu(
+                        pair[f"{role}_model"], endpoint
+                    )
+                for role in ("env", "bad_output_process"):
+                    values[f"{role}_model"] = model_on_gpu(
+                        getattr(args, f"{role}_model"), endpoint
+                    )
+                child_args = argparse.Namespace(**values)
+                child_dir = create_run_directory(pair_root, pair["pair_id"])
+                stage_1_sample_env_profiles(child_args, records)
+                prepare_simulation_run(child_args, child_dir, db_path, records)
+                pair["run_dir"] = str(child_dir)
+                checkpoint()
+            child_dir = Path(pair["run_dir"])
+            command = [
+                sys.executable,
+                "-m",
+                "talktopia.pipeline",
+                "--resume-run",
+                str(child_dir),
+                "--episode-limit",
+                str(args.episode_limit),
+            ]
+            command.append(evaluation.automatic_switch(args))
+            process = None
+            try:
+                with (child_dir / "worker.log").open("a") as output:
+                    process = await asyncio.create_subprocess_exec(
+                        *command,
+                        cwd=REPO_ROOT,
+                        stdout=output,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    pair["pid"] = process.pid
+                    checkpoint()
+                    code = await process.wait()
+                sim = json.loads((child_dir / "03_simulation.json").read_text())
+                if sim["status"] in {"running", "interrupted"} or code not in (0, 1):
+                    raise RuntimeError(
+                        f"{pair['pair_id']}: worker stopped unexpectedly; see {child_dir / 'worker.log'}"
+                    )
+                if sim["pending"]:
+                    if not args.episode_limit:
+                        raise RuntimeError(
+                            f"{pair['pair_id']}: unexpected unfinished simulations"
+                        )
+                    pair["status"] = "partial"
+                else:
+                    evaluation.check_pair_finished(args, pair["pair_id"], sim)
+                    pair["status"] = "completed_with_failures" if code else "completed"
+                pair["exit_code"] = code
+                pair.pop("error", None)
+                saved_args = argparse.Namespace(
+                    **json.loads((child_dir / "run_config.json").read_text())
+                )
+                from talktopia.models.servers import release_worker_models
+
+                await asyncio.to_thread(
+                    release_worker_models, saved_args, keep_models=[]
+                )
+                print(f"{endpoint} {pair['pair_id']}: {pair['status']}", flush=True)
+            except Exception as exc:
+                # A dead child must not cancel the other GPU or be claimed in
+                # an endless loop. Keep its unfinished episodes for explicit resume.
+                pair.update(status="failed", exit_code=1, error=safe_error(exc))
+                processed.add(pair["pair_id"])
+                print(
+                    f"{endpoint} {pair['pair_id']}: {pair['error']}; continuing",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except BaseException as exc:
+                pair.update(status="interrupted", error=safe_error(exc))
+                raise
+            finally:
+                if process and process.returncode is None:
+                    process.send_signal(signal.SIGINT)
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=15)
+                    except asyncio.TimeoutError:
+                        process.kill()
+                        await process.wait()
+                pair.pop("pid", None)
+                checkpoint()
+                matrix_report(run_dir, state)
+            if args.episode_limit:
+                # Partial pairs are resumed only on the next invocation.
+                processed.add(pair["pair_id"])
+
+    async def monitor():
+        failures = 0
+        checks = 0
+        while True:
+            try:
+                resources = await asyncio.to_thread(
+                    check_matrix_resources, run_dir, strict=False
+                )
+                failures = 0
+                with (run_dir / "gpu_metrics.jsonl").open("a") as output:
+                    output.write(
+                        json.dumps(
+                            dict(time=datetime.now(UTC).isoformat(), gpus=resources)
+                        )
+                        + "\n"
+                    )
+            except Exception:
+                failures += 1
+                if failures >= 3:
+                    raise
+            checkpoint()
+            checks += 1
+            if checks % 6 == 0:
+                matrix_report(run_dir, state)
+            await asyncio.sleep(5)
+
+    task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, task.cancel)
+    workers = [asyncio.create_task(worker(endpoint)) for endpoint in OLLAMA_ENDPOINTS]
+    monitoring = asyncio.create_task(monitor())
+    group = asyncio.gather(*workers)
+    try:
+        await asyncio.wait([group, monitoring], return_when=asyncio.FIRST_COMPLETED)
+        if monitoring.done():
+            monitoring.result()
+        await group
+        state["status"] = (
+            "partial"
+            if any(pair["status"] == "partial" for pair in state["pairs"])
+            else (
+                "completed_with_failures"
+                if any(
+                    pair["status"] in {"completed_with_failures", "failed"}
+                    for pair in state["pairs"]
+                )
+                else "completed"
+            )
+        )
+    except BaseException as exc:
+        state.update(status="interrupted", error=safe_error(exc))
+        raise
+    finally:
+        for pending in [*workers, monitoring]:
+            pending.cancel()
+        await asyncio.gather(*workers, monitoring, return_exceptions=True)
+        await asyncio.gather(group, return_exceptions=True)
+        loop.remove_signal_handler(signal.SIGTERM)
+        checkpoint()
+        matrix_report(run_dir, state)
+    return int(any(pair.get("exit_code", 0) for pair in state["pairs"]))
+
+
+def validate_matrix_pair(pair: dict, records: list) -> None:
+    path = Path(pair["run_dir"])
+    config = json.loads((path / "run_config.json").read_text())
+    if config["worker_gpu"] != pair["gpu"] or any(
+        config[f"agent{index}_model"]
+        != model_on_gpu(pair[f"agent{index}_model"], pair["gpu"])
+        for index in (1, 2)
+    ):
+        raise ValueError("Saved pair model or GPU assignment changed")
+    manifest = path / "02_sampled_characters.json"
+    if (
+        json.loads(manifest.read_text()) != records
+        or file_hash(manifest) != config["manifest_sha256"]
+    ):
+        raise ValueError("Saved pair no longer uses the common episode manifest")
+    sim = json.loads((path / "03_simulation.json").read_text())
+    if sim["pending"]:
+        raise ValueError("Finished pair has pending episodes")
+    for row in sim["episodes"]:
+        if row["status"] == "completed" and completed_result(row, path) is None:
+            raise ValueError(
+                f"Saved completed artifact changed: {path} / {row['episode_id']}"
+            )
+    if config["evaluate_after_simulation"]:
+        evaluation.validate_linked_evaluation(sim)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

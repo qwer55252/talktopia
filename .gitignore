@@ -11,3 +11,4 @@ __pycache__/
 !/checkpoints/README.md
 /outputs/
 /reports/
+/.pipeline.lock
