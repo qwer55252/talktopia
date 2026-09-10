@@ -20,6 +20,27 @@ from sotopia.envs.evaluators import (
 )
 
 
+EVALUATION_EVIDENCE_INSTRUCTION = (
+    "Evaluate only the utterances and actions explicitly recorded in the interaction; "
+    "background information and goals are context, not evidence that any action "
+    "occurred or any goal was achieved."
+)
+
+
+def has_agent_interaction(episode: EpisodeLog) -> bool:
+    """Ignore initial context and none actions, but retain nonverbal actions."""
+    for turn in episode.messages:
+        for sender, receiver, message in turn:
+            if sender == "Environment" or receiver != "Environment":
+                continue
+            action = message.strip()
+            if action.startswith("[private to "):
+                action = action.partition("] ")[2].strip()
+            if action and action != "did nothing":
+                return True
+    return False
+
+
 def specify_agent_keys(schema: dict[str, Any]) -> None:
     dimension_schema = schema["additionalProperties"]
     schema.update(
@@ -108,7 +129,7 @@ async def evaluate_episode(
             raise ValueError(
                 "--reeval-tag must differ from the source tag when saving to DB"
             )
-        history = "\n".join(turns[:-2])
+        history = "\n".join(turns[:-2]) + "\n\n" + EVALUATION_EVIDENCE_INSTRUCTION
         history_path = artifact_dir / "evaluation/history" / f"{episode_id}.txt"
         history_path.parent.mkdir(parents=True, exist_ok=True)
         history_path.write_text(history, encoding="utf-8")
@@ -120,6 +141,10 @@ async def evaluate_episode(
             agent_names=names,
             history=str(history_path.relative_to(run_dir)),
         )
+        if not has_agent_interaction(source):
+            summary.update(status="excluded", reason="no_interaction")
+            print("Evaluation excluded: no agent utterances or actions.", flush=True)
+            return 0
         if args.dry_run:
             summary["status"] = "dry_run"
             print(

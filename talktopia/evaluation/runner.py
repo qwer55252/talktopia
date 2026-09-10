@@ -51,6 +51,9 @@ def evaluation_artifacts(result: dict, run_dir: Path) -> dict[str, str]:
 def evaluation_manifest(
     simulation_dir: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    from sotopia.database import EpisodeLog
+    from .evaluator import has_agent_interaction
+
     summary = json.loads((simulation_dir / "03_simulation.json").read_text())
     sources = read_manifest(simulation_dir / "02_sampled_characters.json")
     expected = {
@@ -100,9 +103,19 @@ def evaluation_manifest(
                 result_artifacts(row, simulation_dir)
             path = (simulation_dir / row["original"]).resolve()
             source_hash = file_hash(path)
+            episode = EpisodeLog.model_validate_json(path.read_bytes())
         except (OSError, ValueError, KeyError, TypeError) as exc:
             excluded.append(
                 {**exclusion, "reason": "invalid_artifacts", "error": safe_error(exc)}
+            )
+            continue
+        if not has_agent_interaction(episode):
+            excluded.append(
+                {
+                    **exclusion,
+                    "reason": "no_interaction",
+                    "error": "No agent utterances or actions were recorded.",
+                }
             )
             continue
         records.append(

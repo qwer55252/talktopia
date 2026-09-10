@@ -527,7 +527,7 @@ class SpeechBackend:
             return " ".join(segment.text.strip() for segment in segments).strip()
 
 
-# SOTOPIA's default agent prompt, with one speech-length instruction added.
+# SOTOPIA's default agent prompt, with recipient and speech-length instructions.
 SPEECH_ACTION_TEMPLATE = """
     Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
     You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
@@ -540,6 +540,7 @@ SPEECH_ACTION_TEMPLATE = """
     Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
 
     For a "speak" action, keep "argument" within 40 words; this is a maximum, not a target.
+    You are {agent}; for "to", use [] for public actions or copy the other participant's full name exactly from the "Participants:" line, never your own name or an abbreviated name.
     Please only generate a JSON string including the action type and the argument.
     Your action should follow the given format:
     {format_instructions}
