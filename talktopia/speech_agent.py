@@ -527,6 +527,25 @@ class SpeechBackend:
             return " ".join(segment.text.strip() for segment in segments).strip()
 
 
+# SOTOPIA's default agent prompt, with one speech-length instruction added.
+SPEECH_ACTION_TEMPLATE = """
+    Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
+    You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
+    Note that {agent}'s goal is only visible to you.
+    You should try your best to achieve {agent}'s goal in a way that align with their character traits.
+    Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
+    {history}.
+    You are at Turn #{turn_number}. Your available action types are
+    {action_list}.
+    Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
+
+    For a "speak" action, keep "argument" within 40 words; this is a maximum, not a target.
+    Please only generate a JSON string including the action type and the argument.
+    Your action should follow the given format:
+    {format_instructions}
+"""
+
+
 class CascadedSpeechAgent(LLMAgent):
     def __init__(
         self,
@@ -540,7 +559,11 @@ class CascadedSpeechAgent(LLMAgent):
         asr_language: str,
         tts_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
-        super().__init__(agent_profile=agent_profile, model_name=model_name)
+        super().__init__(
+            agent_profile=agent_profile,
+            model_name=model_name,
+            custom_template=SPEECH_ACTION_TEMPLATE,
+        )
         self.asr_client = asr_client
         self.tts_client = tts_client
         self.tts_semaphore = tts_semaphore or asyncio.Semaphore(1)
