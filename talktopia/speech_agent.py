@@ -32,6 +32,7 @@ from talktopia.models.config import (
 )
 
 from openai import APIError, AsyncOpenAI
+import gin
 from pydantic import Field
 
 from talktopia.task_space import require_local
@@ -41,6 +42,9 @@ require_local(os.environ.get("SOTOPIA_STORAGE_BACKEND", "local"))
 
 from sotopia.agents import LLMAgent
 from sotopia.database import AgentProfile as SotopiaAgentProfile
+from sotopia.generation_utils import generate as generation
+from sotopia.generation_utils.output_parsers import PydanticOutputParser
+from sotopia.messages import AgentAction, Observation
 
 
 # WAV validation: API output may use other PCM widths; ASR references require PCM16.
@@ -547,6 +551,38 @@ SPEECH_ACTION_TEMPLATE = """
 """
 
 
+def resolve_recipient_names(
+    recipients: Sequence[str], agent_names: Sequence[str]
+) -> list[str]:
+    """Expand exact first names only when one participant matches, including self."""
+    names = set(agent_names)
+    resolved = []
+    for recipient in recipients:
+        if recipient in names:
+            resolved.append(recipient)
+            continue
+        matches = [name for name in names if name.split(" ", 1)[0] == recipient]
+        # Leave unknown/ambiguous names for the existing recipient validator to reject.
+        resolved.append(matches[0] if len(matches) == 1 else recipient)
+    return resolved
+
+
+class SpeechActionOutputParser(PydanticOutputParser[AgentAction]):
+    def parse(self, result: str, context: dict[str, Any] | None = None) -> AgentAction:
+        # Reuse JSON repair and action-type validation, delaying only the name check.
+        context = context or {}
+        action = super().parse(result, context={**context, "agent_names": []})
+        recipients = resolve_recipient_names(action.to, context.get("agent_names", []))
+        validated = AgentAction.model_validate(
+            {**action.model_dump(), "to": recipients}, context=context
+        )
+        if recipients != action.to:
+            generation.log.info(
+                f"Resolved action recipients: {action.to} -> {recipients}"
+            )
+        return validated
+
+
 class CascadedSpeechAgent(LLMAgent):
     def __init__(
         self,
@@ -572,6 +608,57 @@ class CascadedSpeechAgent(LLMAgent):
         self.tts_model = tts_model
         self.asr_language = asr_language
         self.voice = agent_profile.voice_id
+
+    async def aact(self, obs: Observation) -> AgentAction:
+        self.recv_message("Environment", obs)
+        if self._goal is None:
+            self._goal = await generation.agenerate_goal(
+                self.model_name, background=self.inbox[0][1].to_natural_language()
+            )
+        if obs.available_actions == ["none"]:
+            return AgentAction(action_type="none", argument="", to=[])
+
+        # agenerate_action hardcodes its parser. Call agenerate with ours instead,
+        # retaining the engine's configured action temperature (1.0 in the pipeline).
+        try:
+            temperature = gin.query_parameter(
+                "sotopia.generation_utils.generate.agenerate_action.temperature"
+            )
+        except ValueError:
+            temperature = generation.DEFAULT_TEMPERATURE
+        context = {
+            "agent_names": (
+                self.script_background.agent_names if self.script_background else []
+            ),
+            "sender": self.agent_name,
+            "available_action_types": obs.available_actions,
+        }
+        try:
+            return await generation.agenerate(
+                model_name=self.model_name,
+                template=generation.fill_template(
+                    self.custom_template or SPEECH_ACTION_TEMPLATE,
+                    action_instructions=obs.action_instruction,
+                ),
+                input_values={
+                    "agent": self.agent_name,
+                    "turn_number": str(obs.turn_number),
+                    "history": "\n".join(
+                        message.to_natural_language() for _, message in self.inbox
+                    ),
+                    "action_list": " ".join(obs.available_actions),
+                    "goal": self.goal,
+                },
+                output_parser=SpeechActionOutputParser(pydantic_object=AgentAction),
+                temperature=temperature,
+                structured_output=True,
+                context=context,
+            )
+        except Exception as exc:
+            # As in the engine, a failed request/validation skips only this turn.
+            # CancelledError is deliberately not caught.
+            generation.log.warning(f"Failed to generate action due to {exc}")
+            return AgentAction(action_type="none", argument="", to=[])
 
     async def synthesize(self, text: str) -> bytes:
         text = prepare_tts_text(text)
