@@ -45,11 +45,17 @@ def evaluation_artifacts(result: dict, run_dir: Path) -> dict[str, str]:
     )
     if source.messages != episode.messages:
         raise ValueError("Evaluation changed the source conversation")
+    for name in result.get("response_attempts", []):
+        path = (run_dir / name).resolve()
+        if not path.is_relative_to(run_dir.resolve()):
+            raise ValueError("Response attempt path escapes its run directory")
+        hashes[name] = file_hash(path)
     return hashes
 
 
 def evaluation_manifest(
     simulation_dir: Path,
+    episode_ids: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from sotopia.database import EpisodeLog
     from .evaluator import has_agent_interaction
@@ -73,6 +79,13 @@ def evaluation_manifest(
         raise ValueError(
             "All simulation episodes must be attempted before batch evaluation"
         )
+    if episode_ids:
+        selected = set(episode_ids)
+        if len(selected) != len(episode_ids) or selected - set(expected):
+            raise ValueError(
+                "Selected evaluation episode IDs must be unique and exist in the simulation"
+            )
+        rows = [row for row in rows if row["episode_id"] in selected]
     records = []
     excluded = []
     for row in rows:
@@ -134,9 +147,13 @@ def evaluation_manifest(
             }
         )
     return records, {
-        "source_total": len(rows),
-        "source_completed": sum(row["status"] == "completed" for row in rows),
-        "source_failed": sum(row["status"] == "failed" for row in rows),
+        "source_total": len(summary["episodes"]),
+        "source_selected": len(rows),
+        "source_unselected": len(summary["episodes"]) - len(rows),
+        "source_completed": sum(
+            row["status"] == "completed" for row in summary["episodes"]
+        ),
+        "source_failed": sum(row["status"] == "failed" for row in summary["episodes"]),
         "source_excluded": len(excluded),
         "excluded_episodes": excluded,
         "source_no_speech_episodes": sum(
@@ -156,7 +173,9 @@ def prepare_run(args, run_dir: Path, db_path: Path):
     extra = {}
     if args.simulation_dir:
         args.simulation_dir = args.simulation_dir.expanduser().resolve()
-        records, source_summary = evaluation_manifest(args.simulation_dir)
+        records, source_summary = evaluation_manifest(
+            args.simulation_dir, getattr(args, "reeval_episode_id", [])
+        )
         write_json(manifest_path, records)
         extra["source_summary"] = source_summary
     save_run_config(args, run_dir, db_path, manifest_path, **extra)

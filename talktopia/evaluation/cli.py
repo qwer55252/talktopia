@@ -32,6 +32,12 @@ def add_arguments(parser: argparse.ArgumentParser, models: dict[str, str]) -> No
     parser.add_argument("--reeval-tag", default="talktopia_pipeline_reeval")
     parser.add_argument("--reeval-max-retries", type=int, default=2)
     parser.add_argument(
+        "--reeval-episode-id",
+        action="append",
+        default=[],
+        help="Evaluate only this episode from --simulation-dir; repeat to select more.",
+    )
+    parser.add_argument(
         "--eval-batch-size",
         type=int,
         help="Concurrent evaluations per GPU; defaults to --batch-size.",
@@ -56,6 +62,10 @@ def validate_arguments(
             parser.error(str(exc))
     if args.reeval_max_retries < 0:
         parser.error("--reeval-max-retries must be nonnegative")
+    if args.reeval_episode_id and (
+        args.stage != "reevaluate" or not args.simulation_dir
+    ):
+        parser.error("--reeval-episode-id requires --stage reevaluate --simulation-dir")
     if (
         args.stage == "reevaluate"
         or (args.stage in {"all", "simulate"} and args.evaluate_after_simulation)

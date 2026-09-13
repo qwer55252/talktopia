@@ -127,6 +127,8 @@ def write_evaluation_report(run_dir: Path) -> None:
     )
     for key in (
         "source_total",
+        "source_selected",
+        "source_unselected",
         "source_completed",
         "source_failed",
         "source_excluded",

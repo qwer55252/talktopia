@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -23,8 +24,67 @@ from sotopia.envs.evaluators import (
 EVALUATION_EVIDENCE_INSTRUCTION = (
     "Evaluate only the utterances and actions explicitly recorded in the interaction; "
     "background information and goals are context, not evidence that any action "
-    "occurred or any goal was achieved."
+    "occurred or any goal was achieved.\n"
+    "For each agent and each dimension, write 1-3 sentences explaining the score "
+    "using that participant's specific recorded behavior. Identify the participant "
+    "and the relevant utterance, action, or observed outcome. If there is no evidence "
+    "of a change or violation, explain what was not observed in this interaction.\n"
+    "Do not copy field descriptions, scoring rubrics, or example values into reasoning. "
+    "Never use placeholders such as 'Detailed reasoning for the evaluation', '...', "
+    "'string', or 'Placeholder reasoning'. Do not repeat one generic explanation "
+    "across all dimensions. Zero is a valid score only with an actual explanation.\n"
+    "Check each participant's role and goal separately: a buyer's maximum price is "
+    "not a seller's minimum price. Distinguish proposals from accepted agreements "
+    "and completed actions. Do not overlook role confusion or contradictory numbers "
+    "merely because the language is fluent."
 )
+
+
+def normalize_reason(reason: str) -> str:
+    return " ".join(re.findall(r"\w+", reason.casefold()))
+
+
+def reasoning_problem(reason: str) -> str | None:
+    """Reject copied instructions and placeholders, not legitimate zero scores."""
+    normalized = normalize_reason(reason)
+    if not normalized:
+        return "empty or punctuation-only reasoning"
+    if "detailed reasoning for the evaluation" in normalized or normalized in {
+        "string",
+        "placeholder reasoning",
+        "reasoning process goes here",
+    }:
+        return "placeholder reasoning"
+    if any(
+        normalized == normalize_reason(field.description or "")
+        for field in SotopiaDimensions.model_fields.values()
+    ):
+        return "reasoning copies a scoring rubric"
+    return None
+
+
+def validate_evaluation_responses(responses) -> None:
+    expected = {
+        (agent, dimension)
+        for agent in ("agent_1", "agent_2")
+        for dimension in SotopiaDimensions.model_fields
+    }
+    if (
+        len(responses) != len(expected)
+        or {(agent, dimension) for agent, ((dimension, _), _) in responses} != expected
+    ):
+        raise ValueError("Evaluator did not return all 14 dimension scores and reasons")
+    reasons = {"agent_1": [], "agent_2": []}
+    for agent, ((dimension, _), reason) in responses:
+        problem = reasoning_problem(reason)
+        if problem:
+            raise ValueError(f"{agent}.{dimension}: {problem}")
+        reasons[agent].append(normalize_reason(reason))
+    for agent, values in reasons.items():
+        if len(set(values)) == 1:
+            raise ValueError(
+                f"{agent}: identical reasoning across all seven dimensions"
+            )
 
 
 def has_agent_interaction(episode: EpisodeLog) -> bool:
@@ -96,6 +156,7 @@ async def evaluate_episode(
         "status": "running",
         "attempts": 0,
         "attempt_errors": [],
+        "response_attempts": [],
         "history": None,
         "original": None,
         "readable": None,
@@ -129,7 +190,12 @@ async def evaluate_episode(
             raise ValueError(
                 "--reeval-tag must differ from the source tag when saving to DB"
             )
-        history = "\n".join(turns[:-2]) + "\n\n" + EVALUATION_EVIDENCE_INSTRUCTION
+        history = (
+            "\n".join(turns[:-2])
+            + "\n\n"
+            + EVALUATION_EVIDENCE_INSTRUCTION
+            + f"\nAgent mapping: agent_1 is {names[0]}; agent_2 is {names[1]}."
+        )
         history_path = artifact_dir / "evaluation/history" / f"{episode_id}.txt"
         history_path.parent.mkdir(parents=True, exist_ok=True)
         history_path.write_text(history, encoding="utf-8")
@@ -156,11 +222,6 @@ async def evaluate_episode(
         evaluator = EpisodeLLMEvaluator(
             model_name=args.evaluator_model, response_format_class=TwoAgentEvaluation
         )
-        expected = {
-            (agent, dimension)
-            for agent in ("agent_1", "agent_2")
-            for dimension in SotopiaDimensions.model_fields
-        }
         for attempt in range(1, args.reeval_max_retries + 2):
             summary["attempts"] = attempt
             write_json(summary_path, summary)
@@ -168,28 +229,49 @@ async def evaluate_episode(
                 f"SOTOPIA evaluation: attempt {attempt}/{args.reeval_max_retries + 1}",
                 flush=True,
             )
+            request_history = history
+            if summary["attempt_errors"]:
+                request_history += (
+                    f"\n\nEvaluation attempt {attempt}. The previous evaluation was rejected: "
+                    + summary["attempt_errors"][-1][:1000]
+                    + "\nEvaluate the complete interaction above again. Return all 14 "
+                    "scores with specific evidence, not a reformatted example."
+                )
+            attempt_path = (
+                artifact_dir
+                / "evaluation/responses"
+                / episode_id
+                / f"attempt_{attempt}.json"
+            )
+            attempt_record = {
+                "history": request_history,
+                "responses": None,
+                "error": None,
+            }
             try:
                 responses = await evaluator.__acall__(
                     turn_number=-1,
                     messages=None,
-                    history=history,
+                    history=request_history,
                     num_agents=2,
                     temperature=0.0,
                 )
-                if (
-                    len(responses) != len(expected)
-                    or {(agent, dimension) for agent, ((dimension, _), _) in responses}
-                    != expected
-                ):
-                    raise ValueError(
-                        "Evaluator did not return all 14 dimension scores and reasons"
-                    )
+                # Check content AFTER generation so these failures retry with the
+                # conversation, rather than using the engine's JSON-only repair.
+                attempt_record["responses"] = responses
+                validate_evaluation_responses(responses)
                 response = unweighted_aggregate_evaluate(responses)
                 break
             except Exception as exc:
                 error = safe_error(exc)
+                attempt_record["error"] = error
                 summary["attempt_errors"].append(error)
                 print(error, file=sys.stderr, flush=True)
+            finally:
+                write_json(attempt_path, attempt_record)
+                summary["response_attempts"].append(
+                    str(attempt_path.relative_to(run_dir))
+                )
         else:
             raise RuntimeError(
                 f"SOTOPIA evaluation failed after {summary['attempts']} attempts"
