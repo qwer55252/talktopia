@@ -6,7 +6,11 @@ from pathlib import Path
 
 HOME = Path.home()
 REPO_ROOT = Path(__file__).resolve().parents[2]
-RUNTIME_DIR = HOME / ".sotopia" / "talktopia_models"
+RUNTIME_DIR = Path(
+    os.environ.get(
+        "TALKTOPIA_MODEL_RUNTIME_DIR", str(HOME / ".sotopia" / "talktopia_models")
+    )
+).expanduser()
 
 PROXY_HOST = os.environ.get("TALKTOPIA_MODEL_PROXY_HOST", "127.0.0.1")
 PROXY_PORT = int(os.environ.get("TALKTOPIA_MODEL_PROXY_PORT", "18084"))
@@ -14,6 +18,7 @@ PROXY_BASE_URL = f"http://{PROXY_HOST}:{PROXY_PORT}/v1"
 SPEECH_HOST = os.environ.get("TALKTOPIA_SPEECH_HOST", "127.0.0.1")
 SPEECH_PORT = int(os.environ.get("TALKTOPIA_SPEECH_PORT", "18086"))
 SPEECH_BASE_URL = f"http://{SPEECH_HOST}:{SPEECH_PORT}/v1"
+SPEECH_PROTOCOL = "surface5-http-v1"
 SPEECH_GPU = os.environ.get("TALKTOPIA_SPEECH_GPU", "1")
 ASR_REPO = "Systran/faster-whisper-small.en"
 ASR_REVISION = "d1d751a5f8271d482d14ca55d9e2deeebbae577f"

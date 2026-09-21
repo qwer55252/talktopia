@@ -25,6 +25,7 @@ from .config import (
     VLLM_ENDPOINTS,
     SPEECH_BASE_URL,
     SPEECH_GPU,
+    SPEECH_PROTOCOL,
     SPEECH_HOST,
     SPEECH_PORT,
     SPEECH_ENDPOINTS,
@@ -56,6 +57,7 @@ def speech_health(
     data = get_json(f"http://{spec['host']}:{spec['port']}/health", timeout=2)
     if (
         data.get("service") != "talktopia-speech"
+        or data.get("speech_protocol") != SPEECH_PROTOCOL
         or data.get("database") != str(database_path())
         or data.get("asr_revision") != ASR_REVISION
         or data.get("tts_revision") != TTS_REVISION
@@ -165,7 +167,7 @@ def create_speech_app(backend: Any = None, db: Path | None = None) -> Any:
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import Response
     from starlette.concurrency import run_in_threadpool
-    from talktopia.speech_agent import read_pcm_wav, SpeechBackend
+    from talktopia.speech_agent import read_pcm_wav, SpeechBackend, EmptyAudioError
 
     db = db or database_path()
 
@@ -194,6 +196,7 @@ def create_speech_app(backend: Any = None, db: Path | None = None) -> Any:
         active = getattr(value, "tts_active_requests", 0)
         return dict(
             service="talktopia-speech",
+            speech_protocol=SPEECH_PROTOCOL,
             ready=not getattr(value, "fatal_error", None)
             and not getattr(value, "closed", False),
             idle=app.state.inference_requests == 0 and active == 0 and queued == 0,
@@ -228,6 +231,12 @@ def create_speech_app(backend: Any = None, db: Path | None = None) -> Any:
         app.state.inference_requests += 1
         try:
             return await run_in_threadpool(function, *args)
+        except EmptyAudioError as exc:
+            raise HTTPException(
+                500,
+                detail={"code": "empty_audio", "message": str(exc)},
+                headers={"x-should-retry": "false"},
+            ) from exc
         except TimeoutError as exc:
             logging.exception("Speech inference timed out")
             raise HTTPException(
@@ -265,7 +274,14 @@ def create_speech_app(backend: Any = None, db: Path | None = None) -> Any:
             raise HTTPException(400, "Unknown profile voice_id")
         if not isinstance(text, str) or not text.strip():
             raise HTTPException(400, "input must contain text")
-        audio = await inference(value.synthesize, text.strip(), voice)
+        seed = data.get("seed")
+        if "seed" in data and (
+            isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or not 0 <= seed <= 0xFFFFFFFF
+        ):
+            raise HTTPException(400, "seed must be an unsigned 32-bit integer")
+        audio = await inference(value.synthesize, text.strip(), voice, seed)
         return Response(content=audio, media_type="audio/wav")
 
     @app.post("/v1/audio/transcriptions")

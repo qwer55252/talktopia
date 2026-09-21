@@ -1,4 +1,4 @@
-"""Reference voices, profile fields, and the ASR/LLM/TTS conversation agent."""
+"""Profile voices, WAV validation, and the managed ASR/TTS server backend."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import queue
-import re
 import threading
 import time
 import wave
@@ -31,8 +30,6 @@ from talktopia.models.config import (
     speech_url,
 )
 
-from openai import APIError, AsyncOpenAI
-import gin
 from pydantic import Field
 
 from talktopia.task_space import require_local
@@ -40,11 +37,7 @@ from talktopia.task_space import require_local
 # SOTOPIA selects its model classes at import time. Set the backend first.
 require_local(os.environ.get("SOTOPIA_STORAGE_BACKEND", "local"))
 
-from sotopia.agents import LLMAgent
 from sotopia.database import AgentProfile as SotopiaAgentProfile
-from sotopia.generation_utils import generate as generation
-from sotopia.generation_utils.output_parsers import PydanticOutputParser
-from sotopia.messages import AgentAction, Observation
 
 
 # WAV validation: API output may use other PCM widths; ASR references require PCM16.
@@ -81,55 +74,6 @@ def read_pcm_wav(audio: bytes) -> tuple[bytes, int]:
             return pcm, wav.getframerate()
     except (wave.Error, EOFError) as exc:
         raise ValueError("Invalid WAV") from exc
-
-
-def combine_conversation_audio(
-    utterances: Sequence[tuple[Path, int]], destination: Path
-) -> Path | None:
-    """Join (mono WAV, channel) pairs: agent1 left (0), agent2 right (1)."""
-    if not utterances:
-        return None
-
-    # Validate all inputs before creating the conversation file.
-    audio_format = None
-    chunks = []
-    for path, channel in utterances:
-        if channel not in (0, 1):
-            raise ValueError(f"Conversation channel must be 0 or 1: {channel}")
-        audio = path.read_bytes()
-        validate_wav(audio)
-        with wave.open(io.BytesIO(audio), "rb") as wav:
-            current_format = (
-                wav.getnchannels(),
-                wav.getsampwidth(),
-                wav.getframerate(),
-            )
-            if audio_format is not None and current_format != audio_format:
-                raise ValueError(f"Conversation WAV formats do not match: {path}")
-            audio_format = current_format
-            chunks.append((wav.readframes(wav.getnframes()), channel))
-
-    assert audio_format is not None
-    _, width, rate = audio_format
-    # WAV PCM8 is unsigned; zero amplitude is 128, not 0.
-    silent_sample = b"\x80" if width == 1 else b"\x00" * width
-    silence = silent_sample * 2 * round(rate * 0.3)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("xb") as output, wave.open(output, "wb") as wav:
-        wav.setnchannels(2)
-        wav.setsampwidth(width)
-        wav.setframerate(rate)
-        for index, (frames, channel) in enumerate(chunks):
-            if index:
-                wav.writeframes(silence)
-            stereo = bytearray(silent_sample * 2 * (len(frames) // width))
-            # Interleave the original sample bytes; the other channel stays silent.
-            for byte_offset in range(width):
-                stereo[channel * width + byte_offset :: 2 * width] = frames[
-                    byte_offset::width
-                ]
-            wav.writeframes(stereo)
-    return destination
 
 
 # Reference voices: shared by dataset preparation and the speech server.
@@ -170,10 +114,10 @@ def load_voice_registry(db: Path) -> dict[str, dict[str, Any]]:
         row = json.loads(path.read_text(encoding="utf-8"))
         pk = row["pk"]
         expected = reference_profile(pk, db / "voices")
-        for field, value in expected.items():
-            if row.get(field) != value:
+        for field_name, value in expected.items():
+            if row.get(field_name) != value:
                 raise ValueError(
-                    f"Agent {pk}: {field} does not match copied reference files"
+                    f"Agent {pk}: {field_name} does not match copied reference files"
                 )
         voice_id = expected["voice_id"]
         if voice_id in registry:
@@ -205,28 +149,15 @@ for _name, _field in SotopiaAgentProfile.model_fields.items():
 AgentProfile.model_rebuild(force=True)
 
 
-# Conversation agent: synthesize its own speech and transcribe the other agent.
-
-
-def prepare_tts_text(text: str) -> str:
-    """Remove starred spans only from speech input, not from the saved LLM text."""
-    # A run of stars opens/closes a span. An unclosed span consumes the remainder.
-    cleaned = re.sub(r"\*+[^*]*(?:\*+|$)", " ", text)
-    cleaned = " ".join(cleaned.split())
-    return cleaned if any(character.isalnum() for character in cleaned) else ""
-
-
-def speech_api_error(operation: str, exc: APIError) -> RuntimeError:
-    # Response bodies may echo credentials; do not persist them in run artifacts.
-    status = getattr(exc, "status_code", None)
-    detail = f", HTTP {status}" if status is not None else ""
-    return RuntimeError(f"{operation} request failed ({type(exc).__name__}{detail})")
+class EmptyAudioError(RuntimeError):
+    """An empty TTS result is retryable with a different deterministic seed."""
 
 
 @dataclass
 class TTSRequest:
     text: str
     voice_id: str
+    seed: int | None = None
     future: Future = field(default_factory=Future)
     queued_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None
@@ -357,10 +288,10 @@ class SpeechBackend:
         )
         self.thread.start()
 
-    def synthesize(self, text: str, voice_id: str) -> bytes:
+    def synthesize(self, text: str, voice_id: str, seed: int | None = None) -> bytes:
         if self.closed or self.fatal_error:
             raise RuntimeError(self.fatal_error or "Speech backend is closed")
-        request = TTSRequest(text, voice_id)
+        request = TTSRequest(text, voice_id, seed=seed)
         self.requests.put(request, timeout=5)
         try:
             return request.future.result(timeout=self.request_timeout)
@@ -387,18 +318,26 @@ class SpeechBackend:
         self.thread.join(timeout=5)
 
     def _tts_loop(self) -> None:
+        pending = None
         while not self.closed:
             try:
-                first = self.requests.get(timeout=0.1)
+                first = (
+                    pending if pending is not None else self.requests.get(timeout=0.1)
+                )
+                pending = None
             except queue.Empty:
                 continue
             batch = [first]
             deadline = time.monotonic() + 0.02
-            while len(batch) < self.batch_size:
+            while first.seed is None and len(batch) < self.batch_size:
                 try:
-                    batch.append(
-                        self.requests.get(timeout=max(0, deadline - time.monotonic()))
+                    candidate = self.requests.get(
+                        timeout=max(0, deadline - time.monotonic())
                     )
+                    if candidate.seed is not None:
+                        pending = candidate
+                        break
+                    batch.append(candidate)
                 except queue.Empty:
                     break
             active = [
@@ -455,6 +394,10 @@ class SpeechBackend:
                     )
                 for _ in batch:
                     self.requests.task_done()
+        if pending is not None:
+            if not pending.future.done():
+                pending.future.set_exception(RuntimeError("Speech backend stopped"))
+            self.requests.task_done()
         while True:
             try:
                 item = self.requests.get_nowait()
@@ -473,16 +416,30 @@ class SpeechBackend:
                     ref_audio=str(voice["wav_path"]),
                     ref_text=voice["voice_reference_text"],
                 )
-        audios = self.tts.generate(
-            text=[item.text for item in requests],
-            language="English",
-            voice_clone_prompt=[self.prompts[item.voice_id] for item in requests],
-        )
+        if requests[0].seed is not None:
+            if len(requests) != 1:
+                raise ValueError("Seeded TTS requests must be synthesized individually")
+            item = requests[0]
+            # Prompt creation can consume RNG; seed immediately before generation.
+            self.torch.manual_seed(item.seed)
+            audios = self.tts.generate(
+                text=item.text,
+                language="English",
+                voice_clone_prompt=self.prompts[item.voice_id],
+            )
+        else:
+            audios = self.tts.generate(
+                text=[item.text for item in requests],
+                language="English",
+                voice_clone_prompt=[self.prompts[item.voice_id] for item in requests],
+            )
         results = []
         for audio in audios:
             samples = self.np.asarray(audio, dtype=self.np.float32).reshape(-1)
-            if not len(samples) or not self.np.isfinite(samples).all():
-                raise RuntimeError("OmniVoice returned empty or non-finite audio")
+            if not len(samples):
+                raise EmptyAudioError("OmniVoice returned empty audio")
+            if not self.np.isfinite(samples).all():
+                raise RuntimeError("OmniVoice returned non-finite audio")
             pcm = (self.np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
             result = io.BytesIO()
             with wave.open(result, "wb") as wav:
@@ -529,166 +486,3 @@ class SpeechBackend:
                 vad_filter=False,
             )
             return " ".join(segment.text.strip() for segment in segments).strip()
-
-
-# SOTOPIA's default agent prompt, with recipient and speech-length instructions.
-SPEECH_ACTION_TEMPLATE = """
-    Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
-    You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
-    Note that {agent}'s goal is only visible to you.
-    You should try your best to achieve {agent}'s goal in a way that align with their character traits.
-    Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
-    {history}.
-    You are at Turn #{turn_number}. Your available action types are
-    {action_list}.
-    Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
-
-    For a "speak" action, keep "argument" within 40 words; this is a maximum, not a target.
-    You are {agent}; for "to", use [] for public actions or copy the other participant's full name exactly from the "Participants:" line, never your own name or an abbreviated name.
-    Please only generate a JSON string including the action type and the argument.
-    Your action should follow the given format:
-    {format_instructions}
-"""
-
-
-def resolve_recipient_names(
-    recipients: Sequence[str], agent_names: Sequence[str]
-) -> list[str]:
-    """Expand exact first names only when one participant matches, including self."""
-    names = set(agent_names)
-    resolved = []
-    for recipient in recipients:
-        if recipient in names:
-            resolved.append(recipient)
-            continue
-        matches = [name for name in names if name.split(" ", 1)[0] == recipient]
-        # Leave unknown/ambiguous names for the existing recipient validator to reject.
-        resolved.append(matches[0] if len(matches) == 1 else recipient)
-    return resolved
-
-
-class SpeechActionOutputParser(PydanticOutputParser[AgentAction]):
-    def parse(self, result: str, context: dict[str, Any] | None = None) -> AgentAction:
-        # Reuse JSON repair and action-type validation, delaying only the name check.
-        context = context or {}
-        action = super().parse(result, context={**context, "agent_names": []})
-        recipients = resolve_recipient_names(action.to, context.get("agent_names", []))
-        validated = AgentAction.model_validate(
-            {**action.model_dump(), "to": recipients}, context=context
-        )
-        if recipients != action.to:
-            generation.log.info(
-                f"Resolved action recipients: {action.to} -> {recipients}"
-            )
-        return validated
-
-
-class CascadedSpeechAgent(LLMAgent):
-    def __init__(
-        self,
-        *,
-        agent_profile: AgentProfile,
-        model_name: str,
-        asr_client: AsyncOpenAI,
-        tts_client: AsyncOpenAI,
-        asr_model: str,
-        tts_model: str,
-        asr_language: str,
-        tts_semaphore: asyncio.Semaphore | None = None,
-    ) -> None:
-        super().__init__(
-            agent_profile=agent_profile,
-            model_name=model_name,
-            custom_template=SPEECH_ACTION_TEMPLATE,
-        )
-        self.asr_client = asr_client
-        self.tts_client = tts_client
-        self.tts_semaphore = tts_semaphore or asyncio.Semaphore(1)
-        self.asr_model = asr_model
-        self.tts_model = tts_model
-        self.asr_language = asr_language
-        self.voice = agent_profile.voice_id
-
-    async def aact(self, obs: Observation) -> AgentAction:
-        self.recv_message("Environment", obs)
-        if self._goal is None:
-            self._goal = await generation.agenerate_goal(
-                self.model_name, background=self.inbox[0][1].to_natural_language()
-            )
-        if obs.available_actions == ["none"]:
-            return AgentAction(action_type="none", argument="", to=[])
-
-        # agenerate_action hardcodes its parser. Call agenerate with ours instead,
-        # retaining the engine's configured action temperature (1.0 in the pipeline).
-        try:
-            temperature = gin.query_parameter(
-                "sotopia.generation_utils.generate.agenerate_action.temperature"
-            )
-        except ValueError:
-            temperature = generation.DEFAULT_TEMPERATURE
-        context = {
-            "agent_names": (
-                self.script_background.agent_names if self.script_background else []
-            ),
-            "sender": self.agent_name,
-            "available_action_types": obs.available_actions,
-        }
-        try:
-            return await generation.agenerate(
-                model_name=self.model_name,
-                template=generation.fill_template(
-                    self.custom_template or SPEECH_ACTION_TEMPLATE,
-                    action_instructions=obs.action_instruction,
-                ),
-                input_values={
-                    "agent": self.agent_name,
-                    "turn_number": str(obs.turn_number),
-                    "history": "\n".join(
-                        message.to_natural_language() for _, message in self.inbox
-                    ),
-                    "action_list": " ".join(obs.available_actions),
-                    "goal": self.goal,
-                },
-                output_parser=SpeechActionOutputParser(pydantic_object=AgentAction),
-                temperature=temperature,
-                structured_output=True,
-                context=context,
-            )
-        except Exception as exc:
-            # As in the engine, a failed request/validation skips only this turn.
-            # CancelledError is deliberately not caught.
-            generation.log.warning(f"Failed to generate action due to {exc}")
-            return AgentAction(action_type="none", argument="", to=[])
-
-    async def synthesize(self, text: str) -> bytes:
-        text = prepare_tts_text(text)
-        if not text:
-            raise ValueError("Cannot synthesize an empty speak action")
-        try:
-            async with self.tts_semaphore:
-                response = await self.tts_client.audio.speech.create(
-                    model=self.tts_model,
-                    input=text,
-                    voice=self.voice,
-                    response_format="wav",
-                )
-        except APIError as exc:
-            raise speech_api_error("TTS", exc) from exc
-        audio = response.content
-        validate_wav(audio)
-        return audio
-
-    async def transcribe(self, audio: bytes, filename: str) -> str:
-        try:
-            response = await self.asr_client.audio.transcriptions.create(
-                model=self.asr_model,
-                file=(filename, audio, "audio/wav"),
-                language=self.asr_language,
-                response_format="json",
-            )
-        except APIError as exc:
-            raise speech_api_error("ASR", exc) from exc
-        text = response.text
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("ASR returned an empty or invalid transcript")
-        return text.strip()

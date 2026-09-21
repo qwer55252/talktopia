@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import random
 import re
@@ -15,7 +16,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import Any, Sequence
 from urllib.parse import urlsplit
 
 from talktopia import evaluation
@@ -50,12 +51,6 @@ from talktopia.models.config import (
     model_on_gpu,
     speech_url,
 )
-
-if TYPE_CHECKING:
-    from openai import AsyncOpenAI
-    from sotopia.envs import ParallelSotopiaEnv
-
-    from talktopia.speech_agent import CascadedSpeechAgent
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -125,7 +120,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--pairs-per-env", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--max-turns", type=int, default=20)
+    parser.add_argument("--max-turns", type=int, default=12)
+    parser.add_argument("--episode-timeout-s", type=float, default=150.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--push-to-db", action="store_true")
     parser.add_argument(
@@ -202,6 +198,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     for name in ("pairs_per_env", "batch_size", "max_turns"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if not math.isfinite(args.episode_timeout_s) or args.episode_timeout_s <= 0:
+        parser.error("--episode-timeout-s must be finite and positive")
     if args.num_envs < 0:
         parser.error("--num-envs must be nonnegative (0 means all)")
     for name in ("tag",):
@@ -375,202 +373,6 @@ def stage_2_sample_characters(
     return records
 
 
-def build_episode(
-    record: dict[str, Any],
-    args: argparse.Namespace,
-    asr_client: AsyncOpenAI,
-    tts_client: AsyncOpenAI,
-    tts_semaphore: asyncio.Semaphore | None = None,
-) -> tuple[ParallelSotopiaEnv, list[CascadedSpeechAgent]]:
-    from sotopia.database import EnvironmentProfile
-    from sotopia.envs import ParallelSotopiaEnv
-    from talktopia.speech_agent import AgentProfile, CascadedSpeechAgent
-
-    env = ParallelSotopiaEnv(
-        env_profile=EnvironmentProfile.get(record["env_id"]), **env_params(args)
-    )
-    agents = [
-        CascadedSpeechAgent(
-            agent_profile=AgentProfile.get(pk),
-            model_name=getattr(args, f"agent{index}_model"),
-            asr_client=asr_client,
-            tts_client=tts_client,
-            tts_semaphore=tts_semaphore,
-            asr_model=args.asr_model,
-            tts_model=args.tts_model,
-            asr_language=args.asr_language,
-        )
-        for index, pk in enumerate(record["agent_ids"], start=1)
-    ]
-    return env, agents
-
-
-def episode_markdown(episode: Any) -> str:
-    _, turns = episode.render_for_humans()
-    return (
-        "# Speech conversation\n\nEvaluation: not performed.\n\n"
-        + "\n\n".join(turns[:-2])
-        + "\n"
-    )
-
-
-async def run_one_episode(
-    env: ParallelSotopiaEnv,
-    agent_list: Sequence[CascadedSpeechAgent],
-    args: argparse.Namespace,
-    run_dir: Path,
-    episode_id: str,
-    *,
-    artifact_dir: Path | None = None,
-) -> dict[str, Any]:
-    from sotopia.agents import Agents
-    from sotopia.database import EpisodeLog
-    from sotopia.messages import AgentAction
-    from sotopia.messages.message_classes import ScriptBackground
-    from talktopia.speech_agent import combine_conversation_audio, prepare_tts_text
-
-    agents = Agents({agent.agent_name: agent for agent in agent_list})
-    observations = env.reset(agents=agents, omniscient=False)
-    agents.reset()
-    # LLMAgent uses only the names here for recipient validation, not private goals.
-    names_only = ScriptBackground(
-        scenario="", agent_names=list(agents), agent_backgrounds=[], agent_goals=[]
-    )
-    for index, agent in enumerate(agent_list):
-        agent.goal = env.profile.agent_goals[index]
-        agent.script_background = names_only
-
-    messages = [
-        [
-            ("Environment", name, obs.to_natural_language())
-            for name, obs in observations.items()
-        ]
-    ]
-    artifact_dir = artifact_dir or run_dir
-    speech_path = artifact_dir / "simulation" / "speech" / f"{episode_id}.jsonl"
-    speech_path.parent.mkdir(parents=True, exist_ok=True)
-    utterances: list[tuple[Path, int]] = []
-    with speech_path.open("x", encoding="utf-8") as speech_output:
-        while True:
-            actions = {}
-            # Inactive agents receive the last turn; LLMAgent returns none without inference.
-            for index, agent in enumerate(agent_list):
-                action = await agent.aact(observations[agent.agent_name])
-                action = AgentAction.model_validate(
-                    action.model_dump(),
-                    context={"agent_names": list(agents), "sender": agent.agent_name},
-                )
-                if (
-                    action.action_type
-                    not in observations[agent.agent_name].available_actions
-                ):
-                    raise ValueError(
-                        f"{agent.agent_name} returned an unavailable action"
-                    )
-                if action.action_type == "speak":
-                    listener = agent_list[1 - index]
-                    tts_text = prepare_tts_text(action.argument)
-                    speech_record = {
-                        "turn": env.turn_number + 1,
-                        "speaker": agent.agent_name,
-                        "listener": listener.agent_name,
-                        "to": action.to,
-                        "llm_text": action.argument,
-                        "tts_text": tts_text,
-                        "tts_model": agent.tts_model,
-                        "voice": agent.voice,
-                        "wav_path": None,
-                        "asr_model": listener.asr_model,
-                        "asr_text": None,
-                    }
-                    if not tts_text:
-                        speech_record.update(
-                            status="tts_skipped", reason="no_spoken_text"
-                        )
-                        action = AgentAction(action_type="none", argument="", to=[])
-                    else:
-                        filename = f"{env.turn_number + 1:04d}_agent{index + 1}.wav"
-                        wav_path = (
-                            artifact_dir
-                            / "simulation"
-                            / "audio"
-                            / episode_id
-                            / filename
-                        )
-                        audio = await agent.synthesize(tts_text)
-                        wav_path.parent.mkdir(parents=True, exist_ok=True)
-                        wav_path.write_bytes(audio)
-                        speech_record["wav_path"] = str(wav_path.relative_to(run_dir))
-                        try:
-                            transcript = await listener.transcribe(audio, filename)
-                        except Exception:
-                            speech_record["status"] = "asr_failed"
-                            speech_output.write(
-                                json.dumps(speech_record, ensure_ascii=False) + "\n"
-                            )
-                            speech_output.flush()
-                            raise
-                        speech_record.update(asr_text=transcript, status="completed")
-                        utterances.append((wav_path, index))
-                        action = action.model_copy(update={"argument": transcript})
-                    speech_output.write(
-                        json.dumps(speech_record, ensure_ascii=False) + "\n"
-                    )
-                    speech_output.flush()
-                actions[agent.agent_name] = action
-                messages[-1].append(
-                    (agent.agent_name, "Environment", action.to_natural_language())
-                )
-
-            observations, _, terminated, _, info = await env.astep(actions)
-            messages.append(
-                [
-                    ("Environment", name, obs.to_natural_language())
-                    for name, obs in observations.items()
-                ]
-            )
-            if all(terminated.values()):
-                break
-
-    conversation_audio = combine_conversation_audio(
-        utterances,
-        artifact_dir / "simulation" / "audio" / episode_id / "conversation.wav",
-    )
-    episode = EpisodeLog(
-        environment=env.profile.pk,
-        agents=[agent.profile.pk for agent in agent_list],
-        tag=args.tag,
-        models=[env.model_name] + [agent.model_name for agent in agent_list],
-        agent_classes=[type(agent).__name__ for agent in agent_list],
-        messages=messages,
-        reasoning="Not evaluated. " + info[agent_list[0].agent_name]["comments"],
-        rewards=[0.0, 0.0],
-    )
-    original_path = artifact_dir / "simulation" / "original" / f"{episode_id}.json"
-    readable_path = artifact_dir / "simulation" / "readable" / f"{episode_id}.md"
-    write_json(original_path, episode.model_dump(mode="json"))
-    readable_path.parent.mkdir(parents=True, exist_ok=True)
-    readable_path.write_text(episode_markdown(episode), encoding="utf-8")
-    if args.push_to_db:
-        episode.save()
-        write_json(original_path, episode.model_dump(mode="json"))
-    return {
-        "episode_id": episode_id,
-        "status": "completed",
-        "env_id": env.profile.pk,
-        "agent_ids": episode.agents,
-        "turns": env.turn_number,
-        "episode_pk": episode.pk or None,
-        "evaluation_status": "not_performed",
-        "original": str(original_path.relative_to(run_dir)),
-        "readable": str(readable_path.relative_to(run_dir)),
-        "speech": str(speech_path.relative_to(run_dir)),
-        "conversation_audio": (
-            str(conversation_audio.relative_to(run_dir)) if conversation_audio else None
-        ),
-    }
-
-
 async def run_simulation_batch(
     records, args, run_dir, runner, *, concurrency_limit=None
 ) -> int:
@@ -588,6 +390,7 @@ async def run_simulation_batch(
             "tag": args.tag,
             "evaluation_status": "not_performed",
             "canonical_text": "asr_transcript",
+            "interaction_mode": "surface5-full-duplex",
         },
         concurrency=concurrency,
         max_attempts=3,
@@ -642,6 +445,227 @@ def matrix_report(run_dir: Path, state: dict) -> None:
     evaluation.write_matrix_report(run_dir, state, pairs)
 
 
+def build_episode(
+    record: dict[str, Any], args, asr_client, tts_client, tts_semaphore=None
+):
+    from sotopia.database import EnvironmentProfile
+    from talktopia.full_duplex.agent import CascadedDuplexAgent
+    from talktopia.full_duplex.config import (
+        ASR_DECODE_INTERVAL_MS,
+        ASR_WINDOW_MS,
+    )
+    from talktopia.full_duplex.episode import RuntimeConfig, profile_name
+    from talktopia.full_duplex.generation import DuplexGenerationEngine
+    from talktopia.full_duplex.speech_backends import SentenceTTS, WindowedASR
+    from talktopia.full_duplex.speech_client import SpeechClient
+    from talktopia.full_duplex.sotopia_adapter import ResolvedEpisode
+    from talktopia.speech_agent import AgentProfile
+    from talktopia.task_space import database_path
+
+    profiles = tuple(AgentProfile.get(pk) for pk in record["agent_ids"])
+    resolved = ResolvedEpisode(
+        combo_pk=record.get("combo_id") or record["env_id"],
+        env_profile=EnvironmentProfile.get(record["env_id"]),
+        agent_profiles=profiles,
+    )
+    agents = []
+    db = database_path()
+    for index, profile in enumerate(profiles, start=1):
+        reference = (db / profile.voice_reference_wav).resolve()
+        if not reference.is_relative_to(db):
+            raise ValueError("Voice reference must be inside the Talktopia DB")
+        speech = SpeechClient(
+            asr_client,
+            tts_client,
+            voice_id=profile.voice_id,
+            voice_reference=reference,
+            asr_model=args.asr_model,
+            tts_model=args.tts_model,
+            asr_language=args.asr_language,
+            tts_semaphore=tts_semaphore,
+        )
+        agents.append(
+            CascadedDuplexAgent(
+                profile=profile,
+                generation=DuplexGenerationEngine(
+                    getattr(args, f"agent{index}_model"),
+                    max_attempts=RuntimeConfig().generation_max_attempts,
+                ),
+                asr=WindowedASR(
+                    speech,
+                    decode_interval_ms=ASR_DECODE_INTERVAL_MS,
+                    window_ms=ASR_WINDOW_MS,
+                ),
+                tts=SentenceTTS(speech, source_agent=profile_name(profile)),
+                voice_reference=reference,
+                history_entries=RuntimeConfig().history_entries,
+            )
+        )
+    return resolved, agents
+
+
+async def run_one_episode(
+    resolved,
+    agent_list,
+    args,
+    run_dir: Path,
+    episode_id: str,
+    *,
+    artifact_dir: Path | None = None,
+) -> dict[str, Any]:
+    import time
+
+    from sotopia.database import EpisodeLog
+    from talktopia.full_duplex.audio import AudioRouter, StereoWavWriter
+    from talktopia.full_duplex.config import (
+        FRAME_MS,
+        INTERACTION_MODE,
+        SAMPLE_RATE_HZ,
+    )
+    from talktopia.full_duplex.episode import (
+        RuntimeConfig,
+        profile_background,
+        run_with_timeout,
+        write_speech_log,
+    )
+    from talktopia.full_duplex.events import (
+        ActionCommitted,
+        EpisodeEnded,
+        EventWriter,
+        read_events,
+    )
+    from talktopia.full_duplex.generation import AgentSessionContext
+    from talktopia.full_duplex.rendering import render_sotopia_messages
+    from talktopia.full_duplex.runtime import DuplexRuntime
+    from talktopia.full_duplex.sotopia_adapter import SotopiaSession
+    from talktopia.full_duplex.transcript import TranscriptBuilder
+
+    artifact_dir = artifact_dir or run_dir
+    base = artifact_dir / "simulation"
+    events_path = base / "events" / f"{episode_id}.jsonl"
+    speech_path = base / "speech" / f"{episode_id}.jsonl"
+    wav_path = base / "audio" / episode_id / "conversation.wav"
+    original_path = base / "original" / f"{episode_id}.json"
+    readable_path = base / "readable" / f"{episode_id}.md"
+    timeout_path = base / "diagnostics" / f"{episode_id}.json"
+    names = tuple(agent.agent_name for agent in agent_list)
+    agents = tuple(agent_list)
+    session = SotopiaSession(resolved, seed=args.seed)
+    writer = EventWriter(events_path, episode_id)
+    stereo = StereoWavWriter(wav_path, names)
+    runtime = DuplexRuntime(
+        resolved=resolved,
+        agents=agents,
+        session=session,
+        event_writer=writer,
+        audio_router=AudioRouter(names),
+        stereo_writer=stereo,
+        config=RuntimeConfig(max_turns=args.max_turns),
+        model_names=tuple(agent.model_name for agent in agents),
+        seed=args.seed,
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        frame_ms=FRAME_MS,
+    )
+    opened = False
+    started = time.monotonic()
+    try:
+        for index, agent in enumerate(agents):
+            await agent.start_session(
+                AgentSessionContext(
+                    episode_id=episode_id,
+                    agent_name=names[index],
+                    peer_name=names[1 - index],
+                    scenario=resolved.env_profile.scenario,
+                    self_background=profile_background(agent.profile),
+                    private_goal=resolved.env_profile.agent_goals[index],
+                )
+            )
+        snapshot = session.open(agents)
+        opened = True
+        ended = await run_with_timeout(
+            runtime, snapshot, args.episode_timeout_s, timeout_path
+        )
+        events = read_events(events_path)
+        transcript = TranscriptBuilder.from_events(events)
+        entries = transcript.build()
+        write_speech_log(speech_path, entries, agents, args)
+        commits = [event for event in events if isinstance(event, ActionCommitted)]
+        episode = EpisodeLog(
+            environment=resolved.env_profile.pk,
+            agents=[agent.profile.pk for agent in agents],
+            tag=args.tag,
+            models=[args.env_model, *(agent.model_name for agent in agents)],
+            agent_classes=[type(agent).__name__ for agent in agents],
+            messages=render_sotopia_messages(snapshot.observations, commits, entries),
+            reasoning=f"Not evaluated. Ended: {ended.reason}.",
+            rewards=[0.0, 0.0],
+        )
+        if args.push_to_db:
+            episode.save()
+        write_json(original_path, episode.model_dump(mode="json"))
+        _, turns = episode.render_for_humans()
+        readable_path.parent.mkdir(parents=True, exist_ok=True)
+        readable_path.write_text(
+            "# Speech conversation\n\nEvaluation: not performed.\n\n"
+            + "\n\n".join(turns[:-2])
+            + "\n",
+            encoding="utf-8",
+        )
+        writer.emit(
+            EpisodeEnded,
+            runtime.state.now_ms,
+            status="completed",
+            reason=ended.reason,
+            duration_ms=ended.duration_ms,
+        )
+        return {
+            "episode_id": episode_id,
+            "status": "completed",
+            "interaction_mode": INTERACTION_MODE,
+            "env_id": resolved.env_profile.pk,
+            "agent_ids": episode.agents,
+            "turns": runtime.state.semantic_turn_number,
+            "end_reason": ended.reason,
+            "duration_ms": ended.duration_ms,
+            "wall_seconds": time.monotonic() - started,
+            "episode_pk": episode.pk or None,
+            "evaluation_status": "not_performed",
+            "original": str(original_path.relative_to(run_dir)),
+            "readable": str(readable_path.relative_to(run_dir)),
+            "speech": str(speech_path.relative_to(run_dir)),
+            "events": str(events_path.relative_to(run_dir)),
+            "conversation_audio": str(wav_path.relative_to(run_dir)),
+        }
+    except BaseException as exc:
+        writer.emit(
+            EpisodeEnded,
+            runtime.state.now_ms,
+            status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+            reason="episode_timeout"
+            if isinstance(exc, TimeoutError)
+            else "episode_error",
+            duration_ms=runtime.state.now_ms,
+            error_type=type(exc).__name__,
+            error_message=safe_error(exc),
+        )
+        # Failed attempts retain their delivered audio and transcript for inspection.
+        write_speech_log(
+            speech_path,
+            TranscriptBuilder.from_events(read_events(events_path)).build(),
+            agents,
+            args,
+        )
+        raise
+    finally:
+        await asyncio.gather(
+            *(agent.stop_session() for agent in agents), return_exceptions=True
+        )
+        if opened:
+            session.close()
+        stereo.close()
+        writer.close()
+
+
 async def stage_3_simulate(
     records: Sequence[dict[str, Any]], args: argparse.Namespace, run_dir: Path
 ) -> int:
@@ -682,9 +706,11 @@ async def stage_3_simulate(
                         base_url=url, api_key=tts_key, timeout=120, max_retries=0
                     ) as tts_client,
                 ):
-                    env, agents = build_episode(record, args, asr_client, tts_client)
+                    resolved, agents = build_episode(
+                        record, args, asr_client, tts_client
+                    )
                     return await run_one_episode(
-                        env,
+                        resolved,
                         agents,
                         args,
                         run_dir,
@@ -708,11 +734,11 @@ async def stage_3_simulate(
         tts_semaphore = asyncio.Semaphore(TTS_BATCH_SIZE)
 
         async def run(record, artifact_dir, result_path):
-            env, agents = build_episode(
+            resolved, agents = build_episode(
                 record, args, asr_client, tts_client, tts_semaphore
             )
             return await run_one_episode(
-                env,
+                resolved,
                 agents,
                 args,
                 run_dir,

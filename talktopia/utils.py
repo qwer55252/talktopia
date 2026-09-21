@@ -93,6 +93,7 @@ def input_fingerprints(db_path: Path) -> dict[str, str]:
     paths.extend(path for path in (db_path / "voices").rglob("*") if path.is_file())
     paths.extend((REPO_ROOT / "talktopia").rglob("*.py"))
     paths.extend((REPO_ROOT / "patches").glob("*.patch"))
+    paths.append(REPO_ROOT / "talktopia/full_duplex/source.json")
     paths.extend(
         REPO_ROOT / name
         for name in ("engine.lock", "requirements.lock", "run_pipeline.sh")
@@ -168,7 +169,14 @@ def result_artifacts(result: dict[str, Any], run_dir: Path) -> dict[str, str]:
         raise ValueError("Episode result does not match its environment/agents")
     paths = {
         result[key]
-        for key in ("original", "readable", "speech", "history", "conversation_audio")
+        for key in (
+            "original",
+            "readable",
+            "speech",
+            "history",
+            "conversation_audio",
+            "events",
+        )
         if result.get(key)
     }
     if result.get("speech"):
@@ -268,7 +276,9 @@ async def run_episode_batch(
         summary["status"] = status or (
             "failed"
             if summary["failed"]
-            else "partial" if summary["pending"] else "completed"
+            else "partial"
+            if summary["pending"]
+            else "completed"
         )
         if on_checkpoint is not None:
             on_checkpoint(summary)
@@ -401,6 +411,13 @@ def restore_run(
 ) -> argparse.Namespace:
     run_dir = args.resume_run.expanduser().resolve()
     saved = json.loads((run_dir / "run_config.json").read_text())
+    if (
+        saved.get("stage") != "reevaluate"
+        and saved.get("interaction_mode") != "surface5-full-duplex"
+    ):
+        raise ValueError(
+            "Cannot resume a round-robin run with the full-duplex agent; reevaluation remains supported"
+        )
     if "input_fingerprints" not in saved:
         raise ValueError("This run predates resumable runs; start a new run")
     values = {key: value for key, value in saved.items() if key in vars(args)}
@@ -425,6 +442,8 @@ def speech_runtime() -> dict:
 
 
 def validate_run_inputs(run_dir: Path, db_path: Path, manifest_path: Path) -> dict:
+    from talktopia.full_duplex.config import runtime_settings
+
     config = json.loads((run_dir / "run_config.json").read_text())
     if config["input_fingerprints"] != input_fingerprints(db_path):
         raise ValueError(
@@ -433,6 +452,10 @@ def validate_run_inputs(run_dir: Path, db_path: Path, manifest_path: Path) -> di
     if config.get("speech_runtime") != speech_runtime():
         raise ValueError(
             "Speech server settings changed since this run was created; resume refused"
+        )
+    if config.get("duplex_runtime") != runtime_settings(config["max_turns"]):
+        raise ValueError(
+            "Duplex settings changed since this run was created; resume refused"
         )
     if file_hash(manifest_path) != config["manifest_sha256"]:
         raise ValueError("Frozen manifest changed; resume refused")
@@ -444,11 +467,15 @@ def save_run_config(args, run_dir, db_path, manifest_path, **extra) -> None:
         key: str(value.expanduser().resolve()) if isinstance(value, Path) else value
         for key, value in vars(args).items()
     }
+    from talktopia.full_duplex.config import INTERACTION_MODE, runtime_settings
+
     write_json(
         run_dir / "run_config.json",
         {
             **config,
             "run_id": run_dir.name,
+            "interaction_mode": INTERACTION_MODE,
+            "duplex_runtime": runtime_settings(args.max_turns),
             "input_fingerprints": input_fingerprints(db_path),
             "speech_runtime": speech_runtime(),
             "manifest_sha256": (
