@@ -10,7 +10,7 @@ from typing import Any
 
 from .config import MODEL_ALIASES, OLLAMA_ENDPOINTS, PROXY_HOST, PROXY_PORT
 
-NON_REASONING_DEFAULT_MODELS = {"qwen3.5:9b"}
+NON_REASONING_DEFAULT_MODELS = {"qwen3.5:9b", "deepseek-r1:8b"}
 EVALUATOR_DEFAULT_MAX_TOKENS = 8192
 EVALUATOR_MODELS = {
     spec["model"]
@@ -72,6 +72,82 @@ def forward_json(
             return exc.code, {"error": raw}
 
 
+def deepseek_answer_prompt(messages: list[dict[str, Any]]) -> str:
+    """Close the R1 reasoning prefix before generating the answer tokens."""
+    if not messages or messages[-1].get("role") != "user":
+        raise ValueError("DeepSeek answer-only requests must end with a user message")
+    system = []
+    conversation = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise ValueError("DeepSeek answer-only requests require text messages")
+        match message.get("role"):
+            case "system":
+                system.append(content)
+            case "user":
+                conversation.append(f"<｜User｜>{content}<｜Assistant｜>")
+            case "assistant":
+                conversation.append(content + "<｜end▁of▁sentence｜>")
+            case _:
+                raise ValueError("Unsupported role in DeepSeek answer-only request")
+    return (
+        "<｜begin▁of▁sentence｜>" + "\n\n".join(system)
+        + "".join(conversation) + "<think>\n</think>\n"
+    )
+
+
+def forward_deepseek_answer(
+    endpoint: str, payload: dict[str, Any], timeout: int
+) -> tuple[int, dict[str, Any]]:
+    # R1-0528 ignores think=false through its chat template. Raw generation
+    # preserves the model weights and explicitly prefills an empty think block.
+    if payload.get("stream"):
+        raise ValueError("DeepSeek answer-only streaming is not supported")
+    request = {
+        "model": payload["model"],
+        "prompt": deepseek_answer_prompt(payload.get("messages", [])),
+        "raw": True,
+        "think": False,
+        "stream": False,
+        "options": {
+            key: payload[key]
+            for key in ("temperature", "top_p", "seed") if key in payload
+        },
+    }
+    if payload.get("max_tokens") is not None:
+        request["options"]["num_predict"] = payload["max_tokens"]
+    response_format = payload.get("response_format") or {}
+    if response_format.get("type") == "json_schema":
+        request["format"] = response_format["json_schema"]["schema"]
+    elif response_format.get("type") == "json_object":
+        request["format"] = "json"
+    status, response = forward_json(f"{endpoint}/api/generate", request, timeout)
+    if status != 200:
+        return status, response
+    content = response.get("response", "")
+    if response.get("thinking") or "<think>" in content or "</think>" in content:
+        return 502, {"error": "DeepSeek emitted reasoning despite the empty-think prefix"}
+    return 200, {
+        "id": f"chatcmpl-{time.time_ns()}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": payload["model"],
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
+                     "finish_reason": "length" if response.get("done_reason") == "length" else "stop"}],
+        "usage": {
+            "prompt_tokens": response.get("prompt_eval_count", 0),
+            "completion_tokens": response.get("eval_count", 0),
+            "total_tokens": response.get("prompt_eval_count", 0) + response.get("eval_count", 0),
+        },
+        "talktopia_model_proxy": {
+            "reasoning_mode": "empty_think_prefill",
+            "reasoning_chars": 0,
+            "generation_seconds": response.get("eval_duration", 0) / 1e9,
+        },
+    }
+
+
 class OllamaProxyHandler(BaseHTTPRequestHandler):
     server_version = "talktopia-ollama-proxy/0.1"
 
@@ -128,11 +204,16 @@ class OllamaProxyHandler(BaseHTTPRequestHandler):
         payload["model"] = ollama_model
         apply_model_defaults(payload, ollama_model)
 
-        status, response = forward_json(
-            f"{endpoint['url']}/v1/chat/completions",
-            payload,
-            timeout=600,
-        )
+        try:
+            if ollama_model == "deepseek-r1:8b" and payload.get("reasoning_effort") == "none":
+                status, response = forward_deepseek_answer(endpoint["url"], payload, timeout=600)
+            else:
+                status, response = forward_json(
+                    f"{endpoint['url']}/v1/chat/completions", payload, timeout=600
+                )
+        except ValueError as exc:
+            json_response(self, 400, {"error": str(exc)})
+            return
         if isinstance(response, dict):
             response.setdefault("talktopia_model_proxy", {})
             if isinstance(response["talktopia_model_proxy"], dict):
@@ -143,6 +224,11 @@ class OllamaProxyHandler(BaseHTTPRequestHandler):
                         "endpoint": endpoint_name,
                     }
                 )
+                if response["talktopia_model_proxy"].get("reasoning_mode"):
+                    self.log_message("answer_only %s", json.dumps({
+                        **response["talktopia_model_proxy"],
+                        "completion_tokens": response.get("usage", {}).get("completion_tokens"),
+                    }))
         json_response(self, status, response)
 
 

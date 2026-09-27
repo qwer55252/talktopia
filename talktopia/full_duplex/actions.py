@@ -20,7 +20,7 @@ DuplexActionType = Literal[
     "interruption",
 ]
 
-MAX_GENERATED_WORDS = 40
+MAX_GENERATED_WORDS = 50 # 40 in prompt, 50 in Surface5 runtime for safety margin
 
 _BASE_ACTION_TYPES = frozenset(
     {"none", "speak", "non-verbal communication", "action", "leave"}

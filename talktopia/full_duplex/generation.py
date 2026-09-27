@@ -15,7 +15,6 @@ from .actions import (
     DuplexActionDecision,
     DuplexActionType,
     HiddenSaid,
-    MAX_GENERATED_WORDS,
     SpeechChunk,
     StreamingObservation,
     _validate_generated_text,
@@ -28,6 +27,9 @@ GenerationStage = Literal[
     "hidden_said",
     "closing",
 ]
+
+# Keep the requested length independent from the validation safety margin.
+PROMPT_MAX_WORDS = 40
 
 _BACKCHANNELS = (
     "yeah",
@@ -302,9 +304,13 @@ def _normalize_json_payload(raw_text: str) -> str:
     candidate = _strip_leading_thinking(raw_text)
     if candidate.startswith("```"):
         first_newline = candidate.find("\n")
-        if first_newline == -1 or not candidate.endswith("```"):
-            raise ValueError("incomplete fenced JSON response")
-        candidate = candidate[first_newline + 1 : -3].strip()
+        if first_newline == -1:
+            raise ValueError("fenced JSON response has no content line")
+        # Models sometimes omit the closing fence. JSON parsing below still
+        # rejects truncated objects, strings, and extra trailing content.
+        candidate = candidate[first_newline + 1 :].strip()
+        if candidate.endswith("```"):
+            candidate = candidate[:-3].strip()
     if not candidate:
         raise ValueError("JSON response has no content")
     return candidate
@@ -465,7 +471,7 @@ class DuplexGenerationEngine:
                 "recent_history": recent_history or "(none yet)",
                 "observation": observation.model_dump_json(),
                 "action_type": decision.action_type,
-                "max_words": str(MAX_GENERATED_WORDS),
+                "max_words": str(PROMPT_MAX_WORDS),
             },
         )
 
@@ -504,7 +510,7 @@ class DuplexGenerationEngine:
             input_values={
                 "role_prompt": self._role_prompt(session),
                 "recent_history": recent_history or "(none yet)",
-                "max_words": str(MAX_GENERATED_WORDS),
+                "max_words": str(PROMPT_MAX_WORDS),
             },
         )
 
@@ -577,7 +583,7 @@ class DuplexGenerationEngine:
                         "recent_history": recent_history or "(none yet)",
                         "observation": observation.model_dump_json(),
                         "action_type": action_type,
-                        "max_words": str(MAX_GENERATED_WORDS),
+                        "max_words": str(PROMPT_MAX_WORDS),
                         "validation_feedback": json.dumps(errors[-1:]),
                         "format_instructions": parser.get_format_instructions(),
                     },
