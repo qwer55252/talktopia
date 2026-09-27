@@ -4,12 +4,66 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
+import os
 from pathlib import Path
 
 from talktopia.models.config import local_alias
 
 PATH_OPTIONS = ("simulation_dir", "episode_json")
+
+
+def resolve_source_context(args) -> None:
+    """Use the source mode and database, including for historical evaluations."""
+    from talktopia.experiment import INTERACTION_MODES
+
+    source_config = {}
+    if args.simulation_dir:
+        source_config = json.loads(
+            (args.simulation_dir / "run_config.json").read_text()
+        )
+    elif args.episode_json:
+        for parent in args.episode_json.expanduser().resolve().parents:
+            if (parent / "run_config.json").is_file():
+                source_config = json.loads((parent / "run_config.json").read_text())
+                break
+    mode = source_config.get("interaction_mode")
+    if not mode and args.episode_json:
+        source = json.loads(args.episode_json.read_text())
+        classes = set(source.get("agent_classes") or [])
+        if classes == {"CascadedSpeechAgent"}:
+            mode = "round-robin"
+        elif classes == {"CascadedDuplexAgent"}:
+            mode = "surface5-full-duplex"
+    if not mode and source_config:
+        mode = "round-robin"  # Before Surface5, configs had no mode field.
+    if args.interaction_mode and mode and args.interaction_mode != mode:
+        raise ValueError("Requested evaluation mode differs from the source run")
+    args.interaction_mode = mode or args.interaction_mode
+    if args.interaction_mode not in INTERACTION_MODES:
+        raise ValueError("Source mode is unknown; supply --interaction-mode")
+
+    db = source_config.get("database_path")
+    fingerprints = source_config.get("input_fingerprints", {})
+    if not db:
+        # Old configs record absolute collection paths rather than a DB field.
+        candidates = {
+            str(Path(path).parent.parent)
+            for path in fingerprints
+            if Path(path).parent.name == "AgentProfile"
+        }
+        if len(candidates) == 1:
+            db = candidates.pop()
+    if not db:
+        db = os.environ.get("TALKTOPIA_DB_DIR")
+    if not db:
+        raise ValueError("Source database is unknown; set TALKTOPIA_DB_DIR explicitly")
+    args.database_path = str(Path(db).expanduser().resolve())
+    from talktopia.utils import file_hash
+
+    for path, expected in fingerprints.items():
+        if Path(path).is_relative_to(args.database_path):
+            if not Path(path).is_file() or file_hash(Path(path)) != expected:
+                raise ValueError(f"Source database or voice changed: {path}")
 
 
 def add_arguments(parser: argparse.ArgumentParser, models: dict[str, str]) -> None:
@@ -29,7 +83,6 @@ def add_arguments(parser: argparse.ArgumentParser, models: dict[str, str]) -> No
         type=Path,
         help="Evaluate valid results from a finished simulation run, even if some episodes failed.",
     )
-    parser.add_argument("--reeval-tag", default="talktopia_pipeline_reeval")
     parser.add_argument("--reeval-max-retries", type=int, default=2)
     parser.add_argument(
         "--reeval-episode-id",
@@ -51,10 +104,6 @@ def validate_arguments(
         args.evaluate_after_simulation = True
     if args.eval_batch_size is not None and args.eval_batch_size <= 0:
         parser.error("--eval-batch-size must be positive")
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.reeval_tag):
-        parser.error(
-            "--reeval-tag must use letters, digits, dots, underscores or hyphens"
-        )
     if args.agent1_models:
         try:
             local_alias(args.evaluator_model)
@@ -76,12 +125,7 @@ def validate_arguments(
             parser.error(
                 "--episode-json or --simulation-dir is required for --stage reevaluate"
             )
-        if (
-            args.sample_manifest
-            or args.env_id
-            or args.environment_list_pk
-            or args.use_stored_combos
-        ):
+        if args.sample_manifest:
             parser.error(
                 "--stage reevaluate uses --episode-json, not sampling selections"
             )

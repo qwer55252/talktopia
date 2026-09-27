@@ -51,6 +51,19 @@ print(" ".join(values))
 read -r OLLAMA_NUM_PARALLEL OLLAMA_CONTEXT_LENGTH TALKTOPIA_TTS_BATCH_SIZE TALKTOPIA_SPEECH_WORKERS_PER_GPU <<< "$RUNTIME_SETTINGS"
 export OLLAMA_NUM_PARALLEL OLLAMA_CONTEXT_LENGTH TALKTOPIA_TTS_BATCH_SIZE TALKTOPIA_SPEECH_WORKERS_PER_GPU
 
+# Import configuration only after restoring saved server settings. Validate all
+# 450 canonical combos before starting any model process.
+TALKTOPIA_DB_DIR=$("$PYTHON_BIN" -c '
+import sys
+from contextlib import redirect_stdout
+from talktopia.pipeline import parse_args, resolve_run_args, preflight
+args = resolve_run_args(parse_args(sys.argv[1:]))
+with redirect_stdout(sys.stderr):
+    database = preflight(args)
+print(database)
+' "$@")
+export TALKTOPIA_DB_DIR
+
 cleanup() {
   local pipeline_status=$?
   trap - EXIT

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from talktopia.utils import safe_error, write_json
+from talktopia.utils import file_hash, safe_error, write_json
 from .reporting import write_episode_report
 
 from pydantic import Field, field_validator
@@ -132,6 +132,44 @@ class TwoAgentEvaluation(EvaluationForAgents[SotopiaDimensions]):
         return {key: values[key] for key in ("agent_1", "agent_2")}
 
 
+def round_robin_history(source: EpisodeLog) -> tuple[list, list[str]]:
+    if source.agent_classes and set(source.agent_classes) != {"CascadedSpeechAgent"}:
+        raise ValueError("Round-robin evaluation requires round-robin agents")
+    return source.render_for_humans()
+
+
+def duplex_history(
+    source: EpisodeLog, events_path: Path | None
+) -> tuple[list, list[str]]:
+    if source.agent_classes and set(source.agent_classes) != {"CascadedDuplexAgent"}:
+        raise ValueError("Surface5 evaluation requires full-duplex agents")
+    if events_path is not None:
+        from talktopia.full_duplex.events import (
+            ActionCommitted,
+            EpisodeStarted,
+            read_events,
+        )
+        from talktopia.full_duplex.rendering import render_sotopia_messages
+        from talktopia.full_duplex.transcript import TranscriptBuilder
+
+        events = read_events(events_path)
+        starts = [event for event in events if isinstance(event, EpisodeStarted)]
+        if len(starts) != 1:
+            raise ValueError("Expected one episode start event")
+        messages = render_sotopia_messages(
+            starts[0].initial_observations,
+            [event for event in events if isinstance(event, ActionCommitted)],
+            TranscriptBuilder.from_events(events).build(),
+        )
+        if messages != source.messages:
+            raise ValueError(
+                "Saved Surface5 messages differ from committed ASR evidence"
+            )
+    # Older standalone EpisodeLogs may not have sidecars. Their stored messages
+    # remain the evidence; generated text is never substituted for ASR text.
+    return source.render_for_humans()
+
+
 async def evaluate_episode(
     args: argparse.Namespace,
     run_dir: Path,
@@ -150,6 +188,9 @@ async def evaluate_episode(
         "source_sha256": None,
         "reeval_tag": args.reeval_tag,
         "evaluator_model": args.evaluator_model,
+        "interaction_mode": args.interaction_mode,
+        "source_events": None,
+        "source_events_sha256": None,
         "temperature": 0.0,
         "max_retries": args.reeval_max_retries,
         "push_to_db": args.push_to_db,
@@ -175,7 +216,32 @@ async def evaluate_episode(
             )
         if not source.messages or len(source.messages[0]) < 2:
             raise ValueError("Episode is missing the two initial agent perspectives")
-        profiles, turns = source.render_for_humans()
+        if args.interaction_mode == "round-robin":
+            profiles, turns = round_robin_history(source)
+        elif args.interaction_mode == "surface5-full-duplex":
+            events = getattr(args, "source_events", None)
+            events_path = (
+                Path(events)
+                if events
+                else source_path.parent.parent
+                / "events"
+                / source_path.name.replace(".json", ".jsonl")
+            )
+            if events or events_path.exists():
+                events_hash = file_hash(events_path)
+                expected_hash = getattr(args, "source_events_sha256", None)
+                if expected_hash and events_hash != expected_hash:
+                    raise ValueError(
+                        "Source events changed since evaluation was prepared"
+                    )
+                summary.update(
+                    source_events=str(events_path), source_events_sha256=events_hash
+                )
+            else:
+                events_path = None
+            profiles, turns = duplex_history(source, events_path)
+        else:
+            raise ValueError(f"Unknown evaluation mode: {args.interaction_mode}")
         names = [
             f"{profile.first_name} {profile.last_name}".strip() for profile in profiles
         ]
@@ -188,7 +254,7 @@ async def evaluate_episode(
             )
         if args.push_to_db and args.reeval_tag == source.tag:
             raise ValueError(
-                "--reeval-tag must differ from the source tag when saving to DB"
+                "Evaluation run ID must differ from the source tag when saving to DB"
             )
         history = (
             "\n".join(turns[:-2])

@@ -5,10 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import math
 import os
-import random
-import re
 import signal
 import shutil
 import subprocess
@@ -16,11 +13,20 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 from urllib.parse import urlsplit
 
 from talktopia import evaluation
 from talktopia import utils
+from talktopia.experiment import (
+    INTERACTION_MODES,
+    MAX_TURNS,
+    EPISODE_TIMEOUT_S,
+    UNCOUNTED_ACTIONS,
+    canonical_dataset,
+    validate_dataset,
+    validate_manifest,
+)
 from talktopia.utils import (
     completed_result,
     configure_generation,
@@ -52,6 +58,11 @@ from talktopia.models.config import (
     speech_url,
 )
 
+if TYPE_CHECKING:
+    from openai import AsyncOpenAI
+    from sotopia.envs import ParallelSotopiaEnv
+    from talktopia.speech_agent import CascadedSpeechAgent
+
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     models = default_pipeline_models()
@@ -67,9 +78,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "outputs")
     parser.add_argument(
-        "--tag",
-        default="talktopia_pipeline",
-        help="Run label and directory prefix; each run adds a UTC timestamp and unique suffix.",
+        "--interaction-mode",
+        choices=INTERACTION_MODES,
+        help="Conversation mode; new simulations default to round-robin.",
+    )
+    parser.set_defaults(
+        max_turns=MAX_TURNS,
+        episode_timeout_s=EPISODE_TIMEOUT_S,
+        tag=None,
+        reeval_tag=None,
+        database_path=None,
     )
     for role in ("env", "agent1", "agent2"):
         parser.add_argument(f"--{role}-model", default=models[role])
@@ -95,33 +113,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--episode-limit",
         type=int,
         default=0,
-        help="Maximum unfinished episodes to run this invocation; 0 means all.",
-    )
-    parser.add_argument(
-        "--use-stored-combos",
-        action="store_true",
-        help="Use stored character pairs instead of sampling new pairs.",
+        help="Maximum unfinished episodes per model pair this invocation; 0 means all 450.",
     )
     parser.add_argument(
         "--bad-output-process-model",
         default=models["agent2"],
         help="Local model used by SOTOPIA to repair malformed model output.",
     )
-    selection = parser.add_mutually_exclusive_group()
-    selection.add_argument("--environment-list-pk", default="")
-    selection.add_argument("--env-id", action="append", default=[])
-    selection.add_argument(
+    parser.add_argument(
         "--sample-manifest",
         type=Path,
-        help="Reuse all env_id/agent_ids pairs; ignores sample counts and seed.",
+        help="Reuse the complete canonical 450-combo manifest.",
     )
-    parser.add_argument(
-        "--num-envs", type=int, default=1, help="0 selects all environments."
-    )
-    parser.add_argument("--pairs-per-env", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--max-turns", type=int, default=12)
-    parser.add_argument("--episode-timeout-s", type=float, default=150.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--push-to-db", action="store_true")
     parser.add_argument(
@@ -195,21 +199,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error(
             "Talktopia requires --storage-backend local; Redis is not supported"
         )
-    for name in ("pairs_per_env", "batch_size", "max_turns"):
-        if getattr(args, name) <= 0:
-            parser.error(f"--{name.replace('_', '-')} must be positive")
-    if not math.isfinite(args.episode_timeout_s) or args.episode_timeout_s <= 0:
-        parser.error("--episode-timeout-s must be finite and positive")
-    if args.num_envs < 0:
-        parser.error("--num-envs must be nonnegative (0 means all)")
-    for name in ("tag",):
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", getattr(args, name)):
-            parser.error(
-                f"--{name.replace('_', '-')} must use letters, digits, dots, underscores or hyphens"
-            )
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+    if args.seed < 0:
+        parser.error("--seed must be nonnegative")
+    if args.stage != "reevaluate" and args.interaction_mode is None:
+        args.interaction_mode = "round-robin"
     evaluation.validate_arguments(parser, args)
-    if args.use_stored_combos and args.sample_manifest:
-        parser.error("--use-stored-combos and --sample-manifest cannot be combined")
     if args.stage in {"all", "simulate"} and not args.dry_run:
         for kind in ("asr", "tts"):
             url = urlsplit(getattr(args, f"{kind}_base_url"))
@@ -232,76 +228,60 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def model_names(args: argparse.Namespace) -> dict[str, str]:
-    return {
-        role: getattr(args, f"{role}_model") for role in ("env", "agent1", "agent2")
-    }
-
-
 def env_params(args: argparse.Namespace) -> dict[str, Any]:
     from sotopia.envs.evaluators import RuleBasedTerminatedEvaluator
+    from sotopia.messages import AgentAction
+
+    class BudgetTerminatedEvaluator(RuleBasedTerminatedEvaluator):
+        def __call__(self, turn_number, messages, **kwargs):
+            # Keep engine step numbers for alternation and history. Only actual
+            # actions consume the comparison budget; stale/leave rules stay intact.
+            budget_turns = sum(
+                isinstance(message, AgentAction)
+                and message.action_type not in UNCOUNTED_ACTIONS
+                for speaker, message in messages
+                if speaker != "Environment"
+            )
+            return super().__call__(budget_turns, messages, **kwargs)
 
     return {
         "model_name": args.env_model,
         "action_order": "round-robin",
         "evaluators": [
-            RuleBasedTerminatedEvaluator(
-                max_turn_number=args.max_turns, max_stale_turn=2
-            )
+            BudgetTerminatedEvaluator(max_turn_number=args.max_turns, max_stale_turn=2)
         ],
         "terminal_evaluators": [],
     }
 
 
-def stage_1_sample_env_profiles(
-    args: argparse.Namespace, manifest: list[dict[str, Any]] | None = None
-) -> list[Any]:
+def stage_1_sample_env_profiles(args, manifest=None) -> list[Any]:
     from sotopia.database import EnvironmentProfile
-    from sotopia.database.persistent_profile import EnvironmentList
 
+    source, _ = canonical_dataset()
     if manifest is not None:
-        selected = list(dict.fromkeys(record["env_id"] for record in manifest))
-    else:
-        if args.env_id:
-            candidates = sorted(set(args.env_id))
-        elif args.environment_list_pk:
-            candidates = sorted(
-                set(EnvironmentList.get(args.environment_list_pk).environments)
-            )
-        else:
-            candidates = sorted(EnvironmentProfile.all_pks())
-        if not candidates:
-            raise ValueError(
-                "No environments found. Prepare profiles with ./load_profiles.sh first."
-            )
-        selected = (
-            candidates
-            if args.num_envs == 0
-            else random.Random(args.seed).sample(
-                candidates, min(args.num_envs, len(candidates))
-            )
-        )
-    profiles = [EnvironmentProfile.get(pk) for pk in selected]
-    for profile in profiles:
-        if len(profile.agent_goals) != 2:
-            raise ValueError(
-                f"Environment {profile.pk} must have exactly two agent goals"
-            )
+        validate_manifest(manifest)
+    profiles = [
+        EnvironmentProfile.get(row["pk"])
+        for row in sorted(source["EnvironmentProfile"], key=lambda row: row["pk"])
+    ]
+    if any(len(profile.agent_goals) != 2 for profile in profiles):
+        raise ValueError("Every environment must have exactly two agent goals")
     return profiles
 
 
-def stage_2_sample_characters(
-    env_profiles: Sequence[Any],
-    args: argparse.Namespace,
-    manifest: list[dict[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
-    from sotopia.agents import LLMAgent
+def stage_2_sample_characters(env_profiles, args, manifest=None) -> list[dict]:
     from talktopia.speech_agent import AgentProfile
-    from sotopia.samplers import ConstraintBasedSampler
 
+    source, _ = canonical_dataset()
+    environments = {profile.pk: profile for profile in env_profiles}
     records = []
-
-    def add_record(env: Any, profiles: Sequence[Any]) -> None:
+    for index, combo in enumerate(
+        sorted(
+            source["EnvAgentComboStorage"], key=lambda row: (row["env_id"], row["pk"])
+        ),
+        1,
+    ):
+        profiles = [AgentProfile.get(pk) for pk in combo["agent_ids"]]
         names = [
             f"{profile.first_name} {profile.last_name}".strip() for profile in profiles
         ]
@@ -309,73 +289,35 @@ def stage_2_sample_characters(
             raise ValueError("The two agent profiles must have distinct names")
         records.append(
             {
-                "env_id": env.pk,
-                "codename": env.codename,
-                "agent_ids": [profile.pk for profile in profiles],
+                "episode_id": f"episode_{index:04d}",
+                "combo_id": combo["pk"],
+                "env_id": combo["env_id"],
+                "codename": environments[combo["env_id"]].codename,
+                "agent_ids": combo["agent_ids"],
                 "agent_names": names,
-                "models": model_names(args),
             }
         )
-
+    validate_manifest(records)
     if manifest is not None:
-        environments = {profile.pk: profile for profile in env_profiles}
-        for record in manifest:
-            profiles = [AgentProfile.get(pk) for pk in record["agent_ids"]]
-            add_record(environments[record["env_id"]], profiles)
-            for key in ("episode_id", "combo_id"):
-                if key in record:
-                    records[-1][key] = record[key]
-        return records
-
-    if args.use_stored_combos:
-        from sotopia.database import EnvAgentComboStorage
-
-        combos = sorted(
-            EnvAgentComboStorage.all(), key=lambda combo: (combo.env_id, combo.pk)
-        )
-        for env in sorted(env_profiles, key=lambda profile: profile.pk):
-            selected = [combo for combo in combos if combo.env_id == env.pk]
-            if len(selected) < args.pairs_per_env:
-                raise ValueError(
-                    f"Environment {env.pk} has {len(selected)} stored combos; requested {args.pairs_per_env}"
-                )
-            for combo in selected[: args.pairs_per_env]:
-                if len(combo.agent_ids) != 2 or len(set(combo.agent_ids)) != 2:
-                    raise ValueError(f"Invalid stored combo {combo.pk}")
-                add_record(env, [AgentProfile.get(pk) for pk in combo.agent_ids])
-                records[-1]["combo_id"] = combo.pk
-        if len({(row["env_id"], tuple(row["agent_ids"])) for row in records}) != len(
-            records
-        ):
-            raise ValueError("Stored combos contain duplicate environment/agent pairs")
-        random.Random(args.seed).shuffle(records)
-        return records
-
-    # SOTOPIA's sampler uses the module RNG; limit its seed to synchronous sampling.
-    rng_state = random.getstate()
-    random.seed(args.seed)
-    try:
-        for profile in env_profiles:
-            sampler = ConstraintBasedSampler(env_candidates=[profile.pk])
-            for env, agents in sampler.sample(
-                agent_classes=[LLMAgent, LLMAgent],
-                replacement=False,
-                size=args.pairs_per_env,
-                env_params=env_params(args),
-                agents_params=[
-                    {"model_name": args.agent1_model},
-                    {"model_name": args.agent2_model},
-                ],
-            ):
-                add_record(env.profile, [agent.profile for agent in agents])
-    finally:
-        random.setstate(rng_state)
+        validate_manifest(manifest)
+        # Names and scenario labels must also come from the canonical DB.
+        if manifest != records:
+            raise ValueError("Imported manifest differs from canonical records")
     return records
 
 
 async def run_simulation_batch(
     records, args, run_dir, runner, *, concurrency_limit=None
 ) -> int:
+    summary_path = run_dir / "03_simulation.json"
+    if args.resume_run and summary_path.exists():
+        if (
+            json.loads(summary_path.read_text()).get("interaction_mode")
+            != args.interaction_mode
+        ):
+            raise ValueError(
+                "Saved simulation progress has a different interaction mode"
+            )
     concurrency = args.batch_size
     if concurrency_limit is not None:
         concurrency = min(concurrency, concurrency_limit)
@@ -385,17 +327,22 @@ async def run_simulation_batch(
         run_dir,
         "simulation",
         runner,
-        summary_path=run_dir / "03_simulation.json",
+        summary_path=summary_path,
         initial_summary={
             "tag": args.tag,
             "evaluation_status": "not_performed",
             "canonical_text": "asr_transcript",
-            "interaction_mode": "surface5-full-duplex",
+            "interaction_mode": args.interaction_mode,
+            "coverage": validate_manifest(records),
         },
         concurrency=concurrency,
         max_attempts=3,
         validate_artifacts=result_artifacts,
-        error_fields={"conversation_audio": None, "evaluation_status": "not_performed"},
+        error_fields={
+            "conversation_audio": None,
+            "evaluation_status": "not_performed",
+            "interaction_mode": args.interaction_mode,
+        },
         attempt_fields=("speech_worker",),
     )
 
@@ -406,7 +353,10 @@ def prepare_simulation_run(args, run_dir, db_path, records=None):
         if args.stage == "sample":
             raise ValueError("Resume requires a simulation or batch evaluation run")
         validate_run_inputs(run_dir, db_path, manifest_path)
-        return read_manifest(manifest_path)
+        records = read_manifest(manifest_path)
+        validate_manifest(records)
+        return records
+    validate_manifest(records)
     write_json(manifest_path, records)
     save_run_config(args, run_dir, db_path, manifest_path)
     return records
@@ -445,7 +395,220 @@ def matrix_report(run_dir: Path, state: dict) -> None:
     evaluation.write_matrix_report(run_dir, state, pairs)
 
 
-def build_episode(
+def build_round_robin_episode(
+    record: dict[str, Any],
+    args: argparse.Namespace,
+    asr_client: AsyncOpenAI,
+    tts_client: AsyncOpenAI,
+    tts_semaphore: asyncio.Semaphore | None = None,
+) -> tuple[ParallelSotopiaEnv, list[CascadedSpeechAgent]]:
+    from sotopia.database import EnvironmentProfile
+    from sotopia.envs import ParallelSotopiaEnv
+    from talktopia.speech_agent import AgentProfile, CascadedSpeechAgent
+
+    env = ParallelSotopiaEnv(
+        env_profile=EnvironmentProfile.get(record["env_id"]), **env_params(args)
+    )
+    agents = [
+        CascadedSpeechAgent(
+            agent_profile=AgentProfile.get(pk),
+            model_name=getattr(args, f"agent{index}_model"),
+            asr_client=asr_client,
+            tts_client=tts_client,
+            tts_semaphore=tts_semaphore,
+            asr_model=args.asr_model,
+            tts_model=args.tts_model,
+            asr_language=args.asr_language,
+        )
+        for index, pk in enumerate(record["agent_ids"], start=1)
+    ]
+    return env, agents
+
+
+def episode_markdown(episode: Any) -> str:
+    _, turns = episode.render_for_humans()
+    return (
+        "# Speech conversation\n\nEvaluation: not performed.\n\n"
+        + "\n\n".join(turns[:-2])
+        + "\n"
+    )
+
+
+async def run_round_robin_episode(
+    env: ParallelSotopiaEnv,
+    agent_list: Sequence[CascadedSpeechAgent],
+    args: argparse.Namespace,
+    run_dir: Path,
+    episode_id: str,
+    *,
+    artifact_dir: Path | None = None,
+) -> dict[str, Any]:
+    from sotopia.agents import Agents
+    from sotopia.database import EpisodeLog
+    from sotopia.messages import AgentAction
+    from sotopia.messages.message_classes import ScriptBackground
+    from talktopia.speech_agent import combine_conversation_audio, prepare_tts_text
+
+    started = time.monotonic()
+    budget_turns = 0
+    action_counts = {}
+    agents = Agents({agent.agent_name: agent for agent in agent_list})
+    observations = env.reset(agents=agents, omniscient=False)
+    agents.reset()
+    # LLMAgent uses only the names here for recipient validation, not private goals.
+    names_only = ScriptBackground(
+        scenario="", agent_names=list(agents), agent_backgrounds=[], agent_goals=[]
+    )
+    for index, agent in enumerate(agent_list):
+        agent.goal = env.profile.agent_goals[index]
+        agent.script_background = names_only
+
+    messages = [
+        [
+            ("Environment", name, obs.to_natural_language())
+            for name, obs in observations.items()
+        ]
+    ]
+    artifact_dir = artifact_dir or run_dir
+    speech_path = artifact_dir / "simulation" / "speech" / f"{episode_id}.jsonl"
+    speech_path.parent.mkdir(parents=True, exist_ok=True)
+    utterances: list[tuple[Path, int]] = []
+    with speech_path.open("x", encoding="utf-8") as speech_output:
+        while True:
+            actions = {}
+            # Inactive agents receive the last turn; LLMAgent returns none without inference.
+            for index, agent in enumerate(agent_list):
+                action = await agent.aact(observations[agent.agent_name])
+                action = AgentAction.model_validate(
+                    action.model_dump(),
+                    context={"agent_names": list(agents), "sender": agent.agent_name},
+                )
+                if (
+                    action.action_type
+                    not in observations[agent.agent_name].available_actions
+                ):
+                    raise ValueError(
+                        f"{agent.agent_name} returned an unavailable action"
+                    )
+                if action.action_type == "speak":
+                    listener = agent_list[1 - index]
+                    tts_text = prepare_tts_text(action.argument)
+                    speech_record = {
+                        "turn": env.turn_number + 1,
+                        "speaker": agent.agent_name,
+                        "listener": listener.agent_name,
+                        "to": action.to,
+                        "llm_text": action.argument,
+                        "tts_text": tts_text,
+                        "tts_model": agent.tts_model,
+                        "voice": agent.voice,
+                        "wav_path": None,
+                        "asr_model": listener.asr_model,
+                        "asr_text": None,
+                    }
+                    if not tts_text:
+                        speech_record.update(
+                            status="tts_skipped", reason="no_spoken_text"
+                        )
+                        action = AgentAction(action_type="none", argument="", to=[])
+                    else:
+                        filename = f"{env.turn_number + 1:04d}_agent{index + 1}.wav"
+                        wav_path = (
+                            artifact_dir
+                            / "simulation"
+                            / "audio"
+                            / episode_id
+                            / filename
+                        )
+                        audio = await agent.synthesize(tts_text)
+                        wav_path.parent.mkdir(parents=True, exist_ok=True)
+                        wav_path.write_bytes(audio)
+                        speech_record["wav_path"] = str(wav_path.relative_to(run_dir))
+                        try:
+                            transcript = await listener.transcribe(audio, filename)
+                        except Exception:
+                            speech_record["status"] = "asr_failed"
+                            speech_output.write(
+                                json.dumps(speech_record, ensure_ascii=False) + "\n"
+                            )
+                            speech_output.flush()
+                            raise
+                        speech_record.update(asr_text=transcript, status="completed")
+                        utterances.append((wav_path, index))
+                        action = action.model_copy(update={"argument": transcript})
+                    speech_output.write(
+                        json.dumps(speech_record, ensure_ascii=False) + "\n"
+                    )
+                    speech_output.flush()
+                if action.action_type not in UNCOUNTED_ACTIONS:
+                    budget_turns += 1
+                if observations[agent.agent_name].available_actions != ["none"]:
+                    action_counts[action.action_type] = (
+                        action_counts.get(action.action_type, 0) + 1
+                    )
+                actions[agent.agent_name] = action
+                messages[-1].append(
+                    (agent.agent_name, "Environment", action.to_natural_language())
+                )
+
+            observations, _, terminated, _, info = await env.astep(actions)
+            messages.append(
+                [
+                    ("Environment", name, obs.to_natural_language())
+                    for name, obs in observations.items()
+                ]
+            )
+            if all(terminated.values()):
+                break
+
+    conversation_audio = combine_conversation_audio(
+        utterances,
+        artifact_dir / "simulation" / "audio" / episode_id / "conversation.wav",
+    )
+    episode = EpisodeLog(
+        environment=env.profile.pk,
+        agents=[agent.profile.pk for agent in agent_list],
+        tag=args.tag,
+        models=[env.model_name] + [agent.model_name for agent in agent_list],
+        agent_classes=[type(agent).__name__ for agent in agent_list],
+        messages=messages,
+        reasoning="Not evaluated. " + info[agent_list[0].agent_name]["comments"],
+        rewards=[0.0, 0.0],
+    )
+    original_path = artifact_dir / "simulation" / "original" / f"{episode_id}.json"
+    readable_path = artifact_dir / "simulation" / "readable" / f"{episode_id}.md"
+    write_json(original_path, episode.model_dump(mode="json"))
+    readable_path.parent.mkdir(parents=True, exist_ok=True)
+    readable_path.write_text(episode_markdown(episode), encoding="utf-8")
+    if args.push_to_db:
+        episode.save()
+        write_json(original_path, episode.model_dump(mode="json"))
+    return {
+        "episode_id": episode_id,
+        "status": "completed",
+        "env_id": env.profile.pk,
+        "agent_ids": episode.agents,
+        "turns": env.turn_number,
+        "budget_turns": budget_turns,
+        "action_counts": action_counts,
+        "interaction_mode": args.interaction_mode,
+        "opener": "agent1",
+        "wall_seconds": time.monotonic() - started,
+        "end_reason": "max_turns"
+        if budget_turns >= MAX_TURNS
+        else "environment_terminated",
+        "episode_pk": episode.pk or None,
+        "evaluation_status": "not_performed",
+        "original": str(original_path.relative_to(run_dir)),
+        "readable": str(readable_path.relative_to(run_dir)),
+        "speech": str(speech_path.relative_to(run_dir)),
+        "conversation_audio": (
+            str(conversation_audio.relative_to(run_dir)) if conversation_audio else None
+        ),
+    }
+
+
+def build_duplex_episode(
     record: dict[str, Any], args, asr_client, tts_client, tts_semaphore=None
 ):
     from sotopia.database import EnvironmentProfile
@@ -504,7 +667,7 @@ def build_episode(
     return resolved, agents
 
 
-async def run_one_episode(
+async def run_duplex_episode(
     resolved,
     agent_list,
     args,
@@ -512,6 +675,7 @@ async def run_one_episode(
     episode_id: str,
     *,
     artifact_dir: Path | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     import time
 
@@ -525,7 +689,6 @@ async def run_one_episode(
     from talktopia.full_duplex.episode import (
         RuntimeConfig,
         profile_background,
-        run_with_timeout,
         write_speech_log,
     )
     from talktopia.full_duplex.events import (
@@ -582,9 +745,7 @@ async def run_one_episode(
             )
         snapshot = session.open(agents)
         opened = True
-        ended = await run_with_timeout(
-            runtime, snapshot, args.episode_timeout_s, timeout_path
-        )
+        ended = await runtime.run(snapshot)
         events = read_events(events_path)
         transcript = TranscriptBuilder.from_events(events)
         entries = transcript.build()
@@ -625,6 +786,9 @@ async def run_one_episode(
             "env_id": resolved.env_profile.pk,
             "agent_ids": episode.agents,
             "turns": runtime.state.semantic_turn_number,
+            "budget_turns": runtime.state.budget_turns,
+            "action_counts": dict(runtime.state.action_counts),
+            "opener": "agent1",
             "end_reason": ended.reason,
             "duration_ms": ended.duration_ms,
             "wall_seconds": time.monotonic() - started,
@@ -637,13 +801,27 @@ async def run_one_episode(
             "conversation_audio": str(wav_path.relative_to(run_dir)),
         }
     except BaseException as exc:
+        timed_out = (
+            isinstance(exc, asyncio.CancelledError)
+            and deadline is not None
+            and time.monotonic() >= deadline
+        )
+        write_json(
+            timeout_path,
+            {
+                "episode_id": episode_id,
+                "timeout_seconds": EPISODE_TIMEOUT_S,
+                "runtime": runtime.liveness_snapshot().model_dump(mode="json"),
+                "budget_turns": runtime.state.budget_turns,
+            },
+        )
         writer.emit(
             EpisodeEnded,
             runtime.state.now_ms,
-            status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
-            reason="episode_timeout"
-            if isinstance(exc, TimeoutError)
-            else "episode_error",
+            status="cancelled"
+            if isinstance(exc, asyncio.CancelledError) and not timed_out
+            else "failed",
+            reason="episode_timeout" if timed_out else "episode_error",
             duration_ms=runtime.state.now_ms,
             error_type=type(exc).__name__,
             error_message=safe_error(exc),
@@ -664,6 +842,55 @@ async def run_one_episode(
             session.close()
         stereo.close()
         writer.close()
+
+
+def build_episode(record, args, asr_client, tts_client, tts_semaphore=None):
+    build = (
+        build_round_robin_episode
+        if args.interaction_mode == "round-robin"
+        else build_duplex_episode
+    )
+    return build(record, args, asr_client, tts_client, tts_semaphore)
+
+
+async def run_one_episode(
+    resolved, agents, args, run_dir, episode_id, *, artifact_dir=None
+):
+    run = (
+        run_round_robin_episode
+        if args.interaction_mode == "round-robin"
+        else run_duplex_episode
+    )
+    timeout = asyncio.timeout(EPISODE_TIMEOUT_S)
+    try:
+        deadline = time.monotonic() + EPISODE_TIMEOUT_S
+        options = {"artifact_dir": artifact_dir}
+        if args.interaction_mode == "surface5-full-duplex":
+            options["deadline"] = deadline
+        async with timeout:
+            return await run(resolved, agents, args, run_dir, episode_id, **options)
+    except TimeoutError:
+        if not timeout.expired():
+            raise
+        path = (
+            (artifact_dir or run_dir)
+            / "simulation"
+            / "diagnostics"
+            / f"{episode_id}.json"
+        )
+        diagnostic = json.loads(path.read_text()) if path.exists() else {}
+        write_json(
+            path,
+            {
+                **diagnostic,
+                "episode_id": episode_id,
+                "interaction_mode": args.interaction_mode,
+                "timeout_seconds": EPISODE_TIMEOUT_S,
+                "reason": "episode_timeout",
+                "turns": getattr(resolved, "turn_number", None),
+            },
+        )
+        raise TimeoutError(f"Episode exceeded {EPISODE_TIMEOUT_S:g} seconds") from None
 
 
 async def stage_3_simulate(
@@ -749,18 +976,52 @@ async def stage_3_simulate(
         return await run_simulation_batch(records, args, run_dir, run)
 
 
-def run_pipeline(args: argparse.Namespace) -> int:
+def resolve_run_args(args):
     if args.resume_run:
         args = utils.restore_run(
             args,
             path_fields=("out_dir", "sample_manifest", *evaluation.PATH_OPTIONS),
             overrides=evaluation.resume_overrides(args),
         )
-    # SOTOPIA chooses its database classes at import time.
+    elif args.stage == "reevaluate":
+        from talktopia.evaluation.cli import resolve_source_context
+
+        resolve_source_context(args)
+    if args.database_path:
+        explicit_db = os.environ.get("TALKTOPIA_DB_DIR")
+        if explicit_db and Path(explicit_db).expanduser().resolve() != Path(
+            args.database_path
+        ):
+            raise ValueError("TALKTOPIA_DB_DIR differs from the saved/source database")
+        os.environ["TALKTOPIA_DB_DIR"] = str(args.database_path)
+    return args
+
+
+def preflight(args):
+    """Validate before server startup, and recheck in the process doing the run."""
     os.environ["SOTOPIA_STORAGE_BACKEND"] = args.storage_backend
     from talktopia.task_space import configure_database
 
     db_path = configure_database(args.storage_backend)
+    args.database_path = str(db_path)
+    if args.stage != "reevaluate":
+        validate_dataset(db_path)
+        if args.resume_run:
+            manifest_path = args.resume_run / "02_sampled_characters.json"
+            validate_run_inputs(args.resume_run, db_path, manifest_path)
+            validate_manifest(read_manifest(manifest_path))
+        else:
+            manifest = (
+                read_manifest(args.sample_manifest) if args.sample_manifest else None
+            )
+            profiles = stage_1_sample_env_profiles(args, manifest)
+            stage_2_sample_characters(profiles, args, manifest)
+    return db_path
+
+
+def run_pipeline(args: argparse.Namespace) -> int:
+    args = resolve_run_args(args)
+    db_path = preflight(args)
     print(f"Talktopia DB: {db_path}")
     os.environ.setdefault("CUSTOM_API_KEY", "EMPTY")
     records = None
@@ -774,8 +1035,11 @@ def run_pipeline(args: argparse.Namespace) -> int:
             record.setdefault("episode_id", f"episode_{index:04d}")
     if not args.resume_run:
         run_dir = create_run_directory(
-            args.out_dir, args.reeval_tag if args.stage == "reevaluate" else args.tag
+            args.out_dir,
+            args.interaction_mode + ("_eval" if args.stage == "reevaluate" else ""),
         )
+    if not args.resume_run:
+        args.tag = args.reeval_tag = run_dir.name
     print(f"Run started; output: {run_dir}", flush=True)
     try:
         with lock_run(run_dir):
@@ -974,10 +1238,18 @@ async def run_matrix(args, run_dir: Path, db_path: Path, records: list) -> int:
         else dict(
             status="prepared",
             episodes_per_pair=len(records),
+            interaction_mode=args.interaction_mode,
+            coverage={
+                **validate_manifest(records),
+                "model_pairs": len(expected),
+                "planned_episodes": len(records) * len(expected),
+            },
             pairs=[{**pair, "status": "pending"} for pair in expected],
             wall_seconds=0,
         )
     )
+    if state.get("interaction_mode") != args.interaction_mode:
+        raise ValueError("Saved matrix has a different interaction mode")
     if [
         {key: pair[key] for key in ("pair_id", "agent1_model", "agent2_model")}
         for pair in state["pairs"]
@@ -1059,13 +1331,9 @@ async def run_matrix(args, run_dir: Path, db_path: Path, records: list) -> int:
                     "agent2_models": None,
                     "worker_gpu": endpoint,
                     "sample_manifest": run_dir / "02_sampled_characters.json",
-                    "use_stored_combos": False,
                     "resume_run": None,
                     "out_dir": pair_root,
-                    "tag": pair["pair_id"],
                     **evaluation.pair_settings(args, pair["pair_id"], endpoint),
-                    "env_id": [],
-                    "environment_list_pk": "",
                     "asr_base_url": speech_url(endpoint),
                     "tts_base_url": speech_url(endpoint),
                 }
@@ -1078,12 +1346,18 @@ async def run_matrix(args, run_dir: Path, db_path: Path, records: list) -> int:
                         getattr(args, f"{role}_model"), endpoint
                     )
                 child_args = argparse.Namespace(**values)
-                child_dir = create_run_directory(pair_root, pair["pair_id"])
+                child_dir = create_run_directory(
+                    pair_root, args.interaction_mode + "_" + pair["pair_id"]
+                )
+                child_args.tag = child_args.reeval_tag = child_dir.name
                 stage_1_sample_env_profiles(child_args, records)
                 prepare_simulation_run(child_args, child_dir, db_path, records)
                 pair["run_dir"] = str(child_dir)
                 checkpoint()
             child_dir = Path(pair["run_dir"])
+            child_config = json.loads((child_dir / "run_config.json").read_text())
+            if child_config["interaction_mode"] != args.interaction_mode:
+                raise ValueError("Matrix child has a different interaction mode")
             command = [
                 sys.executable,
                 "-m",

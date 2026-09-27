@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOTOPIA_DATA_DIR="$HOME/.sotopia/data"
 GEMINILIGHT_DATA_DIR="${TALKTOPIA_GEMINILIGHT_DATA_DIR:-$HOME/.cache/talktopia/geminilight_sotopia_dataset}"
 OLLAMA_MODELS_DIR="${OLLAMA_MODELS:-$HOME/.ollama/models}"
-TALKTOPIA_DATA_DIR="${TALKTOPIA_DB_DIR:-$HOME/.sotopia/talktopia/data}"
+TALKTOPIA_DATA_DIR="${TALKTOPIA_DB_DIR:-$HOME/.sotopia/talktopia/geminilight}"
 
 link_source() {
   local target="$1"

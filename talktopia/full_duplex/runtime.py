@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from talktopia.experiment import UNCOUNTED_ACTIONS
+
 import asyncio
 import hashlib
 from collections import deque
@@ -94,6 +96,8 @@ class RuntimeState:
     pending_cancellations: set[str] = field(default_factory=set)
     deferred_observations: dict[str, DeferredObservation] = field(default_factory=dict)
     semantic_turn_number: int = 0
+    budget_turns: int = 0
+    action_counts: dict[str, int] = field(default_factory=dict)
     stopping: bool = False
 
 
@@ -394,7 +398,6 @@ class DuplexRuntime:
             for name, observation in initial_snapshot.observations.items()
         }
         self.state.latest_observations.update(initial_streams)
-        opener_digest = _opening_digest(self.resolved, self.state.episode_id)
         self.event_writer.emit(
             EpisodeStarted,
             self.state.now_ms,
@@ -408,7 +411,7 @@ class DuplexRuntime:
             run_config={
                 "turn_taking_policy": self.config.turn_taking_policy,
                 "opener_agent": self.state.opener_agent,
-                "opener_digest": opener_digest,
+                "opener_policy": "agent1",
                 "minimum_floor_gap_ms": self.config.minimum_floor_gap_ms,
                 "realtime": self.config.realtime,
                 "seed": self.seed,
@@ -1233,7 +1236,7 @@ class DuplexRuntime:
         metadata: dict[str, object],
     ) -> None:
         assert self._snapshot is not None
-        if self._snapshot.turn_number >= self.config.max_turns:
+        if self.state.budget_turns >= self.config.max_turns:
             raise TurnLimitReached
         peer = self._peer(actor)
         actions = {
@@ -1251,6 +1254,11 @@ class DuplexRuntime:
         snapshot = await self.session.commit(commit)
         self._snapshot = snapshot
         self.state.semantic_turn_number = snapshot.turn_number
+        self.state.action_counts[action.action_type] = (
+            self.state.action_counts.get(action.action_type, 0) + 1
+        )
+        if action.action_type not in UNCOUNTED_ACTIONS:
+            self.state.budget_turns += 1
         self._commit_sequence += 1
         commit_id = f"{self.state.episode_id}-commit-{self._commit_sequence:04d}"
         self.event_writer.emit(
@@ -1263,7 +1271,11 @@ class DuplexRuntime:
             observations_after=dict(snapshot.observations),
             origin=origin,
             trigger_event_id=trigger_event_id,
-            metadata={**metadata, "utterance_ids": {actor: utterance_id, peer: None}},
+            metadata={
+                **metadata,
+                "utterance_ids": {actor: utterance_id, peer: None},
+                "budget_turns": self.state.budget_turns,
+            },
         )
         decision_id = metadata.get("decision_id")
         hidden = (
@@ -1282,7 +1294,7 @@ class DuplexRuntime:
                 ),
             )
 
-        if snapshot.turn_number >= self.config.max_turns:
+        if self.state.budget_turns >= self.config.max_turns:
             raise TurnLimitReached
 
     def _record_stopped_audio(self, reason: str) -> None:
@@ -1619,18 +1631,6 @@ class DuplexRuntime:
         return peers[0]
 
 
-def _opening_digest(resolved: ResolvedEpisode, episode_id: str) -> str:
-    identity = "\0".join(
-        (
-            "surface5-opening-v1",
-            resolved.combo_pk or str(resolved.env_profile.pk or ""),
-            episode_id,
-            *(str(profile.pk or "") for profile in resolved.agent_profiles),
-        )
-    )
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
-
-
 def _slug(value: str) -> str:
     characters = "".join(
         character.lower() if character.isalnum() else " " for character in value
@@ -1639,9 +1639,7 @@ def _slug(value: str) -> str:
 
 
 def select_opening_agent(resolved: ResolvedEpisode, episode_id: str) -> str:
-    digest = _opening_digest(resolved, episode_id)
-    index = int(digest, 16) % 2
-    profile = resolved.agent_profiles[index]
+    profile = resolved.agent_profiles[0]
     return f"{profile.first_name} {profile.last_name}".strip()
 
 

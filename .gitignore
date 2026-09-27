@@ -1,5 +1,8 @@
-/.venv/
-/engine/
+/.venv
+/engine
+
+.pytest_cache/
+.ruff_cache/
 
 __pycache__/
 *.py[cod]
@@ -12,3 +15,4 @@ __pycache__/
 /outputs/
 /reports/
 /.pipeline.lock
+/redis-stack-*

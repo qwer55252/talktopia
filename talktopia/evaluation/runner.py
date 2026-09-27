@@ -50,6 +50,11 @@ def evaluation_artifacts(result: dict, run_dir: Path) -> dict[str, str]:
         if not path.is_relative_to(run_dir.resolve()):
             raise ValueError("Response attempt path escapes its run directory")
         hashes[name] = file_hash(path)
+    if (
+        result.get("source_events")
+        and file_hash(Path(result["source_events"])) != result["source_events_sha256"]
+    ):
+        raise ValueError("Source events changed during evaluation")
     return hashes
 
 
@@ -61,6 +66,10 @@ def evaluation_manifest(
     from .evaluator import has_agent_interaction
 
     summary = json.loads((simulation_dir / "03_simulation.json").read_text())
+    config = json.loads((simulation_dir / "run_config.json").read_text())
+    mode = config.get("interaction_mode", "round-robin")
+    if summary.get("interaction_mode", mode) != mode:
+        raise ValueError("Simulation summary mode differs from its config")
     sources = read_manifest(simulation_dir / "02_sampled_characters.json")
     expected = {
         row.get("episode_id", f"episode_{index:04d}"): row
@@ -89,6 +98,8 @@ def evaluation_manifest(
     records = []
     excluded = []
     for row in rows:
+        if row.get("interaction_mode", mode) != mode:
+            raise ValueError("Episode mode differs from the simulation mode")
         original = expected.get(row["episode_id"])
         if (
             original is None
@@ -137,6 +148,13 @@ def evaluation_manifest(
                 "combo_id": original.get("combo_id"),
                 "env_id": row["env_id"],
                 "agent_ids": row["agent_ids"],
+                "interaction_mode": mode,
+                "source_events": str((simulation_dir / row["events"]).resolve())
+                if row.get("events")
+                else None,
+                "source_events_sha256": file_hash(simulation_dir / row["events"])
+                if row.get("events")
+                else None,
                 "source_episode": str(path),
                 "source_sha256": source_hash,
                 "source_conversation_audio": (
@@ -147,6 +165,8 @@ def evaluation_manifest(
             }
         )
     return records, {
+        "interaction_mode": mode,
+        "source_coverage": config.get("coverage", {}),
         "source_total": len(summary["episodes"]),
         "source_selected": len(rows),
         "source_unselected": len(summary["episodes"]) - len(rows),
@@ -176,6 +196,8 @@ def prepare_run(args, run_dir: Path, db_path: Path):
         records, source_summary = evaluation_manifest(
             args.simulation_dir, getattr(args, "reeval_episode_id", [])
         )
+        if source_summary["interaction_mode"] != args.interaction_mode:
+            raise ValueError("Evaluation mode differs from the source simulation")
         write_json(manifest_path, records)
         extra["source_summary"] = source_summary
     save_run_config(args, run_dir, db_path, manifest_path, **extra)
@@ -197,7 +219,13 @@ async def run_evaluation_batch(records, args, run_dir) -> int:
                 "Source episode changed since the evaluation manifest was frozen"
             )
         episode_args = argparse.Namespace(
-            **{**vars(args), "episode_json": Path(record["source_episode"])}
+            **{
+                **vars(args),
+                "episode_json": Path(record["source_episode"]),
+                "interaction_mode": record["interaction_mode"],
+                "source_events": record.get("source_events"),
+                "source_events_sha256": record.get("source_events_sha256"),
+            }
         )
         await evaluate_episode(
             episode_args,
@@ -305,15 +333,15 @@ async def run_after_simulation(args, run_dir, db_path) -> int:
                 "simulation_dir": run_dir,
                 "episode_json": None,
                 "sample_manifest": None,
-                "environment_list_pk": "",
-                "env_id": [],
-                "use_stored_combos": False,
                 "resume_run": None,
                 "episode_limit": 0,
                 "evaluate_after_simulation": False,
             }
         )
-        evaluation_dir = create_run_directory(args.out_dir, args.reeval_tag)
+        evaluation_dir = create_run_directory(
+            args.out_dir, args.interaction_mode + "_eval"
+        )
+        evaluation_args.tag = evaluation_args.reeval_tag = evaluation_dir.name
 
     print(f"Automatic evaluation; output: {evaluation_dir}", flush=True)
     with lock_run(evaluation_dir):
@@ -438,6 +466,5 @@ def check_pair_finished(args, pair_id: str, simulation: dict) -> None:
 
 def pair_settings(args, pair_id: str, endpoint: str) -> dict:
     return {
-        "reeval_tag": f"{pair_id}_eval",
         "evaluator_model": model_on_gpu(args.evaluator_model, endpoint),
     }

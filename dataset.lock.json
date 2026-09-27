@@ -1,0 +1,22 @@
+{
+  "AgentProfile": {
+    "file": "agent_profile.jsonl",
+    "count": 40,
+    "sha256": "6fe400b8ff00f0bf98c005a666e47dfd41b745195ac4c840c7c612181e5463b6"
+  },
+  "EnvironmentProfile": {
+    "file": "environment_profile.jsonl",
+    "count": 90,
+    "sha256": "d1ca470959442c08f10a80dac069e06cd3a6ae2f6820e53d781f34bdc4257a14"
+  },
+  "RelationshipProfile": {
+    "file": "relationship_profile.jsonl",
+    "count": 120,
+    "sha256": "b8154d066edb285e7b3e40f843579ce4d92037d597b40bd0eca095841a876097"
+  },
+  "EnvAgentComboStorage": {
+    "file": "env_agent_combo_storage.jsonl",
+    "count": 450,
+    "sha256": "ec2d07fd87de59d7a10295843ade2176b824b98efda698d0d4767516d5a24f5e"
+  }
+}

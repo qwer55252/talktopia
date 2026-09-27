@@ -15,7 +15,7 @@ CORE_MODELS = (
     "EnvironmentList",
 )
 SOURCE_DB = REPO_ROOT / "data" / "sotopia_db"
-DEFAULT_DB = Path.home() / ".sotopia" / "talktopia" / "data"
+DEFAULT_DB = Path.home() / ".sotopia" / "talktopia" / "geminilight"
 
 
 def assert_separate(target: Path, source: Path) -> None:

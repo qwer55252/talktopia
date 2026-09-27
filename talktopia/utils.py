@@ -93,7 +93,8 @@ def input_fingerprints(db_path: Path) -> dict[str, str]:
     paths.extend(path for path in (db_path / "voices").rglob("*") if path.is_file())
     paths.extend((REPO_ROOT / "talktopia").rglob("*.py"))
     paths.extend((REPO_ROOT / "patches").glob("*.patch"))
-    paths.append(REPO_ROOT / "talktopia/full_duplex/source.json")
+    paths.append(REPO_ROOT / "dataset.lock.json")
+    paths.extend((REPO_ROOT / "talktopia").rglob("*.txt"))
     paths.extend(
         REPO_ROOT / name
         for name in ("engine.lock", "requirements.lock", "run_pipeline.sh")
@@ -411,16 +412,23 @@ def restore_run(
 ) -> argparse.Namespace:
     run_dir = args.resume_run.expanduser().resolve()
     saved = json.loads((run_dir / "run_config.json").read_text())
-    if (
-        saved.get("stage") != "reevaluate"
-        and saved.get("interaction_mode") != "surface5-full-duplex"
-    ):
+    from talktopia.experiment import settings, MAX_TURNS, EPISODE_TIMEOUT_S
+
+    mode = saved.get("interaction_mode", "round-robin")
+    if saved.get("stage") != "reevaluate" and saved.get("experiment") != settings(mode):
         raise ValueError(
-            "Cannot resume a round-robin run with the full-duplex agent; reevaluation remains supported"
+            "Saved simulation uses different comparison rules; start a new run"
         )
+    if saved.get("stage") != "reevaluate" and (
+        saved.get("max_turns") != MAX_TURNS
+        or saved.get("episode_timeout_s") != EPISODE_TIMEOUT_S
+    ):
+        raise ValueError("Saved simulation must use 12 budget turns and 120 seconds")
     if "input_fingerprints" not in saved:
         raise ValueError("This run predates resumable runs; start a new run")
     values = {key: value for key, value in saved.items() if key in vars(args)}
+    values["interaction_mode"] = mode
+    values["database_path"] = saved.get("database_path")
     for name in path_fields:
         if values.get(name) is not None:
             values[name] = Path(values[name])
@@ -443,6 +451,7 @@ def speech_runtime() -> dict:
 
 def validate_run_inputs(run_dir: Path, db_path: Path, manifest_path: Path) -> dict:
     from talktopia.full_duplex.config import runtime_settings
+    from talktopia.experiment import settings, validate_dataset
 
     config = json.loads((run_dir / "run_config.json").read_text())
     if config["input_fingerprints"] != input_fingerprints(db_path):
@@ -453,10 +462,19 @@ def validate_run_inputs(run_dir: Path, db_path: Path, manifest_path: Path) -> di
         raise ValueError(
             "Speech server settings changed since this run was created; resume refused"
         )
-    if config.get("duplex_runtime") != runtime_settings(config["max_turns"]):
-        raise ValueError(
-            "Duplex settings changed since this run was created; resume refused"
-        )
+    if config.get("database_path") != str(db_path):
+        raise ValueError("Database path changed; resume refused")
+    if config.get("stage") != "reevaluate":
+        mode = config.get("interaction_mode")
+        if config.get("experiment") != settings(mode):
+            raise ValueError("Comparison settings changed; resume refused")
+        if config.get("dataset_hashes") != validate_dataset(db_path):
+            raise ValueError("Canonical dataset changed; resume refused")
+        if (
+            mode == "surface5-full-duplex"
+            and config.get("duplex_runtime") != runtime_settings()
+        ):
+            raise ValueError("Duplex settings changed; resume refused")
     if file_hash(manifest_path) != config["manifest_sha256"]:
         raise ValueError("Frozen manifest changed; resume refused")
     return config
@@ -467,15 +485,28 @@ def save_run_config(args, run_dir, db_path, manifest_path, **extra) -> None:
         key: str(value.expanduser().resolve()) if isinstance(value, Path) else value
         for key, value in vars(args).items()
     }
-    from talktopia.full_duplex.config import INTERACTION_MODE, runtime_settings
+    from talktopia.full_duplex.config import runtime_settings
+    from talktopia.experiment import settings, validate_dataset, validate_manifest
+
+    metadata = {
+        "database_path": str(db_path),
+        "interaction_mode": args.interaction_mode,
+    }
+    if args.stage != "reevaluate":
+        metadata.update(
+            experiment=settings(args.interaction_mode),
+            dataset_hashes=validate_dataset(db_path),
+            coverage=validate_manifest(read_manifest(manifest_path)),
+        )
+        if args.interaction_mode == "surface5-full-duplex":
+            metadata["duplex_runtime"] = runtime_settings()
 
     write_json(
         run_dir / "run_config.json",
         {
             **config,
             "run_id": run_dir.name,
-            "interaction_mode": INTERACTION_MODE,
-            "duplex_runtime": runtime_settings(args.max_turns),
+            **metadata,
             "input_fingerprints": input_fingerprints(db_path),
             "speech_runtime": speech_runtime(),
             "manifest_sha256": (

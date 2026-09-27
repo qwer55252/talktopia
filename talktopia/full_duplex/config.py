@@ -30,5 +30,8 @@ def runtime_settings(max_turns: int = 12) -> dict:
         "frame_ms": FRAME_MS,
         "asr_decode_interval_ms": ASR_DECODE_INTERVAL_MS,
         "asr_window_ms": ASR_WINDOW_MS,
-        "max_generated_words": 40,
+        "prompt_max_words": 40,
+        "max_generated_words": 50,
+        "turn_budget": "confirmed_actions_except_none_and_backchanneling_v1",
+        "opener": "agent1",
     }

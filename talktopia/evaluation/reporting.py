@@ -126,6 +126,8 @@ def write_evaluation_report(run_dir: Path) -> None:
         output_bytes=size,
     )
     for key in (
+        "interaction_mode",
+        "source_coverage",
         "source_total",
         "source_selected",
         "source_unselected",
@@ -155,6 +157,7 @@ def write_evaluation_report(run_dir: Path) -> None:
     lines = [
         "# Simulation and evaluation summary",
         "",
+        f"Interaction mode: {report.get('interaction_mode', 'legacy')}; source population: {json.dumps(report.get('source_coverage', {}), sort_keys=True)}",
         f"Completed: {report['completed']}/{report['total']}; failed: {report['failed']}; pending: {report['pending']}.",
         "",
         f"Agent evaluations: {len(rows)}; dimension scores: {len(rows) * 7}; episodes without speech: {no_speech}.",
@@ -285,6 +288,8 @@ def write_matrix_report(run_dir: Path, state: dict, pairs: list[dict]) -> None:
     )
     report = dict(
         status=state["status"],
+        interaction_mode=state.get("interaction_mode"),
+        coverage=state.get("coverage", {}),
         pairs=pairs,
         wall_seconds=state.get("wall_seconds", 0),
         **totals,
@@ -300,6 +305,9 @@ def write_matrix_report(run_dir: Path, state: dict, pairs: list[dict]) -> None:
         "# Model matrix",
         "",
         f"Status: {state['status']}",
+        f"Interaction mode: {state.get('interaction_mode', 'legacy')}",
+        f"Population: {json.dumps(state.get('coverage', {}), sort_keys=True)}",
+        f"Episodes: {totals['simulation_total']} planned; {totals['simulation_completed']} completed; {totals['simulation_failed']} failed; {totals['simulation_pending']} pending.",
         "",
         "| Agent 1 | Agent 2 | Simulation completed / failed | Evaluation completed / failed / excluded |",
         "|---|---|---:|---:|",
