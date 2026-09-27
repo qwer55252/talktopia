@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Talktopia · 실험 결과</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" type="module"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/"><span class="brand-mark" aria-hidden="true">t.</span>talktopia<span class="brand-section">실험 결과</span></a>
+    <button id="refresh" class="quiet-button" type="button">새로고침</button>
+  </header>
+  <div class="workspace">
+    <aside class="sidebar" aria-label="실행과 에피소드 선택">
+      <label class="eyebrow" for="run-select">SIMULATION RUN</label>
+      <select id="run-select" aria-label="시뮬레이션 실행"></select>
+      <div class="list-heading"><h2>에피소드</h2><span id="episode-count" class="count">0</span></div>
+      <div id="catalog-warning"></div>
+      <nav id="episode-list" aria-label="에피소드 목록"></nav>
+    </aside>
+    <main id="detail" aria-live="polite"><div class="empty">실행 결과를 불러오는 중입니다.</div></main>
+  </div>
+</body>
+</html>
