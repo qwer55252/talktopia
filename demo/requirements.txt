@@ -1,0 +1,4 @@
+-c ../requirements.lock
+fastapi
+uvicorn
+markdown-it-py

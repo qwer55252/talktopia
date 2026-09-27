@@ -1,0 +1,12 @@
+{
+  "runs": [
+    {
+      "id": "pair-01",
+      "label": "Pair 01",
+      "simulation_dir": "../outputs/talktopia_4x4_w40_t12_20260910T201038481826Z_056976bf/pairs/pair_01/pair_01_20260910T201038858156Z_3285f7ce",
+      "evaluation_dirs": [
+        "../outputs/talktopia_4x4_w40_t12_20260910T201038481826Z_056976bf/pairs/pair_01/pair_01_eval_qwen122B_20260913T231621749397Z_3eb04c97"
+      ]
+    }
+  ]
+}
