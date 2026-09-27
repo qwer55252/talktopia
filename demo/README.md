@@ -1,6 +1,6 @@
 # Talktopia results viewer
 
-저장된 시뮬레이션과 여러 평가기의 결과를 한 에피소드 단위로 확인하는 로컬 페이지다.
+저장된 시뮬레이션과 여러 평가기의 결과를 한 에피소드 단위로 확인하는 페이지다.
 실험 실행, 모델 호출, DB 저장 기능은 없다. 결과와 프로필은 읽기 전용으로 사용한다.
 
 ## 실행
@@ -14,7 +14,8 @@ cp demo/config.example.json demo/config.local.json
 ```
 
 브라우저에서 http://127.0.0.1:8765 를 연다. 포트를 바꾸려면 `--port 8766`을 추가한다.
-서버는 localhost에서만 실행된다. 원격 서버에서는 SSH 또는 VS Code의 포트 전달을 사용한다.
+서버는 localhost에서 실행된다. 개인 접속에는 SSH 또는 VS Code의 포트 전달을,
+외부 공유에는 아래 HTTPS 터널을 사용한다.
 
 음성·모델 실행 환경 없이 조회 페이지만 설치할 수도 있다. Python 3.12 이상을 사용한다.
 이 환경은 저장소 루트의 공유 `.venv`와 별개다.
@@ -26,6 +27,37 @@ demo/.venv/bin/python -m demo --config demo/config.local.json
 ```
 
 의존성 버전은 저장소의 `requirements.lock`을 따른다. 프런트엔드 빌드는 필요 없다.
+
+## 외부 HTTPS 공유
+
+Cloudflare Quick Tunnel로 이 서버에 임시 HTTPS 주소를 연결한다. 계정이나 도메인은 필요 없다.
+비밀번호가 없으므로 주소를 아는 사람은 등록된 대화·음성·프로필·평가를 조회할 수 있다.
+결과 파일은 현재 서버에서 읽으며 별도로 업로드하지 않는다.
+
+Linux x86_64에서는 저장소 루트에서 다음 명령으로 독립 실행 파일을 설치한다.
+검증한 버전은 `2026.9.3`이며, 공유 Python 환경에는 설치하지 않는다.
+
+```bash
+mkdir -p demo/.tools
+curl -fL --retry 2 -o demo/.tools/cloudflared https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-linux-amd64
+printf '77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2  demo/.tools/cloudflared\n' | sha256sum --check
+chmod +x demo/.tools/cloudflared
+```
+
+체크섬 검증이 성공한 경우에만 실행한다. 다른 OS·CPU는
+[공식 릴리스](https://github.com/cloudflare/cloudflared/releases/tag/2026.9.3)에서 맞는 파일과 체크섬을 사용한다.
+데모 서버를 실행한 상태에서 별도 터미널에 다음을 실행한다.
+
+```bash
+demo/.tools/cloudflared tunnel --url http://127.0.0.1:8765
+```
+
+터미널에 나온 `https://….trycloudflare.com` 주소를 공유한다. 서버 포트를 바꿨다면 터널 포트도 맞춘다.
+터널 터미널에서 Ctrl+C를 누르면 외부 공유만 종료되고 로컬 서버는 유지된다.
+서버도 종료하려면 서버 터미널에서 Ctrl+C를 누른다. 두 프로세스가 실행 중이어야 외부 접속이 가능하다.
+터널을 다시 실행하면 주소가 바뀐다. Quick Tunnel은 데모·개발용이며 가동 시간을 보장하지 않는다.
+기존 `~/.cloudflared/config.yaml`이 있으면 Quick Tunnel과 충돌할 수 있으므로
+[공식 사용 안내](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)를 확인한다.
 
 ## 결과 추가
 
@@ -45,13 +77,30 @@ demo/.venv/bin/python -m demo --config demo/config.local.json
 ```
 
 - `id`는 실행마다 달라야 하며 영문·숫자·밑줄·하이픈을 사용할 수 있다.
-- `label`은 선택 항목이다. 생략하면 `id`를 표시한다.
+- `label`은 선택 항목이다. 자동 분류 정보를 찾지 못하면 이 이름을 사용하고, 생략하면 `id`를 사용한다.
 - 경로는 절대경로 또는 **설정 파일의 디렉터리 기준** 상대경로다. `~`도 허용한다.
 - 다른 시뮬레이션은 `runs`에 항목을 추가한다. 평가는 해당 실행의 `evaluation_dirs`에 추가한다.
 - 파일을 저장한 뒤 페이지의 **새로고침**을 누른다. 서버 재시작은 필요 없다.
 - 부모 matrix 디렉터리가 아니라 `03_simulation.json`이 있는 실행 디렉터리를 지정한다.
   평가는 `evaluation_manifest.json`과 `04_sotopia_eval_reevaluate_existing.json`이 있는 디렉터리다.
 - 등록하지 않은 형제 디렉터리를 자동으로 찾아 추가하지 않는다.
+
+탐색 순서는 **실험 태그 → pair → 에피소드**다.
+`<실험>/pairs/pair_XX/<실행>` 구조에서는 실험 루트 `run_config.json`의 `tag`와
+`pair_XX` 디렉터리 이름을 읽는다. 모델은 각 시뮬레이션의 `run_config.json`에서
+`agent1_model`, `agent2_model`을 읽어 `pair 01 (qwen35-9b, ministral3-8b)` 형식으로 표시한다.
+실행용 접두사, GPU 번호, 서버 주소는 표시명에서 제거한다.
+예시 설정의 실제 pair 01은 두 모델 모두 `qwen35-9b`다.
+
+다른 디렉터리 구조에서는 해당 `runs` 항목에 `"experiment_tag": "my-experiment"`,
+`"pair_id": "pair_01"`을 추가해 분류를 지정할 수 있다. 명시한 값이 자동 감지보다 우선한다.
+태그를 지정하지 않으면 단독 실행의 `run_config.json`에 있는 `tag`, 그다음 `label`을 사용한다.
+pair 정보를 찾지 못하면 `label`을 사용하고 모델 정보가 없으면 이를 표시한다.
+같은 태그는 한 그룹으로 묶고 pair 번호순으로 정렬한다. 같은 pair가 여러 번 등록되면
+표시명 끝에 설정의 `id`를 붙인다. 새로고침하면 남아 있는 실험·pair·에피소드 선택을 유지한다.
+
+`GET /api/runs`는 기존 `id`, `label`에 `experiment_tag`, `pair_id`, `agent_models`,
+`pair_label`을 추가한 목록을 반환한다. 기존 에피소드·음성·보고서 API 주소는 그대로다.
 
 전체 목록은 manifest와 진행 요약을 합쳐 읽는다. 실패·대기 항목도 유지한다.
 상세 화면은 선택한 에피소드의 파일만 읽으며, 요약에 저장된 재시도 경로를 따른다.
@@ -114,6 +163,8 @@ demo/.venv/bin/python -m pytest -q demo/tests
 3. 재생 중 다른 에피소드를 선택해 이전 음성이 멈추는지 확인한다.
 4. 여러 평가 경로를 추가하고 새로고침한다. 점수표와 각 보고서, Markdown 원문을 확인한다.
 5. 좁은 화면에서 페이지 전체가 가로로 넘치지 않는지 확인한다.
+6. 여러 실험과 pair를 등록해 분류·모델 이름·전환·새로고침 후 선택 유지를 확인한다.
+7. 공유 HTTPS 주소에서도 보고서와 음성을 열고, 음성 구간 탐색이 동작하는지 확인한다.
 
 실제 예시 데이터로 브라우저 확인을 자동 실행하려면 별도 Playwright 설치를 사용할 수 있다.
 시스템에 Chromium 실행에 필요한 라이브러리가 있어야 한다. 이 도구는 데모 실행에는 필요 없다.

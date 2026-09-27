@@ -15,9 +15,11 @@
     <button id="refresh" class="quiet-button" type="button">새로고침</button>
   </header>
   <div class="workspace">
-    <aside class="sidebar" aria-label="실행과 에피소드 선택">
-      <label class="eyebrow" for="run-select">SIMULATION RUN</label>
-      <select id="run-select" aria-label="시뮬레이션 실행"></select>
+    <aside class="sidebar" aria-label="실험, pair와 에피소드 선택">
+      <label class="eyebrow" for="experiment-select">실험 태그</label>
+      <select id="experiment-select" aria-label="실험 태그"></select>
+      <label class="eyebrow" for="run-select">PAIR</label>
+      <select id="run-select" aria-label="Pair와 에이전트 모델"></select>
       <div class="list-heading"><h2>에피소드</h2><span id="episode-count" class="count">0</span></div>
       <div id="catalog-warning"></div>
       <nav id="episode-list" aria-label="에피소드 목록"></nav>

@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from markdown_it import MarkdownIt
 
-from .catalog import evaluation_rows, read_config, simulation_rows
+from .catalog import evaluation_rows, read_config, run_catalog, simulation_rows
 from .evaluations import DIMENSIONS, evaluation_id, read_evaluations
 from .files import ResultError, artifact_path, available, optional_json
 from .playback import transcript
@@ -77,7 +77,7 @@ def create_app(config_path: Path) -> FastAPI:
 
     @app.get("/api/runs")
     def runs():
-        return [{"id": run.id, "label": run.label} for run in read_config(config_path)]
+        return run_catalog(read_config(config_path))
 
     @app.get("/api/runs/{run_id}/episodes")
     def episodes(run_id: str):
