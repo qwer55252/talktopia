@@ -1,3 +1,4 @@
 /config.local.json
 /.venv/
 /validation.local.*
+/.tools/

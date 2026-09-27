@@ -17,7 +17,27 @@ async function main() {
   try {
     await page.goto(base);
     await page.waitForSelector("button.utterance");
+    const catalog = await (await page.request.get(base + "/api/runs")).json();
+    const tags = [...new Set(catalog.map((run) => run.experiment_tag))];
+    assert.deepEqual(await page.locator("#experiment-select option").allTextContents(), tags);
     const runId = await page.locator("#run-select").inputValue();
+    const selectedRun = catalog.find((run) => run.id === runId);
+    assert.equal(await page.locator("#experiment-select").inputValue(), selectedRun.experiment_tag);
+    assert.deepEqual(
+      await page.locator("#run-select option").allTextContents(),
+      catalog.filter((run) => run.experiment_tag === selectedRun.experiment_tag).map((run) => run.pair_label),
+    );
+    async function selectRun(id) {
+      const run = catalog.find((item) => item.id === id);
+      if (await page.locator("#experiment-select").inputValue() !== run.experiment_tag) {
+        await page.locator("#experiment-select").selectOption(run.experiment_tag);
+      }
+      await page.locator("#run-select").selectOption(id);
+      await page.waitForFunction(
+        (text) => document.querySelector(".run-context")?.textContent === text,
+        run.experiment_tag + " / " + run.pair_label,
+      );
+    }
     const path = "/api/runs/" + runId + "/episodes";
     const listed = await (await page.request.get(base + path)).json();
     assert.equal(await page.locator(".episode-item").count(), listed.episodes.length);
@@ -80,6 +100,51 @@ async function main() {
     }, alternatives.map((row) => row.id));
     await page.waitForFunction((id) => document.querySelector("h1")?.textContent === id.replace("episode_", "Episode "), alternatives[2].id);
 
+    // Refresh preserves all three selections after choosing a non-first episode.
+    await page.locator("#refresh").click();
+    await page.waitForSelector("#detail:not([aria-busy]) h1");
+    assert.equal(await page.locator("#experiment-select").inputValue(), selectedRun.experiment_tag);
+    assert.equal(await page.locator("#run-select").inputValue(), runId);
+    assert.equal(await page.locator('.episode-item[aria-current="true"]').getAttribute("data-episode"), alternatives[2].id);
+
+    const anotherPair = catalog.find((run) => run.experiment_tag === selectedRun.experiment_tag && run.id !== runId);
+    if (anotherPair) {
+      await page.locator("audio").evaluate((audio) => {
+        window.previousAudio = audio;
+        return audio.play();
+      });
+      await selectRun(anotherPair.id);
+      assert.ok(await page.evaluate(() => window.previousAudio.paused && !window.previousAudio.hasAttribute("src")));
+      await selectRun(runId);
+
+      // Removing the selected run during refresh must clear its old episode list
+      // before the replacement run's delayed list response can arrive.
+      await page.route(base + "/api/runs", (route) => route.fulfill({
+        json: catalog.filter((run) => run.id !== runId),
+      }), { times: 1 });
+      let releaseList;
+      const holdList = new Promise((resolve) => { releaseList = resolve; });
+      let listRequested;
+      const waitingForList = new Promise((resolve) => { listRequested = resolve; });
+      await page.route(base + "/api/runs/" + anotherPair.id + "/episodes", async (route) => {
+        listRequested();
+        await holdList;
+        await route.continue();
+      }, { times: 1 });
+      try {
+        await page.locator("#refresh").click();
+        await waitingForList;
+        assert.equal(await page.locator("#run-select").inputValue(), anotherPair.id);
+        assert.equal(await page.locator(".episode-item").count(), 0);
+      } finally {
+        releaseList();
+      }
+      await page.waitForSelector("#detail:not([aria-busy]) h1");
+      await page.locator("#refresh").click(); // Restore the real catalog.
+      await page.waitForSelector("#detail:not([aria-busy]) h1");
+      await selectRun(runId);
+    }
+
     if (runId === "pair-01") {
       await page.locator('[data-episode="episode_0053"]').click();
       await page.waitForSelector(".evaluation-report .notice");
@@ -87,9 +152,16 @@ async function main() {
       const firstScores = await page.locator(".scores tbody tr").first().locator("td").allTextContents();
       assert.deepEqual(firstScores.slice(0, 2), ["—", "—"]);
     }
-    const hasDuplex = await page.locator('#run-select option[value="duplex"]').count();
+    const hasDuplex = catalog.some((run) => run.id === "duplex");
     if (hasDuplex) {
-      await page.locator("#run-select").selectOption("duplex");
+      await page.locator('[data-episode="' + current + '"]').click();
+      await page.waitForFunction(() => document.querySelector("audio")?.readyState >= 1);
+      await page.locator("audio").evaluate((audio) => {
+        window.previousAudio = audio;
+        return audio.play();
+      });
+      await selectRun("duplex");
+      assert.ok(await page.evaluate(() => window.previousAudio.paused && !window.previousAudio.hasAttribute("src")));
       await page.waitForSelector(".utterance");
       await page.waitForFunction(() => document.querySelector("audio")?.readyState >= 1);
       await page.locator("audio").evaluate((audio) => {
@@ -103,7 +175,7 @@ async function main() {
       assert.match(await page.locator(".title-row").innerText(), /대기/);
     }
 
-    await page.locator("#run-select").selectOption(runId);
+    await selectRun(runId);
     await page.locator('[data-episode="' + current + '"]').click();
     await page.waitForSelector("audio");
     await page.setViewportSize({ width: 390, height: 844 });
@@ -117,6 +189,8 @@ async function main() {
       result: "passed", episodes: listed.episodes.length, evaluators: detail.evaluations.length,
       playback: true, seek: true, profileToggles: true, reports: true,
       switchStopsAudio: true, rapidSelection: true, mobile: true,
+      experimentGroups: tags.length, pairSwitch: Boolean(anotherPair), refreshKeepsSelection: true,
+      removedRunClearsList: Boolean(anotherPair),
       duplexOverlap: Boolean(hasDuplex), browserErrors: errors.length,
     }));
   } finally {

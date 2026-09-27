@@ -26,11 +26,11 @@ h3 { font-size: 1rem; }
 .brand-section { font-size: .875rem; font-weight: 450; letter-spacing: 0; color: #c0d1df; margin-left: 18px; padding-left: 24px; border-left: 1px solid #456071; }
 .quiet-button { border: 1px solid var(--line); padding: 7px 12px; border-radius: 7px; background: white; font-size: .875rem; color: #27465b; }
 .topbar .quiet-button { background: #1c3a50; color: #e6edf3; border-color: #415c70; }
-.workspace { display: grid; grid-template-columns: 246px minmax(0, 1fr); min-height: calc(100vh - 76px); }
+.workspace { display: grid; grid-template-columns: 320px minmax(0, 1fr); min-height: calc(100vh - 76px); }
 .sidebar { background: #fff; border-right: 1px solid var(--line); padding: 26px 16px 16px; position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .eyebrow { color: var(--muted); font-size: .75rem; font-weight: 700; letter-spacing: .1em; }
 .sidebar > .eyebrow { padding-left: 6px; }
-select { width: 100%; background: #f6f8fa; color: #213b50; border: 1px solid var(--line); border-radius: 7px; padding: 10px; }
+select { width: 100%; min-width: 0; background: #f6f8fa; color: #213b50; border: 1px solid var(--line); border-radius: 7px; padding: 10px; font-size: .875rem; }
 .list-heading { display: flex; justify-content: space-between; align-items: center; margin: 16px 6px 4px; }
 .count { font-size: .8125rem; font-weight: 650; color: #52667a; background: #edf1f5; border-radius: 5px; padding: 1px 7px; }
 #episode-list { overflow: auto; min-height: 0; display: flex; flex-direction: column; gap: 4px; padding-right: 2px; }
@@ -48,6 +48,7 @@ main { padding: 34px 36px 60px; min-width: 0; max-width: 1700px; width: 100%; ma
 .title-row { display: flex; gap: 14px; align-items: center; margin: 5px 0 2px; }
 h1 { font-size: 2rem; font-weight: 650; line-height: 1.3; letter-spacing: -.04em; }
 .scenario-title { color: var(--muted); margin-top: 6px; }
+.run-context { color: var(--muted); font-size: .8125rem; overflow-wrap: anywhere; margin-bottom: 12px; }
 .participants { display: flex; flex-wrap: wrap; gap: 10px 26px; margin: 20px 0 24px; }
 .participant { display: grid; grid-template-columns: 30px auto; column-gap: 9px; line-height: 1.4; }
 .agent-number { display: grid; place-items: center; grid-row: span 2; height: 30px; border-radius: 50%; background: #e7f2f8; color: var(--agent-one); font-size: .875rem; font-weight: 700; align-self: center; }
@@ -127,7 +128,7 @@ button.utterance:hover { background: #f0f6fa; border-color: #7babc3; }
 .missing-report { font-size: .875rem; color: var(--muted); padding: 12px 0; }
 @media (min-width: 1600px) { main { padding-left: 48px; padding-right: 48px; } }
 @media (max-width: 1150px) {
-  .workspace { grid-template-columns: 218px minmax(0, 1fr); }
+  .workspace { grid-template-columns: 280px minmax(0, 1fr); }
   main { padding: 28px 24px; }
   .result-columns { grid-template-columns: minmax(0, 1fr); }
   .evaluation-column { border-top: 1px solid var(--line); padding-top: 20px; }
@@ -136,7 +137,7 @@ button.utterance:hover { background: #f0f6fa; border-color: #7babc3; }
   .topbar { padding: 0 16px; height: 66px; }
   .brand-section { display: none; }
   .workspace { display: block; }
-  .sidebar { position: static; height: 270px; border-right: 0; border-bottom: 1px solid var(--line); padding: 16px; gap: 6px; }
+  .sidebar { position: static; height: 350px; border-right: 0; border-bottom: 1px solid var(--line); padding: 16px; gap: 6px; }
   .list-heading { margin-top: 3px; }
   .episode-item { padding: 8px 12px; }
   main { padding: 24px 16px 40px; }

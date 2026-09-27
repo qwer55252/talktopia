@@ -146,6 +146,85 @@ def test_lists_all_statuses_and_loads_only_requested_episode(saved):
     assert detail["evaluations"][0]["scores"][0]["relationship"] == -1
 
 
+def test_catalog_groups_registered_pairs_and_uses_actual_run_models(saved):
+    root = saved.config.parent / "matrix"
+    write_json(root / "run_config.json", {"tag": "talktopia_4x4_w40_t12"})
+    entries = []
+    for number in (10, 2, 1, 3):
+        simulation = root / "pairs" / f"pair_{number:02d}" / "simulation-run"
+        write_json(simulation / "run_config.json", {
+            "tag": f"pair_{number:02d}",
+            "agent1_model": "custom/structured-talktopia-agent-qwen35-9b-gpu0@http://localhost:18084/v1",
+            "agent2_model": "custom/structured-talktopia-agent-ministral3-8b-gpu1@http://localhost:18085/v1",
+        })
+        if number != 3:  # An unregistered sibling must never appear.
+            entries.append({"id": f"run-{number}", "simulation_dir": str(simulation)})
+    write_json(saved.config, {"runs": entries})
+    response = saved.client.get("/api/runs")
+    assert response.status_code == 200
+    catalog = response.json()
+    assert [item["id"] for item in catalog] == ["run-1", "run-2", "run-10"]
+    assert {item["experiment_tag"] for item in catalog} == {"talktopia_4x4_w40_t12"}
+    assert catalog[0]["pair_id"] == "pair_01"
+    assert catalog[0]["agent_models"] == ["qwen35-9b", "ministral3-8b"]
+    assert catalog[0]["pair_label"] == "pair 01 (qwen35-9b, ministral3-8b)"
+    assert catalog[0]["label"] == "run-1"  # Preserve the existing API fields.
+
+
+def test_catalog_overrides_refresh_and_duplicate_pairs(saved):
+    entry = saved.config_value["runs"][0]
+    entries = [
+        {**entry, "id": "a", "experiment_tag": "same-tag", "pair_id": "pair_01"},
+        {**entry, "id": "b", "experiment_tag": "different-tag", "pair_id": "pair_01"},
+        {**entry, "id": "c", "experiment_tag": "same-tag", "pair_id": "pair_01"},
+    ]
+    write_json(saved.config, {"runs": entries})
+    catalog = saved.client.get("/api/runs").json()
+    assert [item["id"] for item in catalog] == ["a", "c", "b"]
+    assert catalog[0]["pair_label"].endswith(" · a")
+    assert catalog[1]["pair_label"].endswith(" · c")
+    assert not catalog[2]["pair_label"].endswith(" · b")
+    write_json(saved.config, {"runs": [entries[1]]})
+    assert [item["id"] for item in saved.client.get("/api/runs").json()] == ["b"]
+
+
+def test_catalog_legacy_and_missing_metadata_keep_runs_accessible(saved):
+    catalog = saved.client.get("/api/runs").json()
+    assert catalog[0]["experiment_tag"] == "test"
+    assert catalog[0]["pair_label"] == "test (모델 정보 없음, 모델 정보 없음)"
+    write_json(saved.sim / "run_config.json", {"tag": "standalone", "agent1_model": ["invalid"]})
+    assert saved.client.get("/api/runs").json()[0]["experiment_tag"] == "standalone"
+    (saved.sim / "run_config.json").write_text("{unfinished")
+    assert saved.client.get("/api/runs").json()[0]["id"] == "test"
+    (saved.sim / "run_config.json").unlink()
+    assert saved.client.get("/api/runs").json()[0]["id"] == "test"
+    assert saved.client.get("/api/runs/test/episodes").status_code == 200
+
+
+def test_catalog_normalizes_pair_numbers_before_disambiguating(saved):
+    entry = saved.config_value["runs"][0]
+    write_json(saved.config, {"runs": [
+        {**entry, "id": f"run-{index}", "experiment_tag": "same-tag", "pair_id": pair_id}
+        for index, pair_id in enumerate(("pair_1", "pair_01", "pair-01", "pair 01"))
+    ]})
+    catalog = saved.client.get("/api/runs").json()
+    assert {item["pair_id"] for item in catalog} == {"pair_01"}
+    assert len({item["pair_label"] for item in catalog}) == 4
+    for item in catalog:
+        assert item["pair_label"].endswith(" · " + item["id"])
+
+
+@pytest.mark.parametrize("field,value", [
+    ("experiment_tag", []), ("experiment_tag", " "), ("pair_id", None), ("pair_id", 1),
+])
+def test_catalog_rejects_invalid_explicit_group_metadata(saved, field, value):
+    saved.config_value["runs"][0][field] = value
+    write_json(saved.config, saved.config_value)
+    response = saved.client.get("/api/runs")
+    assert response.status_code == 422
+    assert field in response.json()["detail"]
+
+
 def test_round_robin_private_speech_and_skipped_tts_timing(saved):
     playback = saved.client.get(saved.base).json()["playback"]
     assert playback["duration"] == pytest.approx(3.3)

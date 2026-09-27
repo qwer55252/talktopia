@@ -19,6 +19,8 @@ const fieldNames = {
 };
 let request = null;
 let episodes = [];
+let runs = [];
+let selectedExperiment = "";
 let selectedRun = "";
 let selectedEpisode = "";
 let player = null;
@@ -128,21 +130,45 @@ async function loadRun(signal) {
   await loadEpisode(signal);
 }
 
+function renderSelectors() {
+  const tags = [...new Set(runs.map((run) => run.experiment_tag))];
+  if (!tags.includes(selectedExperiment)) selectedExperiment = tags[0] || "";
+  const experiments = byId("experiment-select");
+  experiments.replaceChildren(...tags.map((tag) => {
+    const option = el("option", "", tag);
+    option.value = tag;
+    return option;
+  }));
+  experiments.value = selectedExperiment;
+  experiments.title = selectedExperiment;
+  experiments.disabled = !tags.length;
+
+  const pairs = runs.filter((run) => run.experiment_tag === selectedExperiment);
+  if (!pairs.some((run) => run.id === selectedRun)) {
+    selectedRun = pairs[0]?.id || "";
+    selectedEpisode = "";
+  }
+  const select = byId("run-select");
+  select.replaceChildren(...pairs.map((run) => {
+    const option = el("option", "", run.pair_label);
+    option.value = run.id;
+    return option;
+  }));
+  select.value = selectedRun;
+  select.title = pairs.find((run) => run.id === selectedRun)?.pair_label || "";
+  select.disabled = !pairs.length;
+}
+
 async function refresh() {
   const signal = beginRequest();
   try {
-    const runs = await getJSON("/api/runs", signal);
-    const select = byId("run-select");
-    select.replaceChildren(...runs.map((run) => {
-      const option = el("option", "", run.label);
-      option.value = run.id;
-      return option;
-    }));
-    if (!runs.some((run) => run.id === selectedRun)) selectedRun = runs[0]?.id || "";
-    select.value = selectedRun;
+    runs = await getJSON("/api/runs", signal);
+    selectedExperiment = runs.find((run) => run.id === selectedRun)?.experiment_tag || selectedExperiment;
+    renderSelectors();
+    episodes = [];
+    renderList();
+    byId("catalog-warning").replaceChildren();
     if (!selectedRun) {
-      episodes = [];
-      renderList();
       byId("detail").replaceChildren(el("div", "empty", "설정 파일의 runs에 시뮬레이션 경로를 추가해 주세요."));
       byId("detail").removeAttribute("aria-busy");
       return;
@@ -379,6 +405,8 @@ async function loadEpisode(signal) {
   const base = episodeBase();
   const data = await getJSON(base, signal);
   const header = el("header", "episode-header");
+  const run = runs.find((item) => item.id === data.run_id);
+  if (run) header.append(el("p", "run-context", run.experiment_tag + " / " + run.pair_label));
   const titleRow = el("div", "title-row");
   titleRow.append(el("h1", "", data.id.replace("episode_", "Episode ")), statusBadge(data.status));
   header.append(el("p", "eyebrow", data.playback.mode === "round-robin" ? "ROUND ROBIN" : "FULL DUPLEX"));
@@ -402,11 +430,25 @@ async function loadEpisode(signal) {
   byId("detail").removeAttribute("aria-busy");
 }
 
-byId("run-select").addEventListener("change", async (event) => {
-  selectedRun = event.target.value;
+async function changeRun() {
   selectedEpisode = "";
+  episodes = [];
+  renderList();
+  byId("catalog-warning").replaceChildren();
   const signal = beginRequest();
   try { await loadRun(signal); } catch (error) { showError(error); }
+}
+
+byId("experiment-select").addEventListener("change", () => {
+  selectedExperiment = byId("experiment-select").value;
+  selectedRun = "";
+  renderSelectors();
+  changeRun();
+});
+byId("run-select").addEventListener("change", () => {
+  selectedRun = byId("run-select").value;
+  renderSelectors();
+  changeRun();
 });
 byId("refresh").addEventListener("click", refresh);
 refresh();
