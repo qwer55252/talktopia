@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import unicodedata
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +42,7 @@ PROMPT_MAX_WORDS = 40
 _EMPTY_ARGUMENT_ACTIONS = frozenset({"none", "leave", "backchanneling"})
 _SPOKEN_ACTIONS = frozenset({"speak", "hesitation", "correction", "interruption"})
 _SPEECH_MARKUP_CHARACTERS = frozenset("*()[]{}")
+_COMPACT_DOLLAR_AMOUNT = re.compile(r"\$\s*\d[\d,]*(?:\.\d+)?\s*[kKmMbB]\b")
 
 _SENTENCE_BOUNDARY = re.compile(
     r"(?P<terminal>[.!?。！？]+)(?P<closers>[\"”’')\]]*)(?P<space>\s+)"
@@ -112,8 +114,9 @@ class _JointAction(AgentAction):
     argument: str = Field(
         description=(
             "For speak, hesitation, correction, or interruption: only the words "
-            "spoken aloud, without asterisks, parentheses, square or curly brackets, "
+            "spoken aloud in English, without asterisks, parentheses, square or curly brackets, "
             "stage directions, speaker labels, or narration. "
+            "Write monetary amounts in spoken words, not dollar abbreviations like $1k. "
             "For action or non-verbal communication: describe the "
             "behavior. For none, leave, or backchanneling: an empty string. "
             "Use at most 40 words for a non-empty argument."
@@ -132,6 +135,20 @@ class _JointAction(AgentAction):
         else:
             _validate_generated_text(self.argument, field_name="argument")
             if self.action_type in _SPOKEN_ACTIONS:
+                if any(
+                    character.isalpha()
+                    and "LATIN" not in unicodedata.name(character, "")
+                    for character in self.argument
+                ):
+                    raise ValueError(
+                        "English speech requires Latin-script letters; "
+                        "write foreign names in Latin letters"
+                    )
+                if _COMPACT_DOLLAR_AMOUNT.search(self.argument):
+                    raise ValueError(
+                        "write compact dollar amounts in spoken words "
+                        "while preserving their value"
+                    )
                 # A marked span could be emphasis or a stage direction. Do not
                 # guess and silently remove words from the participant's speech.
                 if _SPEECH_MARKUP_CHARACTERS.intersection(self.argument):
@@ -214,6 +231,18 @@ class Surface5ActionOutputParser(PydanticOutputParser[_JointAction]):
     @property
     def errors(self) -> tuple[str, ...]:
         return tuple(self._errors)
+
+    def get_format_instructions(self) -> str:
+        instructions = super().get_format_instructions()
+        if self._errors:
+            # SOTOPIA calls this again for its existing single repair. Content
+            # validation can fail even when the original JSON syntax is valid.
+            instructions += (
+                "\nThe previous action failed validation:\n"
+                + self._errors[-1][:800]
+                + "\nReturn an action that satisfies the reported validation rule."
+            )
+        return instructions
 
     def parse(self, result: str, context: dict[str, Any] | None = None) -> _JointAction:
         self._attempts += 1

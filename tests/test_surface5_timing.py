@@ -340,7 +340,7 @@ def test_action_controls_and_weighted_latency_summary():
 
 def test_prompt_is_the_versioned_appendix_text():
     text = generation._PROMPT_PATH.read_text()
-    assert generation.SIMULATION_PROMPT_VERSION == "simulation_FDB_v6"
+    assert generation.SIMULATION_PROMPT_VERSION == "simulation_FDB_v7"
     assert generation._ACTION_PROMPT == text
 
 

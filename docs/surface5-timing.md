@@ -83,7 +83,7 @@ completed episodes using measurement counts, rather than averaging episode means
 
 ## Prompts and evaluation
 
-The runtime loads `talktopia/full_duplex/prompts/simulation_FDB_v6.txt` directly.
+The runtime loads `talktopia/full_duplex/prompts/simulation_FDB_v7.txt` directly.
 It preserves the body of `sotopia_action_v1.txt`, including the participant's
 freedom to leave, and adds the same 40-word and recipient instructions as the
 round-robin speech prompt plus the partial-ASR and backchannel instructions.
@@ -99,7 +99,16 @@ nonverbal behavior. The initial request and its possible repair use the same
 schema. Runtime validation retains the blank-text and 50-word checks and still
 checks the current floor before synthesis and delivery. The native decoder does
 not enforce the semantic distinction between dialogue and stage narration.
-The prompt distinguishes words spoken aloud from nonverbal action descriptions.
+The prompt distinguishes words spoken aloud from nonverbal action descriptions
+and makes the English-only ASR channel explicit. Spoken arguments with alphabetic
+non-Latin characters use the existing repair/fallback path. This is a script check,
+not an English-language classifier; Latin accents and combining marks are allowed.
+Recipient names and nonverbal descriptions are not subject to this speech rule.
+Compact dollar amounts such as `$1k` or `$3K` also use the existing repair path
+so the model can express the same amount in spoken words. No numeric value is
+estimated or replaced by the runtime. In replay tests, the original compact
+forms were misrecognized while full-word variants preserved the amounts. This
+is an end-to-end TTS/ASR observation, not a guarantee about either model alone.
 Spoken arguments containing asterisks or round, square, or curly brackets use
 the existing repair/fallback path. The runtime does not guess whether a marked
 span is emphasis, an aside, or a stage direction and then delete it. Ordinary
@@ -121,7 +130,10 @@ unchanged, but newly generated outputs may differ.
 Generation uses SOTOPIA's structured-output parser and JSON repair, recipient
 name resolution, configured action temperature (1.0 in the pipeline), and the
 configured bad-output processing model. A failed parse can issue one repair
-request; final failure produces `none` and an error audit, not another Surface5
+request. The parser includes its last validation error in that repair instruction,
+so valid JSON with invalid action content can be corrected. The first request
+contains no previous-error feedback, and its JSON schema is unchanged for repair.
+Final failure produces `none` and an error audit, not another Surface5
 regeneration loop. Decision events and committed passes distinguish this fallback
 with `generation_fallback`. Cancellation still propagates. All inference and
 repair waits remain in measured latency and the live recording.

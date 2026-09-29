@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import gin
@@ -588,3 +589,162 @@ async def test_inaudible_speech_uses_repair_or_none(
         assert [chunk.text for chunk in engine.split_into_sentence_chunks(hidden)] == [
             "Hello."
         ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action_type", ["speak", "hesitation", "correction", "interruption"]
+)
+@pytest.mark.parametrize(
+    "original", ["Family first—但不多聊那回事。", "Please help. Спасибо."]
+)
+async def test_non_latin_speech_uses_existing_repair_with_error_feedback(
+    monkeypatch, action_type, original
+):
+    repaired = "Family comes first. Let us discuss the details."
+    calls = mock_completions(
+        monkeypatch,
+        [
+            {"action_type": action_type, "argument": original, "to": []},
+            {"action_type": action_type, "argument": repaired, "to": []},
+        ],
+    )
+    engine = DuplexGenerationEngine(MODEL)
+    generated = await engine.generate_action(
+        make_context(), make_observation([action_type], peer_utterance_id="peer-1"), ""
+    )
+    assert not generated.fallback and generated.argument == repaired
+    assert len(calls) == 2
+    assert (
+        "The previous action failed validation"
+        not in calls[0]["messages"][0]["content"]
+    )
+    assert (
+        "English speech requires Latin-script letters"
+        in calls[1]["messages"][0]["content"]
+    )
+    assert calls[0]["response_format"] == calls[1]["response_format"]
+    hidden = engine.make_hidden_said(make_context(), generated)
+    assert (
+        " ".join(c.text for c in engine.split_into_sentence_chunks(hidden)) == repaired
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_non_latin_speech_falls_back_without_extra_calls(monkeypatch):
+    response = {"action_type": "speak", "argument": "你好，朋友。", "to": []}
+    calls = mock_completions(monkeypatch, [response, response])
+    generated = await DuplexGenerationEngine(MODEL).generate_action(
+        make_context(), make_observation(["speak"]), ""
+    )
+    assert len(calls) == 2 and generated.fallback
+    assert generated.decision.action_type == "none"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action_type, text",
+    [
+        ("speak", "José, the café is open. Nai\u0308ve “yes” isn’t a promise."),
+        ("action", "递给对方一杯茶。"),
+        ("non-verbal communication", "*点头*"),
+    ],
+)
+async def test_speech_script_guard_keeps_accents_and_non_audio_unicode(
+    monkeypatch, action_type, text
+):
+    calls = mock_completions(
+        monkeypatch, [{"action_type": action_type, "argument": text, "to": ["李明"]}]
+    )
+    session = make_context()
+    session = replace(session, peer_name="李明")
+    generated = await DuplexGenerationEngine(MODEL).generate_action(
+        session, make_observation([action_type]), ""
+    )
+    assert not generated.fallback and generated.argument == text
+    assert generated.decision.to == ["李明"] and len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requests_do_not_share_repair_feedback(monkeypatch):
+    backend = importlib.import_module("sotopia.generation_utils.generate")
+    calls = []
+
+    async def complete(**kwargs):
+        calls.append(kwargs)
+        prompt = kwargs["messages"][0]["content"]
+        await asyncio.sleep(0)
+        if "Original string:" in prompt:
+            assert "English speech requires Latin-script letters" in prompt
+            argument = "I can help with A."
+        elif "Context A" in prompt:
+            argument = "你好。"
+        else:
+            assert "Context B" in prompt
+            assert "The previous action failed validation" not in prompt
+            argument = "I can help with B."
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {"action_type": "speak", "argument": argument, "to": []}
+                        )
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(backend, "acompletion", complete)
+    results = await asyncio.gather(
+        *[
+            DuplexGenerationEngine(MODEL).generate_action(
+                make_context(), make_observation(["speak"]), f"Context {label}"
+            )
+            for label in ["A", "B"]
+        ]
+    )
+    assert [r.argument for r in results] == ["I can help with A.", "I can help with B."]
+    assert all(not r.fallback for r in results) and len(calls) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "original, repaired",
+    [
+        ("I can lend $1k.", "I can lend one thousand dollars."),
+        ("I need $3K.", "I need three thousand dollars."),
+        ("The budget is $1.5M.", "The budget is one point five million dollars."),
+    ],
+)
+async def test_compact_dollar_amount_uses_repair_without_runtime_value_rewrite(
+    monkeypatch, original, repaired
+):
+    calls = mock_completions(
+        monkeypatch,
+        [
+            {"action_type": "speak", "argument": original, "to": []},
+            {"action_type": "speak", "argument": repaired, "to": []},
+        ],
+    )
+    engine = DuplexGenerationEngine(MODEL)
+    generated = await engine.generate_action(
+        make_context(), make_observation(["speak"]), ""
+    )
+    assert not generated.fallback and generated.argument == repaired
+    assert len(calls) == 2
+    assert "preserving their value" in calls[1]["messages"][0]["content"]
+    assert calls[0]["response_format"] == calls[1]["response_format"]
+    assert engine.make_hidden_said(make_context(), generated).text == repaired
+
+
+@pytest.mark.asyncio
+async def test_non_audio_currency_not_rewritten(monkeypatch):
+    text = "writes $1k on the form"
+    calls = mock_completions(
+        monkeypatch, [{"action_type": "action", "argument": text, "to": []}]
+    )
+    generated = await DuplexGenerationEngine(MODEL).generate_action(
+        make_context(), make_observation(["action"]), ""
+    )
+    assert not generated.fallback and generated.argument == text and len(calls) == 1
