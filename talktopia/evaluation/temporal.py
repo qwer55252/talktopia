@@ -15,13 +15,6 @@ from talktopia.full_duplex.events import (
 )
 from talktopia.full_duplex.rendering import _timestamp
 
-TEMPORAL_INSTRUCTION = (
-    (Path(__file__).with_name("prompts") / "temporal_v1.txt")
-    .read_text()
-    .strip()
-)
-
-
 def _require_silence(wav, channel: int, start: int, end: int) -> None:
     wav.setpos(start)
     while start < end:

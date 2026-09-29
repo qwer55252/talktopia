@@ -12,7 +12,8 @@ class RuntimeConfig(BaseModel):
     allow_backchannels: bool = True
     allow_corrections: bool = False
     allow_interruptions: bool = False
-    turn_taking_policy: str = "surface5_realtime_v2.1"
+    turn_taking_policy: str = "surface5_realtime_v3"
+    termination_policy: Literal["first_leave"] = "first_leave"
     generation_max_attempts: int = Field(default=2, ge=1)
     history_entries: int = Field(default=8, ge=1)
     minimum_floor_gap_ms: int = Field(default=200, ge=0)
@@ -26,6 +27,7 @@ FRAME_MS = 40
 ASR_DECODE_INTERVAL_MS = 400
 ASR_WINDOW_MS = 3000
 INTERACTION_MODE = "surface5-full-duplex"
+SIMULATION_PROMPT_VERSION = "simulation_FDB_v3"
 
 
 def runtime_options(values) -> dict:
@@ -55,6 +57,7 @@ def runtime_settings(max_turns: int = 12, **options) -> dict:
         "opener": "agent1",
         "clock": "monotonic_elapsed_ms",
         "audio_capture": "live_delivered_pcm_v2",
-        "simulation_prompt": "simulation_v2.1",
+        "simulation_prompt": SIMULATION_PROMPT_VERSION,
+        "evaluation_prompt": "evaluation_FDB_v1",
         "temporal_evaluation": "sentence_asr_delivery_v1",
     }

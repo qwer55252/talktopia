@@ -1,4 +1,4 @@
-"""Surface5's 40 ms duplex clock and explicit leave-handshake controller."""
+"""Surface5's live audio delivery, floor control, and first-leave termination."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from .actions import (
 )
 from .agent import ActiveUtterance, AgentOutput, CascadedDuplexAgent
 from .audio import AudioChunk, AudioRouter, StereoWavWriter
-from .config import RuntimeConfig
+from .config import RuntimeConfig, SIMULATION_PROMPT_VERSION
 from .events import (
     ASRUpdateEvent,
     ActionCommitted,
@@ -49,13 +49,7 @@ from .sotopia_adapter import (
 from .speech_backends import ASRUpdate, SpeechSynthesisFailure
 
 
-LeavePhase = Literal[
-    "active",
-    "first_leave",
-    "peer_closing",
-    "draining",
-    "completed",
-]
+LeavePhase = Literal["active", "completed"]
 
 _SPOKEN_ACTIONS = frozenset(
     {"speak", "hesitation", "backchanneling", "correction", "interruption"}
@@ -108,7 +102,7 @@ class AgentLivenessSnapshot(BaseModel):
     agent: str
     session_active: bool
     left: bool
-    work_stage: Literal["idle", "decision", "hidden_said", "closing", "tts"]
+    work_stage: Literal["idle", "decision", "hidden_said", "tts"]
     pending_generation: bool
     pending_output: bool
     active_utterance_id: str | None
@@ -317,7 +311,6 @@ class _UtteranceRuntime:
     listener: str
     decision: DuplexActionDecision
     action_type: DuplexActionType
-    closing: bool
     hidden_said_id: str
     started: bool = False
     floor_claimed: bool = False
@@ -385,8 +378,6 @@ class DuplexRuntime:
         self._hidden_by_decision: dict[str, HiddenSaid] = {}
         self._utterances: dict[str, _UtteranceRuntime] = {}
         self._deliveries: dict[tuple[str, int], _ChunkDelivery] = {}
-        self._first_leaver: str | None = None
-        self._closing_agent: str | None = None
         self._latest_asr_event: dict[str, ASRUpdateEvent] = {}
         self._commit_sequence = 0
         self._output_tasks: dict[str, asyncio.Task[AgentOutput]] = {}
@@ -486,7 +477,8 @@ class DuplexRuntime:
                 "realtime": self.config.realtime,
                 "clock": "monotonic_elapsed_ms",
                 "audio_capture": "live_delivered_pcm_v2",
-                "simulation_prompt": "simulation_v2.1",
+                "simulation_prompt": SIMULATION_PROMPT_VERSION,
+                "termination_policy": self.config.termination_policy,
                 "allow_backchannels": self.config.allow_backchannels,
                 "allow_corrections": self.config.allow_corrections,
                 "allow_interruptions": self.config.allow_interruptions,
@@ -505,6 +497,7 @@ class DuplexRuntime:
                 agent_name, output = await self._next_output()
                 await self.handle_agent_output(agent_name, output)
             await self._stop_audio()
+            await self._finish_delivered_audio("agent_left")
             # The episode runner writes the terminal event after saving artifacts.
             # Evaluation is a separate Talktopia stage.
             ended = EpisodeEnded(
@@ -513,13 +506,13 @@ class DuplexRuntime:
                 sequence=0,
                 timestamp_ms=self.now_ms,
                 status="completed",
-                reason="explicit_leave_handshake",
+                reason="agent_left",
                 duration_ms=self.now_ms,
             )
             return ended
         except TurnLimitReached:
             await self._stop_audio()
-            await self._stop_at_turn_limit()
+            await self._finish_delivered_audio("max_turns")
             return EpisodeEnded(
                 event_id=f"{self.state.episode_id}-runtime-completed",
                 episode_id=self.state.episode_id,
@@ -681,14 +674,8 @@ class DuplexRuntime:
         if decision.action_type == "none":
             return
         if decision.action_type == "leave":
-            if self.state.leave_phase == "active":
-                await self._commit_leave(agent, decision, first=True)
-                return
-            if self.state.leave_phase == "peer_closing" and agent != self._first_leaver:
-                self._closing_agent = agent
-                self.state.leave_phase = "draining"
-                return
-            raise RuntimeError("invalid leave decision for current handshake phase")
+            await self._commit_leave(agent, decision)
+            return
         action = DuplexAction(
             action_type=decision.action_type,
             argument=decision.non_audio_argument,
@@ -748,13 +735,12 @@ class DuplexRuntime:
         await self._commit_joint(
             actor=utterance.speaker,
             action=action,
-            origin="environment_closing" if utterance.closing else "agent",
+            origin="agent",
             trigger_event_id=trigger.event_id if trigger is not None else None,
             utterance_id=update.utterance_id,
             metadata={
                 "decision_id": utterance.decision.decision_id,
                 "hidden_said_id": utterance.hidden_said_id,
-                "closing": utterance.closing,
             },
         )
         was_cancelled = update.utterance_id in self._cancelled_utterances
@@ -766,11 +752,7 @@ class DuplexRuntime:
         self._emit_floor(floor_event)
         self._agents[utterance.speaker].finish_speech(update.utterance_id)
         self._clear_utterance_state(update.utterance_id, utterance)
-        if utterance.closing:
-            assert self._closing_agent == utterance.speaker
-            decision = utterance.decision
-            await self._commit_leave(utterance.speaker, decision, first=False)
-        elif utterance.action_type in _AUXILIARY_ACTIONS:
+        if utterance.action_type in _AUXILIARY_ACTIONS:
             resumed = await self._resume_deferred_observation(utterance.speaker)
             if utterance.action_type == "backchanneling" or resumed:
                 # A micro-listener response acknowledges the active speaker; it
@@ -910,7 +892,7 @@ class DuplexRuntime:
         utterance = self._utterances[utterance_id]
         observation = self._decision_observations[utterance.decision.decision_id]
         peer_id = observation.peer_utterance_id
-        if not peer_id or utterance.closing:
+        if not peer_id:
             return
         if utterance.action_type == "backchanneling":
             kind = "backchannel"
@@ -1016,18 +998,12 @@ class DuplexRuntime:
             ):
                 await self._advance_floor_gap()
             listener = self._peer(agent)
-            closing = (
-                decision.action_type == "leave"
-                and self.state.leave_phase == "draining"
-                and agent == self._closing_agent
-            )
-            action_type: DuplexActionType = "speak" if closing else decision.action_type
+            action_type = decision.action_type
             utterance = _UtteranceRuntime(
                 speaker=agent,
                 listener=listener,
                 decision=decision,
                 action_type=action_type,
-                closing=closing,
                 hidden_said_id=hidden.hidden_said_id,
             )
             self._utterances[audio.utterance_id] = utterance
@@ -1389,9 +1365,11 @@ class DuplexRuntime:
         self,
         agent: str,
         decision: DuplexActionDecision,
-        *,
-        first: bool,
     ) -> None:
+        if self.state.leave_phase != "active":
+            raise RuntimeError("Cannot leave an already completed episode")
+        self._audio_stopping = True
+        await self.stop("agent_left")
         await self._commit_joint(
             actor=agent,
             action=DuplexAction(action_type="leave", argument="", to=[]),
@@ -1400,31 +1378,14 @@ class DuplexRuntime:
             utterance_id=None,
             metadata={
                 "decision_id": decision.decision_id,
-                "leave_phase": "first" if first else "second",
+                "termination_policy": self.config.termination_policy,
             },
         )
         self.state.left_agents.add(agent)
         self._agents[agent].state.left = True
         self._pending_decisions.pop(agent, None)
-        self.state.deferred_observations.pop(agent, None)
-        if first:
-            self._first_leaver = agent
-            self.state.leave_phase = "first_leave"
-            peer = self._peer(agent)
-            self.state.deferred_observations.pop(peer, None)
-            self.state.leave_phase = "peer_closing"
-            assert self._snapshot is not None
-            observation = self._streaming_observation(
-                peer,
-                source="peer_left",
-                canonical=self._snapshot.observations[peer],
-                available_actions=["leave"],
-            )
-            self.state.latest_observations[peer] = observation
-            await self._agents[peer].submit_observation(observation)
-        else:
-            self.state.left_agents.add(agent)
-            self.state.leave_phase = "completed"
+        self.state.deferred_observations.clear()
+        self.state.leave_phase = "completed"
 
     async def _commit_joint(
         self,
@@ -1495,14 +1456,20 @@ class DuplexRuntime:
                 ),
             )
 
-        if self.state.budget_turns >= self.config.max_turns:
+        if (
+            self.state.budget_turns >= self.config.max_turns
+            and action.action_type != "leave"
+        ):
             raise TurnLimitReached
 
     def _record_stopped_audio(self, reason: str) -> None:
         for utterance_id, utterance in self._utterances.items():
             self.audio_router.cancel(utterance_id)
             self._emit_open_delivery_prefixes(utterance_id)
-            if utterance_id not in self._audio_finished_utterances:
+            if (
+                utterance_id not in self._audio_finished_utterances
+                and utterance_id not in self._cancelled_utterances
+            ):
                 self.event_writer.emit(
                     SpeechLifecycleEvent,
                     self.now_ms,
@@ -1513,11 +1480,12 @@ class DuplexRuntime:
                     target_utterance_id=utterance.decision.target_utterance_id,
                     reason=reason,
                 )
+                self._cancelled_utterances.add(utterance_id)
 
-    async def _stop_at_turn_limit(self) -> None:
-        """Keep delivered audio evidence without committing a thirteenth action."""
-        await self.stop("max_turns")
-        self._record_stopped_audio("max_turns")
+    async def _finish_delivered_audio(self, reason: str) -> None:
+        """Preserve received audio and ASR without committing another action."""
+        await self.stop(reason)
+        self._record_stopped_audio(reason)
         for utterance_id, utterance in tuple(self._utterances.items()):
             previous = self._latest_asr_event.get(utterance_id)
             if previous is None or not previous.is_final:
@@ -1691,7 +1659,7 @@ class DuplexRuntime:
         self,
         agent: str,
         *,
-        source: Literal["reset", "asr_partial", "asr_final", "commit", "peer_left"],
+        source: Literal["reset", "asr_partial", "asr_final", "commit"],
         canonical: object,
         available_actions: list[DuplexActionType],
         stable_text: str = "",

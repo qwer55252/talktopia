@@ -206,25 +206,26 @@ async def test_live_pcm_survives_model_waits_and_slow_final_asr(
     )
     calls = []
 
-    class Judge:
-        def __init__(self, **kwargs):
-            pass
+    async def judge(**kwargs):
+        calls.append(kwargs)
+        return evaluator.TwoAgentEvaluation.model_validate(
+            {
+                "evaluations": {
+                    agent: {
+                        dimension: {
+                            "score": 0,
+                            "reasoning": "Recorded interaction."
+                            if len(calls) == 1
+                            else f"{agent} recorded evidence for {dimension}",
+                        }
+                        for dimension in SotopiaDimensions.model_fields
+                    }
+                    for agent in ("agent_1", "agent_2")
+                }
+            }
+        )
 
-        async def __acall__(self, **kwargs):
-            calls.append(kwargs)
-            return [
-                (
-                    agent,
-                    (
-                        (dimension, 0),
-                        f"{agent} recorded evidence for {dimension}",
-                    ),
-                )
-                for agent in ("agent_1", "agent_2")
-                for dimension in SotopiaDimensions.model_fields
-            ]
-
-    monkeypatch.setattr(evaluator, "EpisodeLLMEvaluator", Judge)
+    monkeypatch.setattr(evaluator, "agenerate", judge)
     args = pipeline.parse_args(
         [
             "--stage",
@@ -241,10 +242,22 @@ async def test_live_pcm_survives_model_waits_and_slow_final_asr(
         == 0
     )
     assert source_path.read_bytes() == source_bytes
+    assert "Speech timing in the recorded interaction" in calls[0]["template"]
+    assert calls[0]["temperature"] == 0.0
+    assert "Received words" in calls[0]["input_values"]["history"]
+    assert calls[0]["template"] == evaluator.FDB_EVALUATION_PROMPT
+    assert len(calls) == 2
+    assert calls[0]["input_values"]["retry_feedback"] == ""
     assert (
-        "Timing evidence for this Surface5 interaction" in calls[0]["history"]
+        "previous evaluation was rejected" in calls[1]["input_values"]["retry_feedback"]
     )
-    assert calls[0]["temperature"] == 0.0 and calls[0]["num_agents"] == 2
+    assert calls[0]["input_values"]["history"] == calls[1]["input_values"]["history"]
+    assert (
+        "evaluation_FDB_v1"
+        in (
+            tmp_path / "evaluation-run/04_sotopia_eval_reevaluate_existing.json"
+        ).read_text()
+    )
     # Delivered samples are evidence, not an unverified timestamp decoration.
     audio = tmp_path / result["conversation_audio"]
     original_audio = audio.read_bytes()
@@ -252,7 +265,7 @@ async def test_live_pcm_survives_model_waits_and_slow_final_asr(
     assert (
         await evaluator.evaluate_episode(args, tmp_path / "changed-audio") == 1
     )
-    assert len(calls) == 1
+    assert len(calls) == 2
     damaged = bytearray(original_audio)
     damaged[44] = 1
     audio.write_bytes(damaged)
@@ -348,13 +361,12 @@ def test_action_controls_and_weighted_latency_summary():
 
 def test_prompt_is_the_versioned_appendix_text():
     text = generation._PROMPT_PATH.read_text()
-    assert generation.SIMULATION_PROMPT_VERSION == "simulation_v2.1"
+    assert generation.SIMULATION_PROMPT_VERSION == "simulation_FDB_v3"
     for section in (
-        generation._ROLE_PROMPT,
+        generation._COMMON_PROMPT,
         generation._DECISION_PROMPT,
         generation._NON_AUDIO_ARGUMENT_PROMPT,
         generation._HIDDEN_SAID_PROMPT,
-        generation._CLOSING_PROMPT,
     ):
         assert section in text
 
@@ -516,7 +528,6 @@ async def test_failure_preserves_exactly_the_accepted_audio(tmp_path, failure):
             listener=names[1 - names.index(name)],
             decision=decision,
             action_type="speak",
-            closing=False,
             hidden_said_id=name,
         )
         runtime._deliveries[(utterance_id, 0)] = _ChunkDelivery(

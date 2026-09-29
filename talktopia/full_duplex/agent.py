@@ -49,7 +49,7 @@ class AgentState:
     active_utterance: ActiveUtterance | None = None
     observation_revision: int = 0
     last_llm_latency_ms: int | None = None
-    work_stage: Literal["idle", "decision", "hidden_said", "closing", "tts"] = "idle"
+    work_stage: Literal["idle", "decision", "hidden_said", "tts"] = "idle"
 
 
 AgentOutput = (
@@ -358,7 +358,7 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
                 "non-verbal communication",
             }:
                 return
-            if decision.action_type == "leave" and observation.source != "peer_left":
+            if decision.action_type == "leave":
                 return
 
             if decision.action_type == "backchanneling":
@@ -369,14 +369,6 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
                 )
                 self._backchannel_index += 1
                 action_type: DuplexActionType = "backchanneling"
-            elif decision.action_type == "leave":
-                self.state.work_stage = "closing"
-                hidden = await self.generation.generate_closing(
-                    self._context,
-                    recent_history,
-                    decision.decision_id,
-                )
-                action_type = "speak"
             else:
                 self.state.work_stage = "hidden_said"
                 hidden = await self.generation.generate_hidden_said(

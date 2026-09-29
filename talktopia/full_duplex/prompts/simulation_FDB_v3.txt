@@ -1,0 +1,70 @@
+[COMMON]
+Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
+You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
+Note that {agent}'s goal is only visible to you.
+You should try your best to achieve {agent}'s goal in a way that align with their character traits.
+Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
+{history}.
+You are at Turn #{turn_number}. Your available action types are
+{action_list}.
+Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
+
+[DECISION]
+{common_prompt}
+
+Current speech observation:
+{observation}
+
+An "asr_partial" observation contains only the words recognized so far from an
+unfinished utterance. Recognition may change as more audio arrives; do not assume
+that you have heard the remainder of the utterance.
+When "backchanneling" is available, you may give a brief acknowledgment of the
+words already heard while the other participant is speaking. A backchannel
+signals listening without taking the floor or answering an unfinished utterance.
+Choose "none" when a backchannel is not appropriate to the partial observation.
+
+Select one action type from the available list, using its exact spelling.
+This step selects only the action type. Its argument will be generated separately
+when needed. Return only a JSON object containing "action_type".
+
+Feedback on the previous attempt, if any:
+{validation_feedback}
+
+Your action should follow the given format:
+{format_instructions}
+
+[NON_AUDIO_ARGUMENT]
+{common_prompt}
+
+Current speech observation:
+{observation}
+
+Selected action: {action_type}
+
+Generate only the argument for the selected action as a description of what you
+do. Use at most {max_words} words; this is a maximum, not a target.
+Return only a JSON object containing the argument in the "text" field.
+
+Feedback on the previous attempt, if any:
+{validation_feedback}
+
+Your action argument should follow the given format:
+{format_instructions}
+
+[HIDDEN_SAID]
+{common_prompt}
+
+Current speech observation:
+{observation}
+
+Selected action: {action_type}
+
+Generate only the words you will say for the selected action, without speaker
+labels or stage directions. Use at most {max_words} words; this is a maximum,
+not a target. Return only a JSON object containing the speech in the "text" field.
+
+Feedback on the previous attempt, if any:
+{validation_feedback}
+
+Your speech should follow the given format:
+{format_instructions}

@@ -13,12 +13,19 @@ from talktopia.utils import file_hash, safe_error, write_json
 from .reporting import write_episode_report
 
 from pydantic import Field, field_validator
+from litellm.utils import supports_response_schema
 from sotopia.database import EpisodeLog, SotopiaDimensions
+from sotopia.generation_utils import PydanticOutputParser, agenerate
 from sotopia.envs.evaluators import (
     EpisodeLLMEvaluator,
     EvaluationForAgents,
     unweighted_aggregate_evaluate,
 )
+
+FDB_EVALUATION_PROMPT_VERSION = "evaluation_FDB_v1"
+FDB_EVALUATION_PROMPT = (
+    Path(__file__).with_name("prompts") / f"{FDB_EVALUATION_PROMPT_VERSION}.txt"
+).read_text(encoding="utf-8")
 
 
 EVALUATION_EVIDENCE_INSTRUCTION = (
@@ -130,6 +137,44 @@ class TwoAgentEvaluation(EvaluationForAgents[SotopiaDimensions]):
                 raise ValueError("Every evaluation dimension needs a nonempty reason")
         # The engine iterates dict values; fix their order before it assigns labels.
         return {key: values[key] for key in ("agent_1", "agent_2")}
+
+
+def fdb_prompt_values(
+    history: str, names: list[str], retry_feedback: str = ""
+) -> dict[str, str]:
+    parser = PydanticOutputParser(pydantic_object=TwoAgentEvaluation)
+    return {
+        "history": history,
+        "agent1_name": names[0],
+        "agent2_name": names[1],
+        "retry_feedback": retry_feedback,
+        "agent_instruction": (
+            "There are exactly 2 agents. Under the 'evaluations' field, use exactly these keys: "
+            '["agent_1", "agent_2"] (no other keys).\n'
+        ),
+        "format_instructions": parser.get_format_instructions(),
+    }
+
+
+async def evaluate_fdb(model_name: str, values: dict[str, str]) -> list:
+    """Use the complete FDB template with the engine's existing generation settings."""
+    response = await agenerate(
+        model_name=model_name,
+        template=FDB_EVALUATION_PROMPT,
+        input_values=values,
+        output_parser=PydanticOutputParser(pydantic_object=TwoAgentEvaluation),
+        temperature=0.0,
+        structured_output=(
+            model_name.startswith("custom/structured")
+            or supports_response_schema(model=model_name)
+        ),
+        bad_output_process_model=model_name,
+    )
+    return [
+        (agent, ((dimension, payload["score"]), payload["reasoning"]))
+        for agent, evaluation in response.evaluations.items()
+        for dimension, payload in evaluation.model_dump().items()
+    ]
 
 
 def round_robin_history(source: EpisodeLog) -> tuple[list, list[str]]:
@@ -273,19 +318,23 @@ async def evaluate_episode(
             raise ValueError(
                 "Evaluation run ID must differ from the source tag when saving to DB"
             )
-        history = (
-            "\n".join(turns[:-2])
-            + "\n\n"
-            + EVALUATION_EVIDENCE_INSTRUCTION
-            + f"\nAgent mapping: agent_1 is {names[0]}; agent_2 is {names[1]}."
-        )
-        if args.interaction_mode == "surface5-full-duplex":
-            from .temporal import TEMPORAL_INSTRUCTION
-
-            history += "\n\n" + TEMPORAL_INSTRUCTION
+        history = "\n".join(turns[:-2])
+        is_fdb = args.interaction_mode == "surface5-full-duplex"
+        if is_fdb:
+            summary["evaluation_prompt"] = FDB_EVALUATION_PROMPT_VERSION
+            saved_history = FDB_EVALUATION_PROMPT.format(
+                **fdb_prompt_values(history, names)
+            )
+        else:
+            history += (
+                "\n\n"
+                + EVALUATION_EVIDENCE_INSTRUCTION
+                + f"\nAgent mapping: agent_1 is {names[0]}; agent_2 is {names[1]}."
+            )
+            saved_history = history
         history_path = artifact_dir / "evaluation/history" / f"{episode_id}.txt"
         history_path.parent.mkdir(parents=True, exist_ok=True)
-        history_path.write_text(history, encoding="utf-8")
+        history_path.write_text(saved_history, encoding="utf-8")
         summary.update(
             source_tag=source.tag,
             source_episode_pk=source.pk or None,
@@ -306,8 +355,13 @@ async def evaluate_episode(
             )
             return 0
 
-        evaluator = EpisodeLLMEvaluator(
-            model_name=args.evaluator_model, response_format_class=TwoAgentEvaluation
+        evaluator = (
+            None
+            if is_fdb
+            else EpisodeLLMEvaluator(
+                model_name=args.evaluator_model,
+                response_format_class=TwoAgentEvaluation,
+            )
         )
         for attempt in range(1, args.reeval_max_retries + 2):
             summary["attempts"] = attempt
@@ -316,14 +370,19 @@ async def evaluate_episode(
                 f"SOTOPIA evaluation: attempt {attempt}/{args.reeval_max_retries + 1}",
                 flush=True,
             )
-            request_history = history
+            retry_feedback = ""
             if summary["attempt_errors"]:
-                request_history += (
+                retry_feedback = (
                     f"\n\nEvaluation attempt {attempt}. The previous evaluation was rejected: "
                     + summary["attempt_errors"][-1][:1000]
                     + "\nEvaluate the complete interaction above again. Return all 14 "
                     "scores with specific evidence, not a reformatted example."
                 )
+            if is_fdb:
+                values = fdb_prompt_values(history, names, retry_feedback)
+                request_history = FDB_EVALUATION_PROMPT.format(**values)
+            else:
+                request_history = history + retry_feedback
             attempt_path = (
                 artifact_dir
                 / "evaluation/responses"
@@ -336,13 +395,16 @@ async def evaluate_episode(
                 "error": None,
             }
             try:
-                responses = await evaluator.__acall__(
-                    turn_number=-1,
-                    messages=None,
-                    history=request_history,
-                    num_agents=2,
-                    temperature=0.0,
-                )
+                if is_fdb:
+                    responses = await evaluate_fdb(args.evaluator_model, values)
+                else:
+                    responses = await evaluator.__acall__(
+                        turn_number=-1,
+                        messages=None,
+                        history=request_history,
+                        num_agents=2,
+                        temperature=0.0,
+                    )
                 # Check content AFTER generation so these failures retry with the
                 # conversation, rather than using the engine's JSON-only repair.
                 attempt_record["responses"] = responses

@@ -21,13 +21,13 @@ from .actions import (
     StreamingObservation,
     _validate_generated_text,
 )
+from .config import SIMULATION_PROMPT_VERSION
 
 
 GenerationStage = Literal[
     "decision",
     "non_audio_argument",
     "hidden_said",
-    "closing",
 ]
 
 # Keep the requested length independent from the validation safety margin.
@@ -70,15 +70,13 @@ _NON_TERMINAL_ABBREVIATIONS = frozenset(
 )
 _INITIALISM = re.compile(r"(?:[A-Za-z]\.){1,5}$")
 
-SIMULATION_PROMPT_VERSION = "simulation_v2.1"
 _PROMPT_PATH = Path(__file__).with_name("prompts") / f"{SIMULATION_PROMPT_VERSION}.txt"
 _parts = re.split(r"(?m)^\[([A-Z_]+)\]\s*$", _PROMPT_PATH.read_text(encoding="utf-8"))
 _PROMPTS = {name: text.strip() for name, text in zip(_parts[1::2], _parts[2::2])}
-_ROLE_PROMPT = _PROMPTS["ROLE"]
+_COMMON_PROMPT = _PROMPTS["COMMON"]
 _DECISION_PROMPT = _PROMPTS["DECISION"]
 _NON_AUDIO_ARGUMENT_PROMPT = _PROMPTS["NON_AUDIO_ARGUMENT"]
 _HIDDEN_SAID_PROMPT = _PROMPTS["HIDDEN_SAID"]
-_CLOSING_PROMPT = _PROMPTS["CLOSING"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +140,7 @@ class _GeneratedText(BaseModel):
     def accept_ollama_json_string(cls, value: object) -> object:
         # Ollama may collapse a one-property JSON schema to its string value.
         # This is transport normalization only; HiddenSaid applies the public
-        # 40-word and controller-metadata contract immediately afterwards.
+        # 50-word and controller-metadata contract immediately afterwards.
         if isinstance(value, str):
             return {"text": value}
         return value
@@ -263,8 +261,9 @@ class DuplexGenerationEngine:
                     model_name=self.model_name,
                     template=_DECISION_PROMPT,
                     input_values={
-                        "role_prompt": self._role_prompt(session),
-                        "recent_history": recent_history or "(none yet)",
+                        "common_prompt": self._common_prompt(
+                            session, observation, recent_history
+                        ),
                         "observation": self._decision_observation_json(observation),
                         "available_actions": json.dumps(
                             observation.canonical.available_actions
@@ -364,11 +363,15 @@ class DuplexGenerationEngine:
             decision_id=decision.decision_id,
             template=_HIDDEN_SAID_PROMPT,
             input_values={
-                "role_prompt": self._role_prompt(session),
-                "recent_history": recent_history or "(none yet)",
+                "common_prompt": self._common_prompt(
+                    session, observation, recent_history
+                ),
                 "observation": observation.model_dump_json(),
                 "action_type": decision.action_type,
                 "max_words": str(PROMPT_MAX_WORDS),
+                "format_instructions": PydanticOutputParser(
+                    pydantic_object=_GeneratedText
+                ).get_format_instructions(),
             },
         )
 
@@ -392,24 +395,6 @@ class DuplexGenerationEngine:
         )
         self._hidden_attempts[hidden.hidden_said_id] = 1
         return hidden
-
-    async def generate_closing(
-        self,
-        session: AgentSessionContext,
-        recent_history: str,
-        decision_id: str,
-    ) -> HiddenSaid:
-        return await self._generate_text(
-            stage="closing",
-            session=session,
-            decision_id=decision_id,
-            template=_CLOSING_PROMPT,
-            input_values={
-                "role_prompt": self._role_prompt(session),
-                "recent_history": recent_history or "(none yet)",
-                "max_words": str(PROMPT_MAX_WORDS),
-            },
-        )
 
     def split_into_sentence_chunks(self, hidden_said: HiddenSaid) -> list[SpeechChunk]:
         sentences = self._spoken_sentences(hidden_said.text)
@@ -476,8 +461,9 @@ class DuplexGenerationEngine:
                     model_name=self.model_name,
                     template=_NON_AUDIO_ARGUMENT_PROMPT,
                     input_values={
-                        "role_prompt": self._role_prompt(session),
-                        "recent_history": recent_history or "(none yet)",
+                        "common_prompt": self._common_prompt(
+                            session, observation, recent_history
+                        ),
                         "observation": observation.model_dump_json(),
                         "action_type": action_type,
                         "max_words": str(PROMPT_MAX_WORDS),
@@ -514,7 +500,7 @@ class DuplexGenerationEngine:
     async def _generate_text(
         self,
         *,
-        stage: Literal["hidden_said", "closing"],
+        stage: Literal["hidden_said"],
         session: AgentSessionContext,
         decision_id: str,
         template: str,
@@ -611,13 +597,24 @@ class DuplexGenerationEngine:
         return json.dumps(schema)
 
     @staticmethod
-    def _role_prompt(session: AgentSessionContext) -> str:
-        return _ROLE_PROMPT.format(
-            agent_name=session.agent_name,
-            peer_name=session.peer_name,
-            scenario=session.scenario,
-            self_background=session.self_background,
-            private_goal=session.private_goal,
+    def _common_prompt(
+        session: AgentSessionContext,
+        observation: StreamingObservation,
+        recent_history: str,
+    ) -> str:
+        history = (
+            "Here is the context of the interaction:\n"
+            f"Participants: {session.agent_name}; {session.peer_name}\n"
+            f"Situation: {session.scenario}\n"
+            f"Your background: {session.self_background}\n"
+            f"Your social goal: {session.private_goal}\n\n"
+            "Conversation so far:\n" + (recent_history or "(none yet)")
+        )
+        return _COMMON_PROMPT.format(
+            agent=session.agent_name,
+            history=history,
+            turn_number=observation.canonical.turn_number,
+            action_list=json.dumps(observation.canonical.available_actions),
         ).strip()
 
     @staticmethod

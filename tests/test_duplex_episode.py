@@ -134,14 +134,14 @@ async def test_http_episode_limits_and_audible_history(
         values = kwargs["input_values"]
         if "available_actions" in values:
             obs = json.loads(values["observation"])
-            histories.append(values["recent_history"])
+            histories.append(values["common_prompt"])
             if obs["source"] == "asr_partial":
                 if intervention != "none" and not intervened:
                     intervened = True
                     return json.dumps({"action_type": intervention})
                 return '{"action_type":"none"}'
             count += 1
-            # Exercise both natural termination and a hard cutoff during closing.
+            # The first voluntary leave ends the interaction without an extra reply.
             return json.dumps({"action_type": "speak" if count <= 2 else "leave"})
         return '{"text":"Generated speech that is private until heard."}'
 
@@ -174,7 +174,16 @@ async def test_http_episode_limits_and_audible_history(
     assert [event.turn_number for event in commits] == list(range(1, len(commits) + 1))
     assert events[-1].status == "completed"
     assert len([event for event in events if isinstance(event, EpisodeEnded)]) == 1
-    assert result["end_reason"] == "explicit_leave_handshake"
+    assert result["end_reason"] == "agent_left"
+    assert (
+        sum(
+            action.action_type == "leave"
+            for event in commits
+            for action in event.actions.values()
+        )
+        == 1
+    )
+    assert any(action.action_type == "leave" for action in commits[-1].actions.values())
     saved = json.loads((tmp_path / result["original"]).read_text())
     assert len(saved["models"]) == 3
     from sotopia.database import EpisodeLog
@@ -242,18 +251,31 @@ async def test_http_episode_limits_and_audible_history(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("last_action", ["speak", "leave"])
 async def test_exactly_twelve_commits_with_continuing_agents(
-    profiles, tmp_path, monkeypatch
+    profiles, tmp_path, monkeypatch, last_action
 ):
+    decisions = 0
+
     async def generate(**kwargs):
+        nonlocal decisions
         values = kwargs["input_values"]
         if "available_actions" in values:
             obs = json.loads(values["observation"])
+            if obs["source"] == "asr_partial":
+                return json.dumps({"action_type": "none"})
+            decisions += 1
             return json.dumps(
-                {"action_type": "none" if obs["source"] == "asr_partial" else "speak"}
+                {"action_type": last_action if decisions == 12 else "speak"}
             )
         return '{"text":"We can meet tomorrow morning."}'
 
+    from talktopia.full_duplex.speech_client import SpeechClient
+
+    async def short_speech(self, text, reference, seed):
+        return (1000).to_bytes(2, "little") * 4800
+
+    monkeypatch.setattr(SpeechClient, "synthesize", short_speech)
     monkeypatch.setattr(generation, "agenerate", generate)
     monkeypatch.setattr(
         episode_module,
@@ -269,7 +291,11 @@ async def test_exactly_twelve_commits_with_continuing_agents(
             resolved, agents, args, tmp_path, "episode_0001"
         )
     assert result["turns"] == 12
-    assert result["end_reason"] == "max_turns"
+    assert result["budget_turns"] == 12
+    assert result["end_reason"] == (
+        "agent_left" if last_action == "leave" else "max_turns"
+    )
+    assert decisions == 12
     assert (
         len(
             [
@@ -283,7 +309,7 @@ async def test_exactly_twelve_commits_with_continuing_agents(
 
 
 @pytest.mark.asyncio
-async def test_word_limit_retries_whole_utterance_and_closing(monkeypatch):
+async def test_word_limit_retries_whole_utterance(monkeypatch):
     context = AgentSessionContext(
         episode_id="episode",
         agent_name="Alice",
@@ -312,9 +338,8 @@ async def test_word_limit_retries_whole_utterance_and_closing(monkeypatch):
     monkeypatch.setattr(generation, "agenerate", generate)
     engine = DuplexGenerationEngine("fake", max_attempts=2)
     hidden = await engine.generate_hidden_said(context, observation, decision, "")
-    closing = await engine.generate_closing(context, "", "closing-decision")
-    assert hidden.text == closing.text == forty
-    assert len(calls) == 4
+    assert hidden.text == forty
+    assert len(calls) == 2
     assert all(call["input_values"]["max_words"] == "40" for call in calls)
     with pytest.raises(ValidationError, match="at most 50"):
         HiddenSaid(

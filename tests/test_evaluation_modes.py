@@ -71,6 +71,13 @@ async def test_round_robin_preserves_the_original_scoring_prompt_and_settings(
         assert summary["interaction_mode"] == mode and summary["status"] == "completed"
         evaluated = json.loads((out / summary["original"]).read_text())
         assert evaluated["messages"] == json.loads(source.model_dump_json())["messages"]
+        _, source_turns = source.render_for_humans()
+        assert calls[-1]["history"] == (
+            "\n".join(source_turns[:-2])
+            + "\n\n"
+            + evaluator.EVALUATION_EVIDENCE_INSTRUCTION
+            + "\nAgent mapping: agent_1 is Alice Test; agent_2 is Bob Test."
+        )
     assert len(calls) == 1
     assert "Timing evidence" not in calls[0]["history"]
     assert "[00:" not in calls[0]["history"]

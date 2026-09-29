@@ -20,6 +20,12 @@ Backchannels and `none` do not consume the action budget. Shutdown drains the
 in-flight audio frame before closing the capture; it does not start another frame.
 No change to the canonical 450-combination population is made by these controls.
 
+The first selected `leave` ends a Surface5 episode with reason `agent_left`,
+including when it is the twelfth counted action. No closing sentence or second
+leave is generated. Shutdown preserves delivered PCM and final ASR evidence,
+cancels pending generation, and does not commit further actions. The frozen
+runtime settings record `termination_policy: first_leave`.
+
 ## Clock and audio
 
 Surface5 v2 events use milliseconds measured from a shared monotonic clock. Model
@@ -50,18 +56,25 @@ counts and arithmetic means for:
   waits are included. The decision/observation/peer utterance identifiers are
   recorded in `response_latency` events.
 
-The opener, the leave-handshake closing, and decisions with no delivered audio
+The opener and decisions with no delivered audio
 are excluded from these averages. An empty group has `count: 0` and `mean_ms: null`.
 Episode results contain the same statistics. `03_simulation.json` aggregates
 completed episodes using measurement counts, rather than averaging episode means.
 
 ## Prompts and evaluation
 
-The runtime loads the five sections of
-`talktopia/full_duplex/prompts/simulation_v2.1.txt` directly. This is the appendix
-version, rather than a copy of a separate inline prompt. Prompts request at most
-40 words; the existing 50-word validation limit and JSON handling remain intact.
-DeepSeek answer-only generation is unchanged.
+The runtime loads `talktopia/full_duplex/prompts/simulation_FDB_v3.txt` directly.
+Its common section preserves the body of `sotopia_action_v1.txt` verbatim,
+including the participant's freedom to leave. Separate sections select the
+action and generate its spoken or non-audio argument. Additions explain partial
+ASR, backchannel meaning and availability, and the separate output formats.
+There are no extra instructions to make an opening contribution, end a resolved
+conversation, or avoid repeated agreement and thanks.
+
+The two prior prompts are archived as `simulation_FDB_v1.txt` and
+`simulation_FDB_v2.txt` with their contents unchanged; only v3 is loaded for new
+simulations. Prompts request at most 40 words; the existing 50-word validation
+limit, JSON handling and DeepSeek answer-only generation remain intact.
 
 For Surface5 evaluation, each delivered sentence chunk has its own ASR result.
 The evaluator verifies event identity, frame positions and PCM hashes against the
@@ -69,7 +82,10 @@ recording, requires silence outside delivered frames, and checks that
 whole-utterance ASR commits match the saved EpisodeLog. Batch evaluation freezes
 the entire WAV hash before starting.
 It then adds utterance and sentence start/end times to the evaluation history,
-with `evaluation/prompts/temporal_v1.txt` as the timing instructions. Sentence ASR
+using the complete `evaluation/prompts/evaluation_FDB_v1.txt` template. It
+preserves the wording and order of `evaluation_v1.txt` and adds only a speech
+timing section. The seven score dimensions, ranges, validation, retries and
+evaluation temperature are unchanged. Sentence ASR
 can differ from whole-utterance ASR; both represent the same action, and generated
 text is never substituted for received speech. The saved EpisodeLog is unchanged.
 The committed whole-utterance ASR determines what the listener heard. Differences
