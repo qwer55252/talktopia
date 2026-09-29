@@ -16,11 +16,12 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    ValidationError,
     ValidationInfo,
     create_model,
     model_validator,
 )
-from sotopia.generation_utils import PydanticOutputParser, agenerate
+from sotopia.generation_utils import PydanticOutputParser
 from sotopia.generation_utils import generate as sotopia_generation
 from sotopia.messages import AgentAction
 
@@ -36,6 +37,7 @@ from .actions import (
     _validate_generated_text,
 )
 from .config import SIMULATION_PROMPT_VERSION
+from .requests import generate_structured_action
 
 # Keep the requested length independent from the validation safety margin.
 PROMPT_MAX_WORDS = 40
@@ -43,6 +45,11 @@ _EMPTY_ARGUMENT_ACTIONS = frozenset({"none", "leave", "backchanneling"})
 _SPOKEN_ACTIONS = frozenset({"speak", "hesitation", "correction", "interruption"})
 _SPEECH_MARKUP_CHARACTERS = frozenset("*()[]{}")
 _COMPACT_DOLLAR_AMOUNT = re.compile(r"\$\s*\d[\d,]*(?:\.\d+)?\s*[kKmMbB]\b")
+_REPAIR_TOKEN = re.compile(r"[+-]?\$?[+-]?\d+(?:[,.]\d+)*%?|[^\W\d_]+(?:'[^\W\d_]+)*")
+_MARKED_SPAN = re.compile(
+    r"\*\*([^*()\[\]{}]+)\*\*|\*([^*()\[\]{}]+)\*"
+    r"|\(([^*()\[\]{}]+)\)|\[([^*()\[\]{}]+)\]|\{([^*()\[\]{}]+)\}"
+)
 
 _SENTENCE_BOUNDARY = re.compile(
     r"(?P<terminal>[.!?。！？]+)(?P<closers>[\"”’')\]]*)(?P<space>\s+)"
@@ -106,6 +113,57 @@ class GeneratedAction:
     fallback: bool = False
 
 
+class _SpeechMarkupError(ValueError):
+    def __init__(self, action: _JointAction) -> None:
+        self.action = action
+        super().__init__(
+            "speech argument must not contain asterisks or brackets: *()[]{}. "
+            "For spoken actions, remove stage directions rather than just their "
+            "markers. Preserve dialogue words marked only for emphasis."
+        )
+
+
+def _repair_tokens(text: str) -> list[str]:
+    return _REPAIR_TOKEN.findall(text.lower().replace("’", "'").replace("−", "-"))
+
+
+def _validate_markup_repair(original: str, repaired: str) -> None:
+    """Reject invented/reordered words and deletion outside balanced markup.
+
+    Marked words may be retained or omitted. This lexical check cannot decide
+    whether those words are a stage direction, emphasis, or a meaningful aside.
+    It only validates the model's output; it never edits text sent to TTS.
+    """
+    source: list[tuple[str, bool]] = []
+    end = 0
+    for span in _MARKED_SPAN.finditer(original):
+        outside = original[end : span.start()]
+        if _SPEECH_MARKUP_CHARACTERS.intersection(outside):
+            raise ValueError("cannot safely compare nested or unbalanced speech markup")
+        source.extend((token, True) for token in _repair_tokens(outside))
+        inside = next(group for group in span.groups() if group is not None)
+        source.extend((token, False) for token in _repair_tokens(inside))
+        end = span.end()
+    outside = original[end:]
+    if _SPEECH_MARKUP_CHARACTERS.intersection(outside):
+        raise ValueError("cannot safely compare nested or unbalanced speech markup")
+    source.extend((token, True) for token in _repair_tokens(outside))
+
+    candidate = _repair_tokens(repaired)
+    # Track possible alignments so repeated words cannot hide a deleted required
+    # word. Only tokens from marked spans may be skipped.
+    positions = {0}
+    for token, required in source:
+        matched = {
+            index + 1
+            for index in positions
+            if index < len(candidate) and candidate[index] == token
+        }
+        positions = matched if required else positions | matched
+    if len(candidate) not in positions:
+        raise ValueError("markup repair changed words outside the marked spans")
+
+
 class _JointAction(AgentAction):
     """Keep SOTOPIA's wire format, adding only Surface5 action literals."""
 
@@ -152,10 +210,7 @@ class _JointAction(AgentAction):
                 # A marked span could be emphasis or a stage direction. Do not
                 # guess and silently remove words from the participant's speech.
                 if _SPEECH_MARKUP_CHARACTERS.intersection(self.argument):
-                    raise ValueError(
-                        "speech argument must not contain asterisks or brackets: "
-                        "*()[]{}"
-                    )
+                    raise _SpeechMarkupError(self)
                 if not prepare_tts_text(self.argument):
                     raise ValueError("speech argument must contain audible words")
         if (
@@ -223,6 +278,7 @@ class Surface5ActionOutputParser(PydanticOutputParser[_JointAction]):
 
     _attempts: int = PrivateAttr(default=0)
     _errors: list[str] = PrivateAttr(default_factory=list)
+    _marked_action: _JointAction | None = PrivateAttr(default=None)
 
     @property
     def attempts(self) -> int:
@@ -233,16 +289,26 @@ class Surface5ActionOutputParser(PydanticOutputParser[_JointAction]):
         return tuple(self._errors)
 
     def get_format_instructions(self) -> str:
-        instructions = super().get_format_instructions()
-        if self._errors:
-            # SOTOPIA calls this again for its existing single repair. Content
-            # validation can fail even when the original JSON syntax is valid.
-            instructions += (
-                "\nThe previous action failed validation:\n"
-                + self._errors[-1][:800]
-                + "\nReturn an action that satisfies the reported validation rule."
-            )
-        return instructions
+        if not self._errors:
+            return super().get_format_instructions()
+        # Native response_format still carries the identical schema. Repeating
+        # it here obscures the content error in the one allowed repair request.
+        return (
+            "The original JSON may already be valid. Repair the invalid action "
+            "content, not just JSON syntax. For spoken actions, output only the "
+            "words said to the listener. Omit descriptions of physical actions; "
+            "preserve all actual dialogue words, action type, and recipients "
+            "unless they violate the reported rule.\n"
+            "Stage directions describe movements, facial expressions, posture, "
+            "or tone; they are not words said to the listener. This remains true "
+            "when directions use bold/double asterisks, single asterisks, or "
+            "brackets. Remove the direction itself. Preserve every word of the "
+            "actual dialogue verbatim, including emphasized words, and do not "
+            "paraphrase, add words, or quote the dialogue.\n"
+            "The previous action failed validation:\n"
+            + self._errors[-1][:800]
+            + "\nReturn an action that satisfies the reported validation rule."
+        )
 
     def parse(self, result: str, context: dict[str, Any] | None = None) -> _JointAction:
         self._attempts += 1
@@ -255,12 +321,32 @@ class Surface5ActionOutputParser(PydanticOutputParser[_JointAction]):
             validated = _JointAction.model_validate(
                 {**action.model_dump(), "to": recipients}, context=context
             )
+            if self._marked_action is not None:
+                original = self._marked_action
+                if validated.action_type != original.action_type:
+                    raise ValueError("markup repair changed a valid action type")
+                original_to = resolve_recipient_names(
+                    original.to, context.get("agent_names", [])
+                )
+                allowed = set(context.get("agent_names", [])) - {context.get("sender")}
+                original_to_valid = len(original_to) == len(set(original_to)) and (
+                    not context.get("agent_names") or set(original_to) <= allowed
+                )
+                if original_to_valid and set(recipients) != set(original_to):
+                    raise ValueError("markup repair changed valid recipients")
+                _validate_markup_repair(original.argument, validated.argument)
             if recipients != action.to:
                 sotopia_generation.log.info(
                     f"Resolved action recipients: {action.to} -> {recipients}"
                 )
             return validated
         except Exception as error:
+            if self._attempts == 1 and isinstance(error, ValidationError):
+                for detail in error.errors():
+                    cause = detail.get("ctx", {}).get("error")
+                    if isinstance(cause, _SpeechMarkupError):
+                        self._marked_action = cause.action
+                        break
             self._errors.append(f"{type(error).__name__}: {error}")
             raise
 
@@ -309,7 +395,7 @@ class DuplexGenerationEngine:
         fallback = False
         errors: tuple[str, ...]
         try:
-            action = await agenerate(
+            action = await generate_structured_action(
                 model_name=self.model_name,
                 template=_ACTION_PROMPT,
                 input_values={
@@ -321,7 +407,6 @@ class DuplexGenerationEngine:
                 },
                 output_parser=parser,
                 temperature=temperature,
-                structured_output=True,
                 context=context,
             )
             if not isinstance(action, _JointAction):

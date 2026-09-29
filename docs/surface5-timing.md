@@ -127,12 +127,23 @@ unsupported request shapes retain their previous routes. This transport fix also
 applies to round-robin Qwen requests using this proxy; historical frozen runs are
 unchanged, but newly generated outputs may differ.
 
-Generation uses SOTOPIA's structured-output parser and JSON repair, recipient
+Generation uses SOTOPIA's structured-output parser and relaxed JSON parsing, recipient
 name resolution, configured action temperature (1.0 in the pipeline), and the
 configured bad-output processing model. A failed parse can issue one repair
-request. The parser includes its last validation error in that repair instruction,
-so valid JSON with invalid action content can be corrected. The first request
+request. A local request adapter preserves the first SOTOPIA HTTP payload and
+uses a content-correction instruction for the one repair: valid JSON can still
+contain invalid speech. The parser includes its last validation error and asks
+the repair model to omit physical stage directions while preserving dialogue.
+The repair uses the same configured model and default sampling as before; no
+shared engine code is modified. The first request
 contains no previous-error feedback, and its JSON schema is unchanged for repair.
+When the first parse fails specifically on speech markup, a lexical check rejects
+new or reordered words and deletion of words outside balanced marked spans. It
+also preserves the originally valid action type and recipients. Nested or
+unbalanced markup fails this check. It never removes or replaces speech itself.
+Words inside marked spans can be retained or omitted, so this check cannot
+guarantee that emphasis or an aside is preserved, or that all stage narration is
+removed. Recorded conversations still require inspection for those model errors.
 Final failure produces `none` and an error audit, not another Surface5
 regeneration loop. Decision events and committed passes distinguish this fallback
 with `generation_fallback`. Cancellation still propagates. All inference and

@@ -1,4 +1,4 @@
-"""Surface5 keeps the actual SOTOPIA request, JSON repair, and fallback path."""
+"""Surface5 preserves the first SOTOPIA request and bounds content repair."""
 
 from __future__ import annotations
 
@@ -349,8 +349,9 @@ async def test_partial_schema_matches_mask_in_initial_and_repair_requests(monkey
         schema = call["response_format"]["json_schema"]["schema"]
         assert schema["properties"]["action_type"]["enum"] == ["none", "backchanneling"]
         assert schema["properties"]["argument"]["const"] == ""
-        prompt = call["messages"][0]["content"]
-        assert '"enum": ["none", "backchanneling"]' in prompt
+    prompt = calls[0]["messages"][0]["content"]
+    assert '"enum": ["none", "backchanneling"]' in prompt
+    assert "failed content validation" in calls[1]["messages"][0]["content"]
 
 
 @pytest.mark.parametrize(
@@ -511,7 +512,6 @@ async def test_non_audio_descriptions_keep_markup(monkeypatch, action_type):
 @pytest.mark.parametrize(
     "original, repaired",
     [
-        ("*nods*", "Hello."),
         ("I *need* to keep the *other* grand.", "I need to keep the other grand."),
         ("**smiles** We can meet tomorrow.", "We can meet tomorrow."),
         ("I can meet (tomorrow).", "I can meet tomorrow."),
@@ -559,6 +559,103 @@ async def test_persistent_starred_speech_falls_back_before_synthesis(monkeypatch
     )
     assert generated.fallback and generated.decision.action_type == "none"
     assert generated.argument == "" and len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "original, repaired",
+    [
+        ("*nods*", "Hello."),
+        ("*raises an eyebrow* Could we talk privately?", "You mentioned it yesterday."),
+        ("*nods* Ava, I can help.", "I can help."),
+        ("*nods* I cannot help.", "I can help."),
+        ("*nods* I can't help.", "I can help."),
+        ("*nods* The balance is -50.", "The balance is 50."),
+        ("*nods* The balance is $50.", "The balance is 50."),
+        ("*nods* The balance is 5%.", "The balance is 5."),
+        ("I *need* the other grand.", "I need the other half."),
+        ("*nods* I can help. I can wait.", "I can wait. I can help."),
+        ("*I can help* I can help.", "I can."),
+        ("*nods Hello.", "Hello."),
+        ("(nods [quietly]) Hello.", "Hello."),
+        ("**nods*** Hello.", "Hello."),
+        ("[] Hello.", "Hello."),
+    ],
+)
+async def test_markup_repair_rejects_new_words_and_ambiguous_spans(
+    monkeypatch, original, repaired
+):
+    calls = mock_completions(
+        monkeypatch,
+        [
+            {"action_type": "speak", "argument": original, "to": []},
+            {"action_type": "speak", "argument": repaired, "to": []},
+        ],
+    )
+    generated = await DuplexGenerationEngine(MODEL).generate_action(
+        make_context(), make_observation(["speak"]), ""
+    )
+    assert generated.fallback and generated.decision.action_type == "none"
+    assert generated.argument == "" and len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "original, repaired",
+    [
+        ("[nods] I can’t help.", "I can't help!"),
+        ("**nods** We can meet tomorrow.", "we can meet tomorrow"),
+        ("*I can help* I can help.", "I can help."),
+        ("*nods* Your smiles make me happy.", "Your smiles make me happy."),
+    ],
+)
+async def test_markup_repair_keeps_lexical_content_and_common_punctuation(
+    monkeypatch, original, repaired
+):
+    mock_completions(
+        monkeypatch,
+        [
+            {"action_type": "speak", "argument": original, "to": ["Bob"]},
+            {"action_type": "speak", "argument": repaired, "to": ["Bob Two"]},
+        ],
+    )
+    generated = await DuplexGenerationEngine(MODEL).generate_action(
+        make_context(), make_observation(["speak"]), ""
+    )
+    assert not generated.fallback and generated.argument == repaired
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "original_to, repaired_type, repaired_to, fallback",
+    [
+        (["Bob"], "speak", [], True),
+        ([], "speak", ["Bob"], True),
+        ([], "hesitation", [], True),
+        ([], "none", [], True),
+        (["Stranger"], "speak", ["Bob"], False),
+        (["Alice"], "speak", ["Bob"], False),
+        (["Bob", "Bob Two"], "speak", ["Bob"], False),
+    ],
+)
+async def test_markup_repair_preserves_valid_action_and_recipients(
+    monkeypatch, original_to, repaired_type, repaired_to, fallback
+):
+    mock_completions(
+        monkeypatch,
+        [
+            {"action_type": "speak", "argument": "*nods* Hello.", "to": original_to},
+            {
+                "action_type": repaired_type,
+                "argument": "" if repaired_type == "none" else "Hello.",
+                "to": repaired_to,
+            },
+        ],
+    )
+    generated = await DuplexGenerationEngine(MODEL).generate_action(
+        make_context(), make_observation(["speak", "hesitation", "none"]), ""
+    )
+    assert generated.fallback is fallback
 
 
 @pytest.mark.asyncio

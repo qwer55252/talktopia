@@ -84,7 +84,7 @@ async def run_timed_episode(profiles, tmp_path, monkeypatch, *, late_backchannel
             else "Received words about the proposed meeting time."
         )
 
-    monkeypatch.setattr(generation, "agenerate", generate)
+    monkeypatch.setattr(generation, "generate_structured_action", generate)
     monkeypatch.setattr(SpeechClient, "synthesize", synthesize)
     monkeypatch.setattr(SpeechClient, "decode", decode)
     args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
@@ -379,7 +379,7 @@ async def test_active_audio_failure_keeps_capture_and_stops_tasks(
         await asyncio.Event().wait()
 
     monkeypatch.setattr(CascadedDuplexAgent, "receive_audio", receive)
-    monkeypatch.setattr(generation, "agenerate", generate)
+    monkeypatch.setattr(generation, "generate_structured_action", generate)
     monkeypatch.setattr(SpeechClient, "synthesize", synthesize)
     monkeypatch.setattr(SpeechClient, "decode", decode)
     if failure == "timeout":

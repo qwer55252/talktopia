@@ -108,7 +108,7 @@ async def test_first_leave_stops_active_work_without_a_closing_reply(
             draining.set()
         await original_stop_audio(self, **kwargs)
 
-    monkeypatch.setattr(generation, "agenerate", generate)
+    monkeypatch.setattr(generation, "generate_structured_action", generate)
     monkeypatch.setattr(SpeechClient, "synthesize", synthesize)
     monkeypatch.setattr(SpeechClient, "decode", decode)
     monkeypatch.setattr(CascadedDuplexAgent, "receive_audio", receive)

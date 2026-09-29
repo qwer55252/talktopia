@@ -131,7 +131,7 @@ async def test_accepted_speech_preserves_generated_synthesized_and_live_pcm(
         decisions += 1
         return joint_result(kwargs, "speak" if decisions == 1 else "leave", original)
 
-    monkeypatch.setattr(generation, "agenerate", generate)
+    monkeypatch.setattr(generation, "generate_structured_action", generate)
     args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
     args.tag = "accepted-speech"
     speech = FakeSpeech()
@@ -192,7 +192,7 @@ async def test_http_episode_limits_and_audible_history(
         count += 1
         return joint_result(kwargs, "speak" if count <= 2 else "leave")
 
-    monkeypatch.setattr(generation, "agenerate", fake_generation)
+    monkeypatch.setattr(generation, "generate_structured_action", fake_generation)
     monkeypatch.setattr(
         episode_module,
         "RuntimeConfig",
@@ -324,7 +324,7 @@ async def test_exactly_twelve_commits_with_continuing_agents(
         return (1000).to_bytes(2, "little") * 4800
 
     monkeypatch.setattr(SpeechClient, "synthesize", short_speech)
-    monkeypatch.setattr(generation, "agenerate", generate)
+    monkeypatch.setattr(generation, "generate_structured_action", generate)
     monkeypatch.setattr(
         episode_module,
         "RuntimeConfig",
@@ -401,7 +401,7 @@ async def test_failed_episode_has_one_terminal_event_and_stops_tasks(
         waiting.set()
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(generation, "agenerate", generate)
+    monkeypatch.setattr(generation, "generate_structured_action", generate)
     args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
     args.tag = "test-duplex"
     if failure == "timeout":
