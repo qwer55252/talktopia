@@ -23,6 +23,7 @@ def test_simulation_preserves_sotopia_body_and_round_robin_guidance():
         "simulation_FDB_v2.txt",
         "simulation_FDB_v3.txt",
         "simulation_FDB_v4.txt",
+        "simulation_FDB_v5.txt",
     }
     assert (
         runtime_settings()["simulation_prompt"] == generation.SIMULATION_PROMPT_VERSION

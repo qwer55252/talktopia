@@ -114,7 +114,7 @@ def joint_result(kwargs, action, text="Generated speech that is private until he
 
 
 @pytest.mark.asyncio
-async def test_stage_direction_filter_preserves_generated_synthesized_and_live_pcm(
+async def test_accepted_speech_preserves_generated_synthesized_and_live_pcm(
     profiles, tmp_path, monkeypatch
 ):
     from sotopia.database import EpisodeLog
@@ -122,7 +122,7 @@ async def test_stage_direction_filter_preserves_generated_synthesized_and_live_p
     from talktopia.full_duplex.transcript import TranscriptBuilder
 
     decisions = 0
-    original = "*nods* We can meet at ten."
+    original = "I need the other grand."
 
     async def generate(**kwargs):
         nonlocal decisions
@@ -133,7 +133,7 @@ async def test_stage_direction_filter_preserves_generated_synthesized_and_live_p
 
     monkeypatch.setattr(generation, "agenerate", generate)
     args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
-    args.tag = "stage-directions"
+    args.tag = "accepted-speech"
     speech = FakeSpeech()
     async with speech.client() as client:
         resolved, agents = pipeline.build_episode(profiles, args, client, client)
@@ -142,7 +142,7 @@ async def test_stage_direction_filter_preserves_generated_synthesized_and_live_p
             10,
         )
     assert result["status"] == "completed"
-    assert speech.tts_inputs == ["We can meet at ten."]
+    assert speech.tts_inputs == [original]
     events = read_events(tmp_path / result["events"])
     spoken = [
         e

@@ -83,7 +83,7 @@ completed episodes using measurement counts, rather than averaging episode means
 
 ## Prompts and evaluation
 
-The runtime loads `talktopia/full_duplex/prompts/simulation_FDB_v4.txt` directly.
+The runtime loads `talktopia/full_duplex/prompts/simulation_FDB_v5.txt` directly.
 It preserves the body of `sotopia_action_v1.txt`, including the participant's
 freedom to leave, and adds the same 40-word and recipient instructions as the
 round-robin speech prompt plus the partial-ASR and backchannel instructions.
@@ -98,10 +98,21 @@ possible repair use that same schema. When all available actions require an empt
 argument, the schema constrains `argument` to the empty string as well. Runtime
 validation still checks the current floor before synthesis and delivery.
 The prompt distinguishes words spoken aloud from nonverbal action descriptions.
-As in round-robin, starred spans are removed only from TTS input; this also removes
-starred emphasis. `HiddenSaid` preserves the original generated text, while each
-sentence chunk records the prepared synthesis input. A spoken action with no
-audible text after this preparation uses the existing repair/fallback path.
+Spoken arguments containing asterisks use the existing repair/fallback path.
+The runtime does not guess whether a starred span is emphasis or a stage direction
+and then delete it. The argument schema repeats the spoken-text rule for repair
+requests. `HiddenSaid` preserves the accepted generated text, while each sentence
+chunk records the actual synthesis input. Nonverbal action descriptions remain
+non-audio actions. No narration-removal heuristic is applied.
+
+For Qwen3.5:9b structured requests with reasoning disabled, the Ollama proxy uses
+the native raw generation endpoint with the verified Qwen chat template and an
+empty thinking prefix. This avoids a locally reproduced Ollama 0.31.1 issue where
+chat requests ignored the supplied JSON schema. The single model call, messages,
+schema, token limit, and OpenAI sampling options are preserved. Other models and
+unsupported request shapes retain their previous routes. This transport fix also
+applies to round-robin Qwen requests using this proxy; historical frozen runs are
+unchanged, but newly generated outputs may differ.
 
 Generation uses SOTOPIA's structured-output parser and JSON repair, recipient
 name resolution, configured action temperature (1.0 in the pipeline), and the

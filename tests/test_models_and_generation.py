@@ -393,46 +393,95 @@ async def test_concurrent_masks_do_not_change_each_others_schema(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action_type", ["speak", "action", "non-verbal communication"])
-async def test_stage_directions_keep_original_text_and_only_filter_speech(
-    monkeypatch, action_type
-):
+@pytest.mark.parametrize("action_type", ["action", "non-verbal communication"])
+async def test_non_audio_descriptions_keep_asterisks(monkeypatch, action_type):
     text = "*nods* Hello. **smiles** We can meet tomorrow."
     calls = mock_completions(
         monkeypatch, [dict(action_type=action_type, argument=text, to=[])]
     )
-    engine = DuplexGenerationEngine(MODEL)
-    generated = await engine.generate_action(
+    generated = await DuplexGenerationEngine(MODEL).generate_action(
         make_context(), make_observation([action_type]), ""
     )
     assert not generated.fallback and generated.argument == text
-    if action_type == "speak":
-        hidden = engine.make_hidden_said(make_context(), generated)
-        assert hidden.text == text
-        assert [c.text for c in engine.split_into_sentence_chunks(hidden)] == [
-            "Hello.",
-            "We can meet tomorrow.",
-        ]
-    else:
-        assert generated.decision.non_audio_argument == text
+    assert generated.decision.non_audio_argument == text
     assert len(calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_stage_direction_only_speech_uses_existing_repair(monkeypatch):
+@pytest.mark.parametrize(
+    "original, repaired",
+    [
+        ("*nods*", "Hello."),
+        ("I *need* to keep the *other* grand.", "I need to keep the other grand."),
+        ("**smiles** We can meet tomorrow.", "We can meet tomorrow."),
+    ],
+)
+@pytest.mark.parametrize(
+    "action_type", ["speak", "hesitation", "correction", "interruption"]
+)
+async def test_starred_speech_uses_existing_repair_without_deleting_words(
+    monkeypatch, original, repaired, action_type
+):
     calls = mock_completions(
         monkeypatch,
         [
-            dict(action_type="speak", argument="*nods*", to=[]),
-            dict(action_type="speak", argument="Hello.", to=[]),
+            dict(action_type=action_type, argument=original, to=[]),
+            dict(action_type=action_type, argument=repaired, to=[]),
         ],
     )
     engine = DuplexGenerationEngine(MODEL)
     generated = await engine.generate_action(
+        make_context(), make_observation([action_type], peer_utterance_id="peer-1"), ""
+    )
+    assert not generated.fallback and generated.argument == repaired
+    assert len(calls) == 2
+    assert "asterisks" in engine.decision_audit(generated.decision.decision_id)[1][0]
+    hidden = engine.make_hidden_said(make_context(), generated)
+    assert hidden.text == repaired
+    assert (
+        " ".join(c.text for c in engine.split_into_sentence_chunks(hidden)) == repaired
+    )
+    for call in calls:
+        description = call["response_format"]["json_schema"]["schema"]["properties"][
+            "argument"
+        ]["description"]
+        assert "without asterisks" in description and "40 words" in description
+
+
+@pytest.mark.asyncio
+async def test_persistent_starred_speech_falls_back_before_synthesis(monkeypatch):
+    value = dict(action_type="speak", argument="I *need* that.", to=[])
+    calls = mock_completions(monkeypatch, [value, value])
+    generated = await DuplexGenerationEngine(MODEL).generate_action(
         make_context(), make_observation(["speak"]), ""
     )
-    assert not generated.fallback and generated.argument == "Hello."
+    assert generated.fallback and generated.decision.action_type == "none"
+    assert generated.argument == "" and len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("original", ["...", "—", "🙂"])
+@pytest.mark.parametrize("repair_succeeds", [True, False])
+async def test_inaudible_speech_uses_repair_or_none(
+    monkeypatch, original, repair_succeeds
+):
+    first = dict(action_type="speak", argument=original, to=[])
+    second = dict(
+        action_type="speak", argument="Hello." if repair_succeeds else original, to=[]
+    )
+    calls = mock_completions(monkeypatch, [first, second])
+    engine = DuplexGenerationEngine(MODEL)
+    generated = await engine.generate_action(
+        make_context(), make_observation(["speak"]), ""
+    )
     assert len(calls) == 2
     assert (
         "audible words" in engine.decision_audit(generated.decision.decision_id)[1][0]
     )
+    assert generated.fallback is not repair_succeeds
+    assert generated.decision.action_type == ("speak" if repair_succeeds else "none")
+    if repair_succeeds:
+        hidden = engine.make_hidden_said(make_context(), generated)
+        assert [chunk.text for chunk in engine.split_into_sentence_chunks(hidden)] == [
+            "Hello."
+        ]

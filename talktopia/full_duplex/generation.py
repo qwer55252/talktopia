@@ -12,6 +12,7 @@ from typing import Any, Literal
 import gin
 from pydantic import (
     ConfigDict,
+    Field,
     PrivateAttr,
     ValidationInfo,
     create_model,
@@ -104,6 +105,15 @@ class _JointAction(AgentAction):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
     action_type: DuplexActionType  # type: ignore[assignment]
+    argument: str = Field(
+        description=(
+            "For speak, hesitation, correction, or interruption: only the words "
+            "spoken aloud, without asterisks, stage directions, speaker labels, "
+            "or narration. For action or non-verbal communication: describe the "
+            "behavior. For none, leave, or backchanneling: an empty string. "
+            "Use at most 40 words for a non-empty argument."
+        )
+    )
 
     @model_validator(mode="after")
     def validate_surface5_contract(self, info: ValidationInfo) -> _JointAction:
@@ -122,6 +132,10 @@ class _JointAction(AgentAction):
                 "correction",
                 "interruption",
             }:
+                # A starred span could be emphasis or a stage direction. Do not
+                # guess and silently remove words from the participant's speech.
+                if "*" in self.argument:
+                    raise ValueError("speech argument must not contain asterisks")
                 if not prepare_tts_text(self.argument):
                     raise ValueError("speech argument must contain audible words")
         if (
@@ -330,8 +344,8 @@ class DuplexGenerationEngine:
         return hidden
 
     def split_into_sentence_chunks(self, hidden_said: HiddenSaid) -> list[SpeechChunk]:
-        # Match round-robin's TTS preparation, retaining the generated original
-        # in HiddenSaid and the actual synthesis input in each SpeechChunk.
+        # Spoken actions reject asterisks before reaching this preparation, so
+        # round-robin's star-span removal cannot silently discard spoken words.
         spoken_text = prepare_tts_text(hidden_said.text)
         sentences = self._spoken_sentences(spoken_text)
         if not sentences:
