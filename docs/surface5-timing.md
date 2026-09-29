@@ -126,6 +126,17 @@ regeneration loop. Decision events and committed passes distinguish this fallbac
 with `generation_fallback`. Cancellation still propagates. All inference and
 repair waits remain in measured latency and the live recording.
 
+The shared speech API uses `without_timestamps=True` when decoding Whisper text.
+In a recorded 3.63-second utterance, timestamp-token decoding reproducibly added
+unrelated repeated text; the same PCM and VAD preprocessing decoded correctly
+with only this option changed. This reduces that observed failure without
+guaranteeing error-free ASR. The ASR model, VAD, sampling, and full-utterance
+recognition policy remain unchanged. Round-robin and Surface5 both record the
+option under `experiment.asr_decoding`; speech protocol v4 and the health flag
+prevent reuse of an older server. All evaluation timestamps still come from
+measured audio delivery, not the ASR decoder. Historical recordings and
+transcripts are not rewritten.
+
 The agent history contains the initial SOTOPIA observation and every subsequent
 canonical observation, without an eight-entry limit. Both participants see the
 confirmed ASR text, including for their own earlier utterances. Private generated

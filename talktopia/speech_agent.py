@@ -24,6 +24,7 @@ from typing import Any, Sequence
 from talktopia.models.config import (
     ASR_REPO,
     ASR_REVISION,
+    ASR_WITHOUT_TIMESTAMPS,
     CONFIRMATION_TTS_TAG,
     CONFIRMATION_TTS_DURATION_S,
     CONFIRMATION_TARGET_RMS,
@@ -539,6 +540,9 @@ class SpeechBackend:
                 best_of=1,
                 condition_on_previous_text=False,
                 vad_filter=False,
+                # This API returns text. Dialogue timing comes from delivered
+                # PCM, not Whisper's generated timestamp tokens.
+                without_timestamps=ASR_WITHOUT_TIMESTAMPS,
             )
             return " ".join(segment.text.strip() for segment in segments).strip()
 
