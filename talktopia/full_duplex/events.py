@@ -65,6 +65,7 @@ class DecisionEvent(EventBase):
     attempt: int = Field(ge=1)
     validation_errors: tuple[str, ...] = ()
     request_started_ms: float | None = None
+    generation_fallback: bool = False
 
 
 class HiddenSaidCreated(EventBase):

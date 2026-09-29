@@ -197,7 +197,10 @@ def duplex_history(
         EpisodeStarted,
         read_events,
     )
-    from talktopia.full_duplex.rendering import render_sotopia_messages
+    from talktopia.full_duplex.rendering import (
+        render_episode_for_humans,
+        render_sotopia_messages,
+    )
     from talktopia.full_duplex.transcript import TranscriptBuilder
     from .temporal import timed_messages, validate_timing
 
@@ -212,7 +215,7 @@ def duplex_history(
     timed = source.model_copy(
         update={"messages": timed_messages(source, commits, entries, events)}
     )
-    return timed.render_for_humans()
+    return render_episode_for_humans(timed)
 
 
 async def evaluate_episode(

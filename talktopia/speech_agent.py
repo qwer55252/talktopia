@@ -24,6 +24,8 @@ from typing import Any, Sequence
 from talktopia.models.config import (
     ASR_REPO,
     ASR_REVISION,
+    CONFIRMATION_TTS_TAG,
+    CONFIRMATION_TTS_DURATION_S,
     TTS_REPO,
     TTS_REVISION,
     TTS_BATCH_SIZE,
@@ -423,6 +425,15 @@ class SpeechBackend:
                     ref_audio=str(voice["wav_path"]),
                     ref_text=voice["voice_reference_text"],
                 )
+        durations = [
+            CONFIRMATION_TTS_DURATION_S if item.text == CONFIRMATION_TTS_TAG else None
+            for item in requests
+        ]
+        duration_kwargs = {}
+        if any(duration is not None for duration in durations):
+            duration_kwargs["duration"] = (
+                durations[0] if requests[0].seed is not None else durations
+            )
         if requests[0].seed is not None:
             if len(requests) != 1:
                 raise ValueError("Seeded TTS requests must be synthesized individually")
@@ -433,12 +444,14 @@ class SpeechBackend:
                 text=item.text,
                 language="English",
                 voice_clone_prompt=self.prompts[item.voice_id],
+                **duration_kwargs,
             )
         else:
             audios = self.tts.generate(
                 text=[item.text for item in requests],
                 language="English",
                 voice_clone_prompt=[self.prompts[item.voice_id] for item in requests],
+                **duration_kwargs,
             )
         results = []
         for audio in audios:

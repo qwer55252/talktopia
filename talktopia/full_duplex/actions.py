@@ -76,7 +76,7 @@ class DuplexAction(AgentAction):
         if self.action_type in _EMPTY_ARGUMENT_ACTION_TYPES:
             if argument:
                 raise ValueError(f"{self.action_type} requires an empty argument")
-        elif not argument:
+        elif not argument and self.action_type != "backchanneling":
             raise ValueError(f"{self.action_type} requires a non-empty argument")
         if self.action_type in _NON_AUDIO_ARGUMENT_ACTION_TYPES:
             _validate_generated_text(self.argument, field_name="argument")
@@ -99,7 +99,11 @@ class DuplexAction(AgentAction):
             case "hesitation":
                 rendered = f"[hesitation] {self.argument}"
             case "backchanneling":
-                rendered = f'backchanneled: "{self.argument}"'
+                rendered = (
+                    f'backchanneled: "{self.argument}"'
+                    if self.argument.strip()
+                    else "made a nonverbal backchannel [no recognized words]"
+                )
             case "correction":
                 rendered = f'corrected: "{self.argument}"'
             case "interruption":
@@ -137,7 +141,7 @@ class StreamingObservation(BaseModel):
 
 
 class DuplexActionDecision(BaseModel):
-    """Structured first-stage decision without generated speech text."""
+    """Controller action associated with a joint model response."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 

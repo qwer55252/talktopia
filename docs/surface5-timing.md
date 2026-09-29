@@ -1,7 +1,7 @@
 # Surface5: measured speech timing and backchannel controls
 
 Run the implementation in `talktopia-dev`. The Surface5 default allows
-backchannels and disables correction and interruption:
+backchannels and disables hesitation, correction, and interruption:
 
 ```sh
 ./run_pipeline.sh --interaction-mode surface5-full-duplex
@@ -12,7 +12,7 @@ with `--no-duplex-backchannels`. Correction and interruption remain disabled.
 `--duplex-corrections` and `--duplex-interruptions` explicitly enable those actions
 for a separate condition. The flags are saved in `run_config.json` and the episode
 start event; resume uses the saved settings. A comparison with round-robin also
-changes turn handling, generation, and observations, so it does not isolate the
+changes turn handling, audio delivery, and observations, so it does not isolate the
 effect of backchannels.
 
 Both modes retain the common 12-action budget and 120-second episode deadline.
@@ -26,6 +26,16 @@ leave is generated. Shutdown preserves delivered PCM and final ASR evidence,
 cancels pending generation, and does not commit further actions. The frozen
 runtime settings record `termination_policy: first_leave`.
 
+The opening and subsequent idle opportunities include SOTOPIA's five base actions.
+An idle `none` commits a pass and gives the other participant an opportunity.
+SOTOPIA's rule evaluator ends the episode as `stale` after three consecutive
+actual passes (`max_stale_turn=2`). Peer placeholders and partial-ASR `none`
+observations are not passes. `ActionCommitted.metadata.actor` identifies the
+actual participant; new ordinary and timed histories retain that participant's
+pass. A first leave or all-pass conversation may contain no delivered audio and
+no latency samples. Existing evaluation rules exclude conversations with no
+interaction; generation does not force speech to make them evaluable.
+
 ## Clock and audio
 
 Surface5 v2 events use milliseconds measured from a shared monotonic clock. Model
@@ -35,13 +45,23 @@ live audio bus: agent 1 is the left channel, agent 2 is the right channel, with
 model-processing gaps, sentence gaps, and overlapping voices. It is written during
 the interaction, without rebuilding a conversation from utterance WAV files.
 
-The audio pump runs independently of decisions and final ASR. Each delivery
-records its measured start/end, its WAV sample offset, and the hash of the PCM
-accepted by the receiver. Sample offsets are quantized to the nearest audio sample;
-frame end times are observed after the paced transmission completes. Scheduling
-jitter remains in the recording. A short final frame uses its actual sample
-duration. Cancellation ASR also runs in the background. A backchannel that is ready only after its peer's
-speech has ended is discarded before its first frame.
+The audio pump runs independently of decisions and final ASR. Capture policy
+`live_pcm_sample_clock_v3` keeps the PCM stream continuous between callbacks and
+paces delivery with absolute deadlines. This prevents sub-frame scheduler delays
+from becoming repeated silence inside speech. Every frame retains its actual
+callback start/end, WAV sample offset, PCM hash, and measured stream anchor
+(`clock_anchor_ms`, `clock_anchor_sample`). Callback times and PCM sample positions
+are separate measurements; latency still uses the measured callback times.
+
+An empty queue records real silence and re-anchors the next delivery. A callback
+stall longer than one frame also records the gap and its `underrun_ms`. Within a
+continuous stream, callback lateness is bounded against the absolute sample
+cursor, not the previous callback, so it cannot accumulate across frames.
+Evaluation verifies this bound, uninterrupted stereo sample positions, underrun
+sizes, and PCM hashes. Existing `live_delivered_pcm_v2` artifacts retain their
+original strict position checks. A short final frame uses its actual sample
+duration. Cancellation ASR runs in the background. A backchannel ready only after
+its peer's speech has ended is discarded before its first frame.
 
 ## Latency
 
@@ -64,17 +84,47 @@ completed episodes using measurement counts, rather than averaging episode means
 ## Prompts and evaluation
 
 The runtime loads `talktopia/full_duplex/prompts/simulation_FDB_v3.txt` directly.
-Its common section preserves the body of `sotopia_action_v1.txt` verbatim,
-including the participant's freedom to leave. Separate sections select the
-action and generate its spoken or non-audio argument. Additions explain partial
-ASR, backchannel meaning and availability, and the separate output formats.
-There are no extra instructions to make an opening contribution, end a resolved
-conversation, or avoid repeated agreement and thanks.
+It preserves the body of `sotopia_action_v1.txt`, including the participant's
+freedom to leave, and adds the same 40-word and recipient instructions as the
+round-robin speech prompt plus the partial-ASR and backchannel instructions.
+One request generates `action_type`, `argument`, and `to` together. The runtime
+validates the current observation and floor before allowing TTS to start, and
+checks validity again before delivery. `HiddenSaid` records that same response's
+private speech text; it is not a second LLM request.
 
-The two prior prompts are archived as `simulation_FDB_v1.txt` and
-`simulation_FDB_v2.txt` with their contents unchanged; only v3 is loaded for new
-simulations. Prompts request at most 40 words; the existing 50-word validation
-limit, JSON handling and DeepSeek answer-only generation remain intact.
+Generation uses SOTOPIA's structured-output parser and JSON repair, recipient
+name resolution, configured action temperature (1.0 in the pipeline), and the
+configured bad-output processing model. A failed parse can issue one repair
+request; final failure produces `none` and an error audit, not another Surface5
+regeneration loop. Decision events and committed passes distinguish this fallback
+with `generation_fallback`. Cancellation still propagates. All inference and
+repair waits remain in measured latency and the live recording.
+
+The agent history contains the initial SOTOPIA observation and every subsequent
+canonical observation, without an eight-entry limit. Both participants see the
+confirmed ASR text, including for their own earlier utterances. Private generated
+speech is kept in artifacts, not substituted for ASR in that history. Only the
+current partial ASR observation is appended to the request. Backchannel responses
+have an empty model argument. After runtime validation, the exact OmniVoice tag
+`[confirmation-en]` produces a short nonverbal acknowledgment in the agent's
+voice. The tag is TTS input, not recognized speech. Backchannels with this tag use
+OmniVoice's [`duration=0.6` generation parameter](https://github.com/k2-fsa/OmniVoice/blob/main/docs/generation-parameters.md)
+uniformly across
+voices; the actual delivered duration is measured and may differ. Ordinary
+speech keeps its existing generation defaults. This adds no waveform cropping
+or amplitude adjustment. The input and duration are recorded in `backchannel_tts`.
+Delivered backchannels with empty ASR are retained as nonverbal actions with their measured interval and
+`[no recognized words]`; the raw ASR and transcript text remain empty. An empty
+TTS result produces no committed backchannel and no latency sample.
+
+The runtime settings identify `generation_mode: sotopia_single_call` and
+`history_policy: full_canonical_asr`. Code and prompt fingerprints prevent resuming
+an old run with these changes; use a new output directory and reuse its complete
+canonical manifest to repeat a scenario. Prior prompts `simulation_FDB_v1.txt`
+and `simulation_FDB_v2.txt` retain their contents. The 50-word validation limit and
+DeepSeek answer-only generation remain intact. The shared engine's existing JSON
+normalization, including removal of thinking tags and extraction of JSON from
+surrounding text, applies to all joint responses.
 
 For Surface5 evaluation, each delivered sentence chunk has its own ASR result.
 The evaluator verifies event identity, frame positions and PCM hashes against the

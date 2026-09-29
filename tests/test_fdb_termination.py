@@ -5,7 +5,7 @@ import json
 import wave
 
 import pytest
-from test_duplex_episode import FakeSpeech
+from test_duplex_episode import FakeSpeech, joint_result
 from test_duplex_episode import profiles as profiles  # noqa: PLC0414 -- fixture
 
 from talktopia import pipeline
@@ -50,13 +50,11 @@ async def test_first_leave_stops_active_work_without_a_closing_reply(
     async def generate(**kwargs):
         requests.append(kwargs)
         values = kwargs["input_values"]
-        if "available_actions" in values:
-            observation = json.loads(values["observation"])
-            assert observation["source"] != "peer_left"
-            if stage == "llm" and observation["source"] == "asr_partial":
-                await wait_for_cancellation()
-            return json.dumps({"action_type": "speak"})
-        return json.dumps({"text": "First sentence. Second sentence."})
+        observation = json.loads(values["observation"])
+        assert observation["source"] != "peer_left"
+        if stage == "llm" and observation["source"] == "asr_partial":
+            await wait_for_cancellation()
+        return joint_result(kwargs, "speak", "First sentence. Second sentence.")
 
     async def synthesize(self, text, reference, seed):
         nonlocal syntheses
@@ -161,7 +159,7 @@ async def test_first_leave_stops_active_work_without_a_closing_reply(
         )
     if stage in {"llm", "tts"}:
         assert model_cancelled.is_set()
-    assert len(requests) == (3 if stage == "llm" else 2)
+    assert len(requests) == (2 if stage == "llm" else 1)
     assert events[-1].status == {
         "asr_error": "failed",
         "drain_cancel": "cancelled",

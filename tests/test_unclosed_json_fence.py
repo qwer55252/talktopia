@@ -1,49 +1,77 @@
+"""Transport normalization uses the existing SOTOPIA parser without a fork."""
+
+import importlib
 import json
 
 import pytest
 
-from talktopia.full_duplex.generation import (
-    _parse_action_choice,
-    _parse_generated_text,
-    _parse_non_audio_argument,
-)
+from talktopia.full_duplex.generation import Surface5ActionOutputParser, _JointAction
+
+
+def parse(raw):
+    backend = importlib.import_module("sotopia.generation_utils.generate")
+    return Surface5ActionOutputParser(pydantic_object=_JointAction).parse(
+        backend._strip_thinking_tags(raw),
+        context={
+            "available_action_types": ["speak"],
+            "agent_names": ["Alice", "Bob"],
+            "sender": "Alice",
+        },
+    )
 
 
 @pytest.mark.parametrize("prefix", ["```json\n", "```\n", "```JSON\r\n"])
 @pytest.mark.parametrize("suffix", ["", "\n", "\n```"])
-def test_complete_json_with_optional_closing_fence(prefix, suffix):
-    raw = prefix + '{"text":"Let us try that."}' + suffix
-    assert _parse_generated_text(raw).text == "Let us try that."
-    assert _parse_non_audio_argument(raw).text == "Let us try that."
+def test_joint_action_with_optional_closing_fence(prefix, suffix):
+    raw = (
+        prefix
+        + '{"action_type":"speak","argument":"Let us try that.","to":[]}'
+        + suffix
+    )
+    assert parse(raw).argument == "Let us try that."
 
 
-def test_decision_after_thinking_with_unclosed_fence():
-    raw = '<think>Choose an action.</think>\n```json\n{"action_type":"speak"}'
-    assert _parse_action_choice(raw).action_type == "speak"
+def test_thinking_tags_and_unclosed_fence():
+    raw = '<think>Choose an action.</think>\n```json\n{"action_type":"speak","argument":"Yes.","to":[]}'
+    assert parse(raw).argument == "Yes."
+
+
+def test_common_json_repair_accepts_missing_brace_and_trailing_explanation():
+    assert parse('{"action_type":"speak","argument":"Yes.","to":[]').argument == "Yes."
+    assert (
+        parse('{"action_type":"speak","argument":"Yes.","to":[]}\nExplanation').argument
+        == "Yes."
+    )
 
 
 @pytest.mark.parametrize(
-    "body",
-    [
-        '{"text":"cut off"',
-        '{"text":"cut off',
-        '{"text":"valid"}\nextra text',
-    ],
+    "raw", ["plain speech", "```json", "```json\n", "```json\n```", '"bare speech"']
 )
-def test_missing_fence_does_not_repair_invalid_json(body):
-    for parse in (_parse_generated_text, _parse_non_audio_argument):
-        with pytest.raises(json.JSONDecodeError):
-            parse("```json\n" + body)
+def test_text_without_a_joint_action_cannot_bypass_contract(raw):
+    with pytest.raises((ValueError, AssertionError)):
+        parse(raw)
 
 
-@pytest.mark.parametrize("raw", ["```json", "```json\n", "```json\n```"])
-def test_empty_fenced_response_is_rejected(raw):
-    with pytest.raises(ValueError):
-        _parse_generated_text(raw)
-
-
-def test_backticks_inside_json_string_are_preserved():
+def test_quotes_braces_and_backticks_inside_argument_are_preserved():
+    argument = 'Use {one} and say "yes"; ``` is a marker.'
     assert (
-        _parse_generated_text('```json\n{"text":"Use ``` as a marker."}').text
-        == "Use ``` as a marker."
+        parse(
+            json.dumps({"action_type": "speak", "argument": argument, "to": []})
+        ).argument
+        == argument
     )
+
+
+def test_schema_properties_wrapper_still_checks_action_mask():
+    # The shared parser's legacy wrapper branch omits context internally.
+    raw = json.dumps(
+        {
+            "properties": {
+                "action_type": "action",
+                "argument": "opens the door",
+                "to": [],
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="unavailable action"):
+        parse(raw)

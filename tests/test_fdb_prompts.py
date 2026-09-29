@@ -8,17 +8,16 @@ from sotopia.generation_utils import PydanticOutputParser
 
 from talktopia.evaluation import evaluator
 from talktopia.full_duplex import generation
-from talktopia.full_duplex.actions import DuplexObservation, StreamingObservation
 from talktopia.full_duplex.config import runtime_settings
-from talktopia.full_duplex.generation import AgentSessionContext
 
 
-def test_simulation_common_body_is_the_original_sotopia_body():
+def test_simulation_preserves_sotopia_body_and_round_robin_guidance():
     directory = generation._PROMPT_PATH.parent
     original = (directory / "sotopia_action_v1.txt").read_text()
     body, output_instruction = original.split("\n\nPlease only generate", 1)
-    assert generation._COMMON_PROMPT == body
-    assert "action type and the argument" in output_instruction
+    prompt = generation._ACTION_PROMPT
+    assert prompt.startswith(body)
+    assert prompt.endswith("Please only generate" + output_instruction)
     assert {path.name for path in directory.glob("simulation_*.txt")} == {
         "simulation_FDB_v1.txt",
         "simulation_FDB_v2.txt",
@@ -28,42 +27,25 @@ def test_simulation_common_body_is_the_original_sotopia_body():
         runtime_settings()["simulation_prompt"] == generation.SIMULATION_PROMPT_VERSION
     )
     assert runtime_settings()["termination_policy"] == "first_leave"
-    assert "CLOSING" not in generation._PROMPTS
-
-    context = AgentSessionContext(
-        episode_id="test",
-        agent_name="Alice",
-        peer_name="Bob",
-        scenario="Meet tomorrow.",
-        self_background="A shopkeeper.",
-        private_goal="Agree on a time.",
+    assert "[DECISION]" not in prompt and "[HIDDEN_SAID]" not in prompt
+    assert (
+        'For a "speak" action, keep "argument" within 40 words; this is a maximum, not a target.'
+        in prompt
     )
-    observation = StreamingObservation(
-        canonical=DuplexObservation(
-            last_turn="Nine?",
-            turn_number=3,
-            available_actions=["speak", "leave"],
-            observation_id="obs",
-        ),
-        source="asr_final",
+    assert 'for "to", use [] for public actions' in prompt
+    assert (
+        'An "asr_partial" observation contains only the words recognized so far'
+        in prompt
     )
-    common = generation.DuplexGenerationEngine._common_prompt(
-        context, observation, "Bob said: Nine?"
-    )
-    assert "Here is the context of the interaction:" in common
-    assert "Your social goal: Agree on a time." in common
-    assert "Bob said: Nine?" in common and "Turn #3" in common
-    assert 'You can "leave"' in common and '"speak", "leave"' in common
-    for template in (
-        generation._DECISION_PROMPT,
-        generation._NON_AUDIO_ARGUMENT_PROMPT,
-        generation._HIDDEN_SAID_PROMPT,
+    assert 'set "argument" to "" for "backchanneling"' in prompt
+    assert prompt.count("{history}") == 1
+    for phrase in (
+        "make a concrete opening",
+        "Do not prolong",
+        "remains unresolved",
+        "settled point",
     ):
-        assert template.count("{common_prompt}") == 1
-        assert "make a concrete opening" not in template
-        assert "Do not prolong" not in template
-        assert "remains unresolved" not in template
-        assert "settled point" not in template
+        assert phrase not in prompt
 
 
 def test_fdb_evaluation_only_adds_timing_to_the_original_template():

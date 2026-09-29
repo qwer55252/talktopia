@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from sotopia.database import EpisodeLog, SotopiaDimensions
-from test_duplex_episode import FakeSpeech
+from test_duplex_episode import FakeSpeech, joint_result
 from test_duplex_episode import profiles as profiles  # noqa: PLC0414 -- pytest fixture
 
 from talktopia import pipeline, utils
@@ -47,9 +47,7 @@ from talktopia.full_duplex.speech_backends import WindowedASR
 from talktopia.full_duplex.speech_client import SpeechClient
 
 
-async def run_timed_episode(
-    profiles, tmp_path, monkeypatch, *, late_backchannel=False
-):
+async def run_timed_episode(profiles, tmp_path, monkeypatch, *, late_backchannel=False):
     decisions = 0
     sent_backchannel = False
 
@@ -57,26 +55,21 @@ async def run_timed_episode(
         nonlocal decisions, sent_backchannel
         await asyncio.sleep(0.06)
         values = kwargs["input_values"]
-        if "available_actions" in values:
-            observation = json.loads(values["observation"])
-            available = json.loads(values["available_actions"])
-            assert (
-                "correction" not in available
-                and "interruption" not in available
-            )
-            if observation["source"] == "asr_partial":
-                action = "backchanneling" if not sent_backchannel else "none"
-                sent_backchannel = True
-            else:
-                decisions += 1
-                action = "speak" if decisions <= 2 else "leave"
-            return json.dumps({"action_type": action})
-        return json.dumps(
-            {"text": "Generated first sentence. Generated second sentence."}
+        observation = json.loads(values["observation"])
+        available = kwargs["context"]["available_action_types"]
+        assert not {"correction", "interruption", "hesitation"}.intersection(available)
+        if observation["source"] == "asr_partial":
+            action = "backchanneling" if not sent_backchannel else "none"
+            sent_backchannel = True
+        else:
+            decisions += 1
+            action = "speak" if decisions <= 2 else "leave"
+        return joint_result(
+            kwargs, action, "Generated first sentence. Generated second sentence."
         )
 
     async def synthesize(self, text, reference, seed):
-        backchannel = text in generation._BACKCHANNELS
+        backchannel = text == generation.BACKCHANNEL_TTS_TEXT
         await asyncio.sleep(2.8 if backchannel and late_backchannel else 0.09)
         count = 4800 if backchannel else 28800
         sample = 2000 if backchannel else 1000
@@ -98,9 +91,7 @@ async def run_timed_episode(
     args.tag = "timing-test"
     speech = FakeSpeech()
     async with speech.client() as client:
-        resolved, agents = pipeline.build_episode(
-            profiles, args, client, client
-        )
+        resolved, agents = pipeline.build_episode(profiles, args, client, client)
         result = await pipeline.run_one_episode(
             resolved, agents, args, tmp_path, "episode_0001"
         )
@@ -114,28 +105,30 @@ async def test_live_pcm_survives_model_waits_and_slow_final_asr(
     started = time.monotonic()
     result, events = await run_timed_episode(profiles, tmp_path, monkeypatch)
     wall_ms = (time.monotonic() - started) * 1000
-    deliveries = [
-        event for event in events if isinstance(event, AudioDeliveryEvent)
-    ]
+    deliveries = [event for event in events if isinstance(event, AudioDeliveryEvent)]
+    for delivery in deliveries:
+        for previous, following in pairwise(delivery.frame_spans):
+            assert (
+                following["start_sample"]
+                == previous["start_sample"] + previous["samples"]
+            )
+        assert all(
+            -1 / 24 <= span["start_ms"] - span["start_sample"] / 24 <= 40
+            for span in delivery.frame_spans
+        )
     assert (
-        deliveries[0].start_ms >= 190
-    )  # Decision, text generation and TTS really waited.
+        deliveries[0].start_ms >= 145
+    )  # Joint action generation and TTS really waited.
     assert 0 <= wall_ms - result["duration_ms"] < 500
     assert all(a.timestamp_ms <= b.timestamp_ms for a, b in pairwise(events))
     with wave.open(str(tmp_path / result["conversation_audio"]), "rb") as wav:
         pcm = wav.readframes(wav.getnframes())
         assert abs(wav.getnframes() / 24 - result["duration_ms"]) < 60
         first = deliveries[0].frame_spans[0]["start_sample"]
-        assert not any(
-            pcm[: first * 4]
-        )  # Initial model latency is present as silence.
+        assert not any(pcm[: first * 4])  # Initial model latency is present as silence.
         samples = memoryview(pcm).cast("h")
-        assert any(
-            left and right for left, right in zip(samples[::2], samples[1::2])
-        )
-    latencies = [
-        event for event in events if isinstance(event, ResponseLatencyEvent)
-    ]
+        assert any(left and right for left, right in zip(samples[::2], samples[1::2]))
+    latencies = [event for event in events if isinstance(event, ResponseLatencyEvent)]
     assert {event.kind for event in latencies} == {
         "normal_response",
         "backchannel",
@@ -160,13 +153,9 @@ async def test_live_pcm_survives_model_waits_and_slow_final_asr(
             )
             assert event.origin_ms == decision.request_started_ms
             assert decision.observation.source == "asr_partial"
-    backchannel = next(
-        event for event in latencies if event.kind == "backchannel"
-    )
+    backchannel = next(event for event in latencies if event.kind == "backchannel")
     bc_end = max(
-        e.end_ms
-        for e in deliveries
-        if e.utterance_id == backchannel.utterance_id
+        e.end_ms for e in deliveries if e.utterance_id == backchannel.utterance_id
     )
     bc_asr = next(
         e
@@ -185,9 +174,7 @@ async def test_live_pcm_survives_model_waits_and_slow_final_asr(
     report = json.loads((tmp_path / result["latency_report"]).read_text())
     assert report["statistics"] == result["latency"]
     for kind in ("normal_response", "backchannel"):
-        samples = [
-            event.latency_ms for event in latencies if event.kind == kind
-        ]
+        samples = [event.latency_ms for event in latencies if event.kind == kind]
         assert report["statistics"][kind] == {
             "count": len(samples),
             "mean_ms": sum(samples) / len(samples),
@@ -200,10 +187,7 @@ async def test_live_pcm_survives_model_waits_and_slow_final_asr(
     _, turns = evaluator.duplex_history(source, tmp_path / result["events"])
     history = "\n".join(turns)
     assert "Sentence ASR" in history and "[00:" in history
-    assert (
-        "Received words" in history
-        and "Generated first sentence" not in history
-    )
+    assert "Received words" in history and "Generated first sentence" not in history
     calls = []
 
     async def judge(**kwargs):
@@ -237,10 +221,7 @@ async def test_live_pcm_survives_model_waits_and_slow_final_asr(
         ]
     )
     args.reeval_tag = "evaluated"
-    assert (
-        await evaluator.evaluate_episode(args, tmp_path / "evaluation-run")
-        == 0
-    )
+    assert await evaluator.evaluate_episode(args, tmp_path / "evaluation-run") == 0
     assert source_path.read_bytes() == source_bytes
     assert "Speech timing in the recorded interaction" in calls[0]["template"]
     assert calls[0]["temperature"] == 0.0
@@ -262,9 +243,7 @@ async def test_live_pcm_survives_model_waits_and_slow_final_asr(
     audio = tmp_path / result["conversation_audio"]
     original_audio = audio.read_bytes()
     args.source_conversation_audio_sha256 = "changed-since-manifest"
-    assert (
-        await evaluator.evaluate_episode(args, tmp_path / "changed-audio") == 1
-    )
+    assert await evaluator.evaluate_episode(args, tmp_path / "changed-audio") == 1
     assert len(calls) == 2
     damaged = bytearray(original_audio)
     damaged[44] = 1
@@ -362,13 +341,7 @@ def test_action_controls_and_weighted_latency_summary():
 def test_prompt_is_the_versioned_appendix_text():
     text = generation._PROMPT_PATH.read_text()
     assert generation.SIMULATION_PROMPT_VERSION == "simulation_FDB_v3"
-    for section in (
-        generation._COMMON_PROMPT,
-        generation._DECISION_PROMPT,
-        generation._NON_AUDIO_ARGUMENT_PROMPT,
-        generation._HIDDEN_SAID_PROMPT,
-    ):
-        assert section in text
+    assert generation._ACTION_PROMPT == text
 
 
 def test_temporal_evaluation_requires_recorded_sidecars():
@@ -377,24 +350,6 @@ def test_temporal_evaluation_requires_recorded_sidecars():
 
     with pytest.raises(ValueError, match="requires its event journal"):
         evaluator.duplex_history(Source(), None)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "action", ["correction", "interruption", "backchanneling"]
-)
-async def test_runtime_rejects_disabled_actions_before_execution(action):
-    runtime = object.__new__(DuplexRuntime)
-    runtime.config = RuntimeConfig(allow_backchannels=False)
-    decision = DuplexActionDecision(
-        decision_id="disabled",
-        action_type=action,
-        target_utterance_id="peer-speech"
-        if action != "backchanneling"
-        else None,
-    )
-    with pytest.raises(ValueError, match="Action disabled"):
-        await runtime.handle_agent_output("Alice", decision)
 
 
 @pytest.mark.asyncio
@@ -412,10 +367,7 @@ async def test_active_audio_failure_keeps_capture_and_stops_tasks(
         receiving.set()
 
     async def generate(**kwargs):
-        values = kwargs["input_values"]
-        if "available_actions" in values:
-            return json.dumps({"action_type": "speak"})
-        return json.dumps({"text": "Generated sentence."})
+        return joint_result(kwargs, "speak", "Generated sentence.")
 
     async def synthesize(self, text, reference, seed):
         # Keep the audio short, with a 15 ms final frame.
@@ -436,13 +388,9 @@ async def test_active_audio_failure_keeps_capture_and_stops_tasks(
     args.tag = "failed-live-audio"
     speech = FakeSpeech()
     async with speech.client() as client:
-        resolved, agents = pipeline.build_episode(
-            profiles, args, client, client
-        )
+        resolved, agents = pipeline.build_episode(profiles, args, client, client)
         task = asyncio.create_task(
-            pipeline.run_one_episode(
-                resolved, agents, args, tmp_path, "episode_0001"
-            )
+            pipeline.run_one_episode(resolved, agents, args, tmp_path, "episode_0001")
         )
         await receiving.wait()
         if failure == "cancel":
@@ -455,9 +403,7 @@ async def test_active_audio_failure_keeps_capture_and_stops_tasks(
         with pytest.raises(error):
             await task
     events = read_events(tmp_path / "simulation/events/episode_0001.jsonl")
-    deliveries = [
-        event for event in events if isinstance(event, AudioDeliveryEvent)
-    ]
+    deliveries = [event for event in events if isinstance(event, AudioDeliveryEvent)]
     assert sum(event.delivered_frames for event in deliveries) == len(received)
     assert all(
         span["end_ms"] > span["start_ms"]
@@ -470,12 +416,8 @@ async def test_active_audio_failure_keeps_capture_and_stops_tasks(
         for delivery in deliveries:
             for span in delivery.frame_spans:
                 wav.setpos(span["start_sample"])
-                assert all(
-                    memoryview(wav.readframes(span["samples"])).cast("h")[::2]
-                )
-    assert events[-1].status == (
-        "cancelled" if failure == "cancel" else "failed"
-    )
+                assert all(memoryview(wav.readframes(span["samples"])).cast("h")[::2])
+    assert events[-1].status == ("cancelled" if failure == "cancel" else "failed")
     assert all(not agent.state.session_active for agent in agents)
     assert not any(
         task.get_name().startswith("surface5-")
@@ -505,12 +447,8 @@ async def test_failure_preserves_exactly_the_accepted_audio(tmp_path, failure):
     runtime.state = RuntimeState(
         episode_id="receiver-failure", now_ms=0, opener_agent="Alice"
     )
-    runtime.event_writer = EventWriter(
-        tmp_path / "events.jsonl", "receiver-failure"
-    )
-    runtime.stereo_writer = StereoWavWriter(
-        tmp_path / "conversation.wav", names
-    )
+    runtime.event_writer = EventWriter(tmp_path / "events.jsonl", "receiver-failure")
+    runtime.stereo_writer = StereoWavWriter(tmp_path / "conversation.wav", names)
     runtime.audio_router = AudioRouter(names)
     runtime.sample_rate_hz = 24000
     runtime._agents = {name: Receiver() for name in names}
@@ -530,12 +468,8 @@ async def test_failure_preserves_exactly_the_accepted_audio(tmp_path, failure):
             action_type="speak",
             hidden_said_id=name,
         )
-        runtime._deliveries[(utterance_id, 0)] = _ChunkDelivery(
-            planned_frames=2
-        )
-        runtime._decision_observations[name] = SimpleNamespace(
-            peer_utterance_id=None
-        )
+        runtime._deliveries[(utterance_id, 0)] = _ChunkDelivery(planned_frames=2)
+        runtime._decision_observations[name] = SimpleNamespace(peer_utterance_id=None)
         runtime.audio_router.enqueue(
             AudioChunk(
                 utterance_id=utterance_id,
@@ -570,12 +504,8 @@ async def test_failure_preserves_exactly_the_accepted_audio(tmp_path, failure):
         runtime.event_writer.close()
         runtime.stereo_writer.close()
     events = read_events(tmp_path / "events.jsonl")
-    deliveries = [
-        event for event in events if isinstance(event, AudioDeliveryEvent)
-    ]
-    assert (
-        len(accepted) == len(deliveries) == (1 if failure == "receiver" else 2)
-    )
+    deliveries = [event for event in events if isinstance(event, AudioDeliveryEvent)]
+    assert len(accepted) == len(deliveries) == (1 if failure == "receiver" else 2)
     assert deliveries[0].source_agent == "Alice"
     assert all(
         span["end_ms"] > span["start_ms"]

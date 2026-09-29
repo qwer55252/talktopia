@@ -1,410 +1,319 @@
+"""Surface5 keeps the actual SOTOPIA request, JSON repair, and fallback path."""
+
 from __future__ import annotations
-import json
+
+import asyncio
 import importlib
-from typing import Any
+import json
 from types import SimpleNamespace
+
+import gin
 import pytest
-from sotopia.generation_utils import PydanticOutputParser
-import talktopia.full_duplex.generation as generation_module
+
 from talktopia.full_duplex.actions import DuplexObservation, StreamingObservation
-from talktopia.full_duplex.generation import (
-    AgentSessionContext,
-    DuplexGenerationEngine,
-    _parse_generated_text,
-)
+from talktopia.full_duplex.generation import AgentSessionContext, DuplexGenerationEngine
+
+MODEL = "custom/local-agent@http://127.0.0.1:18083/v1"
+REPAIR_MODEL = "custom/local-repair@http://127.0.0.1:18084/v1"
 
 
-@pytest.mark.parametrize(
-    ("raw_text", "expected"),
-    [
-        ('"bare speech"', "bare speech"),
-        ('```json\n{"text":"fenced speech"}\n```', "fenced speech"),
-        (
-            '<think>I should answer briefly.</think>{"text":"spoken answer"}',
-            "spoken answer",
-        ),
-    ],
-)
-def test_generated_text_normalizes_local_model_json(
-    raw_text: str,
-    expected: str,
-) -> None:
-    assert _parse_generated_text(raw_text).text == expected
-
-
-def test_generated_text_does_not_reinterpret_malformed_json_as_speech() -> None:
-    with pytest.raises(json.JSONDecodeError):
-        _parse_generated_text('{"text":"missing terminator"')
-
-
-@pytest.mark.asyncio
-async def test_generation_keeps_decision_and_hidden_text_as_separate_calls(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[dict[str, Any]] = []
-
-    async def fake_agenerate(**kwargs: Any) -> Any:
-        calls.append(kwargs)
-        if len(calls) == 1:
-            return json.dumps({"action_type": "speak"})
-        # Ollama can collapse a one-field JSON schema to a bare JSON string.
-        return '"I can propose a practical solution."'
-
-    monkeypatch.setattr(generation_module, "agenerate", fake_agenerate)
-    engine = DuplexGenerationEngine("test-model", max_attempts=2)
-    context = AgentSessionContext(
-        episode_id="episode-1",
+def make_context():
+    return AgentSessionContext(
+        episode_id="test",
         agent_name="Alice One",
         peer_name="Bob Two",
         scenario="They need to settle a plan.",
         self_background="Alice is practical.",
         private_goal="Reach a workable plan.",
     )
-    observation = StreamingObservation(
+
+
+def make_observation(actions, **overrides):
+    return StreamingObservation(
         canonical=DuplexObservation(
             last_turn="Conversation starts.",
             turn_number=0,
-            available_actions=["speak"],
-            action_instruction="",
+            available_actions=actions,
             observation_id="observation-1",
         ),
-        source="reset",
-    )
-    decision = await engine.decide_action(context, observation, "")
-    hidden = await engine.generate_hidden_said(
-        context,
-        observation,
-        decision,
-        "",
-    )
-    chunks = engine.split_into_sentence_chunks(hidden)
-
-    assert decision.action_type == "speak"
-    assert decision.to == ["Bob Two"]
-    assert decision.target_utterance_id is None
-    assert decision.non_audio_argument == ""
-    assert hidden.decision_id == decision.decision_id
-    assert " ".join(chunk.text for chunk in chunks) == hidden.text
-    assert calls[0]["structured_output"] is True
-    assert isinstance(calls[0]["output_parser"], PydanticOutputParser)
-    decision_schema = json.loads(calls[0]["input_values"]["format_instructions"])
-    assert decision_schema["title"] == "_ActionChoice"
-    assert decision_schema["properties"]["action_type"]["enum"] == ["speak"]
-    assert set(decision_schema["properties"]) == {"action_type"}
-    assert "peer_utterance_id" not in calls[0]["input_values"]["observation"]
-    assert (
-        "Select one action type from the available list, using its exact spelling."
-        in calls[0]["template"]
-    )
-    assert 'Choose "none" when a backchannel is not appropriate' in calls[0]["template"]
-    assert calls[1]["structured_output"] is False
-    assert len(calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_decision_discards_premature_model_payload_fields(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[dict[str, Any]] = []
-    responses = iter(
-        (
-            json.dumps(
-                {
-                    "action_type": "speak",
-                    "text": "This premature speech must not be committed.",
-                    "content": "Nor may this alternate field be committed.",
-                    "dialogue_act_label": "offer",
-                }
-            ),
-            json.dumps({"text": "This is the separately generated speech."}),
-        )
+        source=overrides.pop("source", "reset"),
+        **overrides,
     )
 
-    async def fake_agenerate(**kwargs: Any) -> str:
-        calls.append(kwargs)
-        return next(responses)
 
-    monkeypatch.setattr(generation_module, "agenerate", fake_agenerate)
-    engine = DuplexGenerationEngine("test-model", max_attempts=2)
-    context = AgentSessionContext(
-        episode_id="episode-premature-payload",
-        agent_name="Alice One",
-        peer_name="Bob Two",
-        scenario="They need to settle a plan.",
-        self_background="Alice is practical.",
-        private_goal="Reach a workable plan.",
-    )
-    observation = StreamingObservation(
-        canonical=DuplexObservation(
-            last_turn="Conversation starts.",
-            turn_number=0,
-            available_actions=["speak"],
-            action_instruction="",
-            observation_id="observation-premature-payload",
-        ),
-        source="reset",
-    )
-
-    decision = await engine.decide_action(context, observation, "")
-    hidden = await engine.generate_hidden_said(
-        context,
-        observation,
-        decision,
-        "",
-    )
-
-    assert decision.action_type == "speak"
-    assert hidden.text == "This is the separately generated speech."
-    assert "premature" not in hidden.text.casefold()
-    assert engine.decision_audit(decision.decision_id) == (1, ())
-    decision_schema = json.loads(calls[0]["input_values"]["format_instructions"])
-    assert decision_schema["additionalProperties"] is False
-    assert len(calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_generation_exposes_successful_retry_audit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    responses = iter(
-        (
-            "not-json",
-            json.dumps({"action_type": "speak"}),
-            "not-json",
-            json.dumps({"text": "I can suggest a workable compromise."}),
-        )
-    )
-
-    async def fake_agenerate(**_kwargs: Any) -> str:
-        return next(responses)
-
-    monkeypatch.setattr(generation_module, "agenerate", fake_agenerate)
-    engine = DuplexGenerationEngine("test-model", max_attempts=2)
-    context = AgentSessionContext(
-        episode_id="episode-retry",
-        agent_name="Alice One",
-        peer_name="Bob Two",
-        scenario="They need to settle a plan.",
-        self_background="Alice is practical.",
-        private_goal="Reach a workable plan.",
-    )
-    observation = StreamingObservation(
-        canonical=DuplexObservation(
-            last_turn="Conversation starts.",
-            turn_number=0,
-            available_actions=["speak"],
-            action_instruction="",
-            observation_id="observation-retry",
-        ),
-        source="reset",
-    )
-
-    decision = await engine.decide_action(context, observation, "")
-    hidden = await engine.generate_hidden_said(
-        context,
-        observation,
-        decision,
-        "",
-    )
-
-    decision_attempt, decision_errors = engine.decision_audit(decision.decision_id)
-    assert decision_attempt == 2
-    assert len(decision_errors) == 1
-    assert engine.hidden_said_attempt(hidden.hidden_said_id) == 2
-
-
-@pytest.mark.asyncio
-async def test_invalid_json_retries_same_local_endpoint_without_credential_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def mock_completions(monkeypatch, responses):
     backend = importlib.import_module("sotopia.generation_utils.generate")
-    responses = iter(("not-json", '```json\n{"action_type":"leave"}\n```'))
-    completion_calls: list[dict[str, Any]] = []
+    responses = iter(responses)
+    calls = []
 
-    async def fake_acompletion(**kwargs: Any) -> Any:
-        completion_calls.append(kwargs)
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content=next(responses)),
-                )
-            ]
-        )
-
-    async def forbidden_fallback(*_args: object, **_kwargs: object) -> str:
-        raise AssertionError("Sotopia format_bad_output must not be called")
-
-    monkeypatch.setattr(backend, "acompletion", fake_acompletion)
-    monkeypatch.setattr(backend, "format_bad_output", forbidden_fallback)
-    monkeypatch.setenv("CUSTOM_API_KEY", "EMPTY")
-    engine = DuplexGenerationEngine(
-        "custom/local-surface5-agent@http://127.0.0.1:18083/v1",
-        max_attempts=2,
-    )
-    context = AgentSessionContext(
-        episode_id="episode-local-retry",
-        agent_name="Alice One",
-        peer_name="Bob Two",
-        scenario="They have reached a workable agreement.",
-        self_background="Alice is practical.",
-        private_goal="Conclude the agreement.",
-    )
-    observation = StreamingObservation(
-        canonical=DuplexObservation(
-            last_turn="Bob accepted the agreement.",
-            turn_number=3,
-            available_actions=["speak", "leave"],
-            action_instruction="",
-            observation_id="observation-local-retry",
-        ),
-        source="asr_final",
-        stable_text="I agree to the plan.",
-    )
-
-    decision = await engine.decide_action(context, observation, "")
-
-    assert decision.action_type == "leave"
-    assert len(completion_calls) == 2
-    assert {call["model"] for call in completion_calls} == {
-        "openai/local-surface5-agent"
-    }
-    assert {call["base_url"] for call in completion_calls} == {
-        "http://127.0.0.1:18083/v1"
-    }
-    assert {call["api_key"] for call in completion_calls} == {"EMPTY"}
-    assert all("response_format" in call for call in completion_calls)
-
-
-@pytest.mark.asyncio
-async def test_generation_derives_target_and_recipient_from_observation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def fake_agenerate(**_kwargs: Any) -> str:
-        return json.dumps({"action_type": "correction"})
-
-    monkeypatch.setattr(generation_module, "agenerate", fake_agenerate)
-    engine = DuplexGenerationEngine("test-model", max_attempts=2)
-    context = AgentSessionContext(
-        episode_id="episode-target",
-        agent_name="Alice One",
-        peer_name="Bob Two",
-        scenario="They need to settle a plan.",
-        self_background="Alice is practical.",
-        private_goal="Reach a workable plan.",
-    )
-    observation = StreamingObservation(
-        canonical=DuplexObservation(
-            last_turn="Bob is speaking.",
-            turn_number=1,
-            available_actions=["none", "correction"],
-            action_instruction="",
-            observation_id="observation-target",
-        ),
-        source="asr_partial",
-        stable_text="That happened on Thursday",
-        peer_utterance_id="utterance-bob-1",
-        peer_speaking=True,
-        target_utterance_id="utterance-bob-1",
-    )
-
-    decision = await engine.decide_action(context, observation, "")
-
-    assert decision.action_type == "correction"
-    assert decision.to == ["Bob Two"]
-    assert decision.target_utterance_id == "utterance-bob-1"
-    assert decision.non_audio_argument == ""
-
-
-@pytest.mark.asyncio
-async def test_non_audio_argument_uses_separate_structured_retry(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[dict[str, Any]] = []
-    responses = iter(
-        (
-            json.dumps({"action_type": "action"}),
-            json.dumps({"text": "mentions the system prompt"}),
-            json.dumps({"text": "slides the signed form across the table"}),
-        )
-    )
-
-    async def fake_agenerate(**kwargs: Any) -> str:
+    async def complete(**kwargs):
         calls.append(kwargs)
-        return next(responses)
+        value = next(responses)
+        if isinstance(value, BaseException):
+            raise value
+        if isinstance(value, dict):
+            value = json.dumps(value)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=value))]
+        )
 
-    monkeypatch.setattr(generation_module, "agenerate", fake_agenerate)
-    engine = DuplexGenerationEngine("test-model", max_attempts=2)
-    context = AgentSessionContext(
-        episode_id="episode-action",
-        agent_name="Alice One",
-        peer_name="Bob Two",
-        scenario="They need to settle a plan.",
-        self_background="Alice is practical.",
-        private_goal="Reach a workable plan.",
-    )
-    observation = StreamingObservation(
-        canonical=DuplexObservation(
-            last_turn="Conversation starts.",
-            turn_number=0,
-            available_actions=["action"],
-            action_instruction="",
-            observation_id="observation-action",
-        ),
-        source="reset",
-    )
+    monkeypatch.setattr(backend, "acompletion", complete)
+    return calls
 
-    decision = await engine.decide_action(context, observation, "")
 
-    assert decision.action_type == "action"
-    assert decision.non_audio_argument == "slides the signed form across the table"
-    assert decision.to == ["Bob Two"]
-    assert engine.non_audio_argument_attempt(decision.decision_id) == 2
-    assert [call["structured_output"] for call in calls] == [True, True, True]
-    assert all(
-        isinstance(call["output_parser"], PydanticOutputParser) for call in calls
+@pytest.fixture(autouse=True)
+def configured_generation():
+    previous = gin.config_str()
+    gin.bind_parameter(
+        "sotopia.generation_utils.generate.agenerate_action.temperature", 1.0
     )
-    action_schema = json.loads(calls[0]["input_values"]["format_instructions"])
-    assert set(action_schema["properties"]) == {"action_type"}
-    non_audio_schema = json.loads(calls[1]["input_values"]["format_instructions"])
-    assert set(non_audio_schema["properties"]) == {"text"}
+    gin.bind_parameter(
+        "sotopia.generation_utils.generate.agenerate.bad_output_process_model",
+        REPAIR_MODEL,
+    )
+    try:
+        yield
+    finally:
+        gin.clear_config()
+        gin.parse_config(previous)
 
 
 @pytest.mark.asyncio
-async def test_non_audio_argument_accepts_unquoted_local_model_text(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    responses = iter(
-        (
-            json.dumps({"action_type": "action"}),
-            "slides the signed form across the table",
+@pytest.mark.parametrize(
+    "action_type, argument",
+    [
+        ("speak", "I can propose a practical solution. One more sentence."),
+        ("action", "slides the signed form across the table"),
+        ("non-verbal communication", "nods toward the empty chair"),
+        ("backchanneling", ""),
+        ("none", ""),
+        ("leave", ""),
+    ],
+)
+async def test_action_and_argument_share_one_actual_model_call(
+    monkeypatch, action_type, argument
+):
+    calls = mock_completions(
+        monkeypatch, [{"action_type": action_type, "argument": argument, "to": ["Bob"]}]
+    )
+    engine = DuplexGenerationEngine(MODEL)
+    session = make_context()
+    history = (
+        "Here is the context of the interaction:\nParticipants: Alice One; Bob Two\n"
+        "Alice's goal: Reach a workable plan.\n"
+        + "\n".join(
+            f"Turn #{index}: Bob said: statement {index}." for index in range(13)
         )
     )
-
-    async def fake_agenerate(**_kwargs: Any) -> str:
-        return next(responses)
-
-    monkeypatch.setattr(generation_module, "agenerate", fake_agenerate)
-    engine = DuplexGenerationEngine("test-model", max_attempts=2)
-    context = AgentSessionContext(
-        episode_id="episode-unquoted-action",
-        agent_name="Alice One",
-        peer_name="Bob Two",
-        scenario="They need to settle a plan.",
-        self_background="Alice is practical.",
-        private_goal="Reach a workable plan.",
+    generated = await engine.generate_action(
+        session, make_observation([action_type]), history
     )
-    observation = StreamingObservation(
-        canonical=DuplexObservation(
-            last_turn="Conversation starts.",
-            turn_number=0,
-            available_actions=["action"],
-            action_instruction="",
-            observation_id="observation-unquoted-action",
+    assert generated.argument == argument
+    assert generated.decision.action_type == action_type
+    assert generated.decision.to == ["Bob Two"]
+    assert not generated.fallback
+    assert engine.decision_audit(generated.decision.decision_id) == (1, ())
+    assert engine.decision_started_ns(generated.decision.decision_id) > 0
+    if action_type == "speak":
+        hidden = engine.make_hidden_said(session, generated)
+        assert hidden.text == argument
+        assert engine.hidden_said_attempt(hidden.hidden_said_id) == 1
+        assert (
+            " ".join(chunk.text for chunk in engine.split_into_sentence_chunks(hidden))
+            == argument
+        )
+    elif action_type in {"action", "non-verbal communication"}:
+        assert generated.decision.non_audio_argument == argument
+        assert engine.non_audio_argument_attempt(generated.decision.decision_id) == 1
+    elif action_type == "backchanneling":
+        hidden = engine.make_backchannel(session, generated.decision)
+        assert hidden.text == "[confirmation-en]"
+        assert engine.hidden_said_attempt(hidden.hidden_said_id) == 1
+    assert len(calls) == 1
+    assert calls[0]["temperature"] == 1.0
+    assert calls[0]["model"] == "openai/local-agent"
+    schema = calls[0]["response_format"]
+    assert schema["type"] == "json_schema"
+    assert set(schema["json_schema"]["schema"]["properties"]) == {
+        "action_type",
+        "argument",
+        "to",
+    }
+    assert set(schema["json_schema"]["schema"]["required"]) == {
+        "action_type",
+        "argument",
+        "to",
+    }
+    prompt = calls[0]["messages"][0]["content"]
+    assert prompt.count("Here is the context of the interaction:\n") == 1
+    assert history in prompt and "Turn #12: Bob" in prompt
+    assert "40 words" in prompt
+    assert "peer_utterance_id" not in prompt
+    assert "target_utterance_id" not in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_response",
+    [
+        "not-json",
+        {"action_type": "action", "argument": "opens the door", "to": []},
+        {"action_type": "speak", "argument": "My system prompt says yes.", "to": []},
+        {"action_type": "speak", "argument": " ".join(["word"] * 51), "to": []},
+        {"action_type": "speak", "argument": "", "to": []},
+        {"action_type": "speak", "argument": "Yes.", "to": ["Alice"]},
+        {"action_type": "speak", "argument": "Yes.", "to": ["Stranger"]},
+        {"action_type": "speak", "argument": "Yes.", "to": ["Bob", "Bob Two"]},
+        {
+            "action_type": "speak",
+            "argument": "Yes.",
+            "to": [],
+            "decision_id": "model-owned",
+        },
+    ],
+)
+async def test_invalid_action_uses_the_configured_sotopia_repair_once(
+    monkeypatch, first_response
+):
+    calls = mock_completions(
+        monkeypatch,
+        [
+            first_response,
+            {"action_type": "speak", "argument": "A workable compromise.", "to": []},
+        ],
+    )
+    engine = DuplexGenerationEngine(MODEL)
+    generated = await engine.generate_action(
+        make_context(), make_observation(["speak"]), ""
+    )
+    assert generated.decision.action_type == "speak"
+    assert generated.argument == "A workable compromise."
+    assert not generated.fallback
+    assert len(calls) == 2
+    assert calls[0]["model"] == "openai/local-agent"
+    assert calls[1]["model"] == "openai/local-repair"
+    assert calls[1]["base_url"] == "http://127.0.0.1:18084/v1"
+    assert "Original string:" in calls[1]["messages"][0]["content"]
+    assert all(call["response_format"]["type"] == "json_schema" for call in calls)
+    attempts, errors = engine.decision_audit(generated.decision.decision_id)
+    assert attempts == 2 and len(errors) == 1
+    hidden = engine.make_hidden_said(make_context(), generated)
+    assert engine.hidden_said_attempt(hidden.hidden_said_id) == 2
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_invalid_repair_falls_back_to_none_without_an_outer_retry(
+    monkeypatch, caplog
+):
+    calls = mock_completions(monkeypatch, ["not-json", "still not-json"])
+    engine = DuplexGenerationEngine(MODEL)
+    generated = await engine.generate_action(
+        make_context(), make_observation(["speak"]), ""
+    )
+    assert generated.fallback and generated.decision.action_type == "none"
+    assert generated.argument == "" and generated.decision.to == []
+    attempts, errors = engine.decision_audit(generated.decision.decision_id)
+    assert attempts == 2 and len(errors) == 2
+    assert len(calls) == 2
+    assert "Failed to generate action" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_request_failure_is_a_logged_pass(monkeypatch):
+    calls = mock_completions(monkeypatch, [RuntimeError("server unavailable")])
+    engine = DuplexGenerationEngine(MODEL)
+    generated = await engine.generate_action(
+        make_context(), make_observation(["speak"]), ""
+    )
+    assert generated.fallback and generated.decision.action_type == "none"
+    assert len(calls) == 1
+    assert (
+        "server unavailable"
+        in engine.decision_audit(generated.decision.decision_id)[1][0]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "responses", [[asyncio.CancelledError()], ["not-json", asyncio.CancelledError()]]
+)
+async def test_cancellation_propagates_from_generation_or_repair(
+    monkeypatch, responses
+):
+    calls = mock_completions(monkeypatch, responses)
+    engine = DuplexGenerationEngine(MODEL)
+    with pytest.raises(asyncio.CancelledError):
+        await engine.generate_action(make_context(), make_observation(["speak"]), "")
+    assert len(calls) == len(responses)
+    assert not engine._decision_audits
+
+
+@pytest.mark.asyncio
+async def test_fifty_word_speech_remains_valid(monkeypatch):
+    text = " ".join(["word"] * 50)
+    calls = mock_completions(
+        monkeypatch, [{"action_type": "speak", "argument": text, "to": []}]
+    )
+    engine = DuplexGenerationEngine(MODEL)
+    generated = await engine.generate_action(
+        make_context(), make_observation(["speak"]), ""
+    )
+    assert not generated.fallback
+    assert engine.make_hidden_said(make_context(), generated).text == text
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action_type", ["correction", "interruption"])
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_target_comes_only_from_current_observation(
+    monkeypatch, action_type, wrapped
+):
+    response = {"action_type": action_type, "argument": "That was Thursday.", "to": []}
+    calls = mock_completions(
+        monkeypatch, [{"properties": response} if wrapped else response]
+    )
+    engine = DuplexGenerationEngine(MODEL)
+    generated = await engine.generate_action(
+        make_context(),
+        make_observation(
+            ["none", action_type],
+            source="asr_partial",
+            peer_speaking=True,
+            peer_utterance_id="utterance-bob-1",
+            target_utterance_id="utterance-bob-1",
         ),
-        source="reset",
+        "",
     )
+    assert generated.decision.action_type == action_type
+    assert generated.decision.target_utterance_id == "utterance-bob-1"
+    assert len(calls) == 1
 
-    decision = await engine.decide_action(context, observation, "")
 
-    assert decision.non_audio_argument == "slides the signed form across the table"
-    assert engine.non_audio_argument_attempt(decision.decision_id) == 1
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action_type, argument",
+    [
+        ("backchanneling", "yes"),
+        ("leave", "bye"),
+        ("none", "hmm"),
+        ("correction", "Thursday."),
+    ],
+)
+async def test_invalid_control_argument_or_missing_target_is_repaired(
+    monkeypatch, action_type, argument
+):
+    calls = mock_completions(
+        monkeypatch,
+        [
+            {"action_type": action_type, "argument": argument, "to": []},
+            {"action_type": "none", "argument": "", "to": []},
+        ],
+    )
+    engine = DuplexGenerationEngine(MODEL)
+    generated = await engine.generate_action(
+        make_context(), make_observation(["none", action_type]), ""
+    )
+    assert not generated.fallback and generated.decision.action_type == "none"
+    assert len(calls) == 2

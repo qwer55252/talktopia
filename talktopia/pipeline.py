@@ -641,7 +641,7 @@ def build_duplex_episode(
         ASR_DECODE_INTERVAL_MS,
         ASR_WINDOW_MS,
     )
-    from talktopia.full_duplex.episode import RuntimeConfig, profile_name
+    from talktopia.full_duplex.episode import profile_name
     from talktopia.full_duplex.generation import DuplexGenerationEngine
     from talktopia.full_duplex.speech_backends import SentenceTTS, WindowedASR
     from talktopia.full_duplex.speech_client import SpeechClient
@@ -676,7 +676,6 @@ def build_duplex_episode(
                 profile=profile,
                 generation=DuplexGenerationEngine(
                     getattr(args, f"agent{index}_model"),
-                    max_attempts=RuntimeConfig().generation_max_attempts,
                 ),
                 asr=WindowedASR(
                     speech,
@@ -685,7 +684,6 @@ def build_duplex_episode(
                 ),
                 tts=SentenceTTS(speech, source_agent=profile_name(profile)),
                 voice_reference=reference,
-                history_entries=RuntimeConfig().history_entries,
             )
         )
     return resolved, agents
@@ -723,7 +721,10 @@ async def run_duplex_episode(
         read_events,
     )
     from talktopia.full_duplex.generation import AgentSessionContext
-    from talktopia.full_duplex.rendering import render_sotopia_messages
+    from talktopia.full_duplex.rendering import (
+        render_episode_for_humans,
+        render_sotopia_messages,
+    )
     from talktopia.full_duplex.runtime import DuplexRuntime
     from talktopia.full_duplex.sotopia_adapter import SotopiaSession
     from talktopia.full_duplex.transcript import TranscriptBuilder
@@ -800,7 +801,7 @@ async def run_duplex_episode(
         if args.push_to_db:
             episode.save()
         write_json(original_path, episode.model_dump(mode="json"))
-        _, turns = episode.render_for_humans()
+        _, turns = render_episode_for_humans(episode)
         readable_path.parent.mkdir(parents=True, exist_ok=True)
         readable_path.write_text(
             "# Speech conversation\n\nEvaluation: not performed.\n\n"

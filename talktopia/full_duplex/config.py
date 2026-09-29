@@ -4,6 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from talktopia.models.config import CONFIRMATION_TTS_DURATION_S, CONFIRMATION_TTS_TAG
 
 class RuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -12,10 +13,10 @@ class RuntimeConfig(BaseModel):
     allow_backchannels: bool = True
     allow_corrections: bool = False
     allow_interruptions: bool = False
-    turn_taking_policy: str = "surface5_realtime_v3"
+    turn_taking_policy: str = "surface5_sotopia_single_call_v1"
     termination_policy: Literal["first_leave"] = "first_leave"
-    generation_max_attempts: int = Field(default=2, ge=1)
-    history_entries: int = Field(default=8, ge=1)
+    generation_mode: Literal["sotopia_single_call"] = "sotopia_single_call"
+    history_policy: Literal["full_canonical_asr"] = "full_canonical_asr"
     minimum_floor_gap_ms: int = Field(default=200, ge=0)
     correction_min_stable_words: int = Field(default=8, ge=1)
     interruption_min_stable_words: int = Field(default=12, ge=1)
@@ -56,8 +57,12 @@ def runtime_settings(max_turns: int = 12, **options) -> dict:
         "turn_budget": "confirmed_actions_except_none_and_backchanneling_v1",
         "opener": "agent1",
         "clock": "monotonic_elapsed_ms",
-        "audio_capture": "live_delivered_pcm_v2",
+        "audio_capture": "live_pcm_sample_clock_v3",
         "simulation_prompt": SIMULATION_PROMPT_VERSION,
         "evaluation_prompt": "evaluation_FDB_v1",
         "temporal_evaluation": "sentence_asr_delivery_v1",
+        "backchannel_tts": {
+            "input": CONFIRMATION_TTS_TAG,
+            "duration_s": CONFIRMATION_TTS_DURATION_S,
+        },
     }

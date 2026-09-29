@@ -1,4 +1,4 @@
-"""PCM routing and deterministic stereo artifact writing."""
+"""PCM routing and live stereo capture on a continuous sample clock."""
 
 from __future__ import annotations
 
@@ -126,11 +126,20 @@ class AudioRouter:
         return any(self._queues.values())
 
 
-class StereoWavWriter:
-    """Capture the live stereo PCM bus on the same monotonic timeline as events.
+@dataclass(frozen=True, slots=True)
+class CapturePosition:
+    start_sample: int
+    clock_anchor_ms: float
+    clock_anchor_sample: int
+    underrun_ms: float
 
-    Only delivered frames enter this writer. Gaps are elapsed silence, never
-    removed; no synthesized utterance files are concatenated after the episode.
+
+class StereoWavWriter:
+    """Capture the delivered PCM bus without turning callback jitter into clicks.
+
+    An active stream follows the sample clock anchored at its first delivery.
+    Idle time and stalls longer than one frame re-anchor it to measured time.
+    Only acknowledged frames enter this writer, during the live episode.
     """
 
     def __init__(
@@ -145,6 +154,7 @@ class StereoWavWriter:
             raise ValueError("StereoWavWriter requires two distinct sources")
         self._sources = sources
         self.sample_rate_hz = sample_rate_hz
+        self.frame_ms = frame_ms
         self._bytes_per_tick = sample_rate_hz * frame_ms // 1000 * 2
         path.parent.mkdir(parents=True, exist_ok=True)
         self._wave = wave.open(str(path), "wb")
@@ -153,8 +163,12 @@ class StereoWavWriter:
         self._wave.setframerate(sample_rate_hz)
         self.samples_written = 0
         self._closed = False
+        self._clock_anchor_ms: float | None = None
+        self._clock_anchor_sample = 0
 
     def silence_until(self, timestamp_ms: float) -> None:
+        # An empty transport queue is real waiting, not callback jitter.
+        self._clock_anchor_ms = None
         target = round(timestamp_ms * self.sample_rate_hz / 1000)
         missing = max(0, target - self.samples_written)
         while missing:
@@ -165,12 +179,19 @@ class StereoWavWriter:
 
     def write_tick(
         self, frames: Mapping[str, AudioFrame | None], *, timestamp_ms: float
-    ) -> int:
+    ) -> CapturePosition:
         if self._closed:
             raise RuntimeError("stereo WAV writer is closed")
         if set(frames) - set(self._sources):
             raise ValueError("Unknown stereo source")
-        self.silence_until(timestamp_ms)
+        gap_ms = timestamp_ms - self.samples_written * 1000 / self.sample_rate_hz
+        underrun_ms = 0.0
+        if self._clock_anchor_ms is None or gap_ms > self.frame_ms:
+            if self._clock_anchor_ms is not None:
+                underrun_ms = gap_ms
+            self.silence_until(timestamp_ms)
+            self._clock_anchor_ms = timestamp_ms
+            self._clock_anchor_sample = self.samples_written
         start_sample = self.samples_written
         size = max(
             (len(frame.pcm_s16le) for frame in frames.values() if frame),
@@ -192,7 +213,12 @@ class StereoWavWriter:
             ]
         self._wave.writeframesraw(bytes(interleaved))
         self.samples_written += size // 2
-        return start_sample
+        return CapturePosition(
+            start_sample=start_sample,
+            clock_anchor_ms=self._clock_anchor_ms,
+            clock_anchor_sample=self._clock_anchor_sample,
+            underrun_ms=underrun_ms,
+        )
 
     def close(self) -> None:
         if not self._closed:
