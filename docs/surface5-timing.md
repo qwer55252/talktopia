@@ -149,6 +149,16 @@ regeneration loop. Decision events and committed passes distinguish this fallbac
 with `generation_fallback`. Cancellation still propagates. All inference and
 repair waits remain in measured latency and the live recording.
 
+Completed generation records the exact model response strings in
+`DecisionEvent.raw_responses`, ordered as the initial response and optional
+repair, before removing thinking tags. The existing decision ID links these
+strings to the observation, validation errors, and final action or fallback.
+An actual null response is recorded as null; an API failure adds no response.
+The strings remain diagnostic data and never enter participant history or
+evaluation dialogue. The event file is covered by the existing artifact hashes.
+Work cancelled before returning a decision is outside this completed-decision
+audit. Older events without the field remain readable.
+
 The shared speech API uses `without_timestamps=True` when decoding Whisper text.
 In a recorded 3.63-second utterance, timestamp-token decoding reproducibly added
 unrelated repeated text; the same PCM and VAD preprocessing decoded correctly

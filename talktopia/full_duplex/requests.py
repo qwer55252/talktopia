@@ -29,6 +29,7 @@ async def generate_structured_action[Result: BaseModel](
     output_parser: PydanticOutputParser[Result],
     temperature: float | None,
     context: dict[str, Any] | None = None,
+    responses: list[str | None] | None = None,
 ) -> Result:
     """Keep the first SOTOPIA request unchanged; repair only a parse failure.
 
@@ -78,6 +79,8 @@ async def generate_structured_action[Result: BaseModel](
     if temperature is not None:
         completion_kwargs["temperature"] = temperature
     response = await sotopia_generation.acompletion(**completion_kwargs)
+    if responses is not None:
+        responses.append(response.choices[0].message.content)
     result = sotopia_generation._strip_thinking_tags(
         response.choices[0].message.content
     )
@@ -85,7 +88,7 @@ async def generate_structured_action[Result: BaseModel](
         parsed = output_parser.parse(result, context=context)
     except Exception:  # noqa: BLE001 - Match SOTOPIA's one parse-error repair.
         repaired = await _repair_action(
-            result, output_parser, repair_model, base_url=base_url
+            result, output_parser, repair_model, base_url=base_url, responses=responses
         )
         parsed = output_parser.parse(repaired, context=context)
     return parsed
@@ -97,6 +100,7 @@ async def _repair_action[Result: BaseModel](
     model_name: str,
     *,
     base_url: str | None,
+    responses: list[str | None] | None = None,
 ) -> str:
     # SOTOPIA's formatter rejects None before making a repair request.
     if result is None:
@@ -124,6 +128,8 @@ async def _repair_action[Result: BaseModel](
         base_url=base_url,
         api_key=api_key,
     )
+    if responses is not None:
+        responses.append(response.choices[0].message.content)
     repaired = sotopia_generation._strip_thinking_tags(
         response.choices[0].message.content
     )

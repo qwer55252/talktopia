@@ -111,10 +111,12 @@ async def test_first_payload_matches_actual_agenerate(
     expected = await sotopia_generation.agenerate(
         **deepcopy(kwargs), structured_output=True
     )
-    actual = await generate_structured_action(**kwargs)
+    recorded = []
+    actual = await generate_structured_action(**kwargs, responses=recorded)
     assert expected == actual == Reply(text="Correct answer.")
     assert len(calls) == 2
     assert calls[0] == calls[1]
+    assert recorded == ['{"text":"Correct answer."}']
     assert kwargs["input_values"] == initial_inputs
     assert kwargs["output_parser"]._contexts == [CONTEXT]
 
@@ -146,7 +148,10 @@ async def test_one_content_repair_keeps_schema_context_and_model_configuration(
         ],
     )
     parser = RecordingParser(pydantic_object=Reply)
-    result = await generate_structured_action(**request_kwargs(parser))
+    recorded = []
+    result = await generate_structured_action(
+        **request_kwargs(parser), responses=recorded
+    )
     assert result.text == "Correct answer."
     assert len(calls) == 2
     assert parser._contexts == [CONTEXT, CONTEXT]
@@ -162,6 +167,10 @@ async def test_one_content_repair_keeps_schema_context_and_model_configuration(
     assert 'Original string: {"text":"Wrong content."}' in content
     assert parser.get_format_instructions() in content
     assert "Given the string that can not be parsed" not in content
+    assert recorded == [
+        '{"text":"Wrong content."}',
+        '<think>private</think>```json\n{"text":"Correct answer."}\n```',
+    ]
 
 
 @pytest.mark.asyncio
@@ -222,9 +231,11 @@ async def test_second_parse_failure_has_no_third_call(monkeypatch):
     calls = mock_completions(
         monkeypatch, ['{"text":"Wrong."}', '{"text":"Still wrong."}']
     )
+    recorded = []
     with pytest.raises(ValueError, match="text does not match context"):
-        await generate_structured_action(**request_kwargs())
+        await generate_structured_action(**request_kwargs(), responses=recorded)
     assert len(calls) == 2
+    assert recorded == ['{"text":"Wrong."}', '{"text":"Still wrong."}']
 
 
 @pytest.mark.asyncio
@@ -232,9 +243,11 @@ async def test_second_parse_failure_has_no_third_call(monkeypatch):
 async def test_cancellation_propagates(monkeypatch, during_repair):
     responses = ['{"text":"Wrong."}'] if during_repair else []
     calls = mock_completions(monkeypatch, responses + [asyncio.CancelledError()])
+    recorded = []
     with pytest.raises(asyncio.CancelledError):
-        await generate_structured_action(**request_kwargs())
+        await generate_structured_action(**request_kwargs(), responses=recorded)
     assert len(calls) == 1 + during_repair
+    assert recorded == responses
 
 
 @pytest.mark.asyncio
@@ -247,12 +260,14 @@ async def test_initial_none_content_matches_engine_one_call_failure(monkeypatch)
             **request_kwargs(original_parser), structured_output=True
         )
     assert len(calls) == 1
+    recorded = []
     with pytest.raises(ValueError, match="Response content is None"):
-        await generate_structured_action(**request_kwargs(parser))
+        await generate_structured_action(**request_kwargs(parser), responses=recorded)
     assert len(calls) == 2
     assert calls[0] == calls[1]
     assert parser._contexts == original_parser._contexts == [CONTEXT]
     assert parser._failed and original_parser._failed
+    assert recorded == [None]
 
 
 @pytest.mark.asyncio
@@ -271,3 +286,30 @@ async def test_relaxed_json_and_thinking_fence_cleanup_skip_repair(monkeypatch):
     result = await generate_structured_action(**request_kwargs())
     assert result.text == "Correct answer."
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_response_collectors_do_not_mix(monkeypatch):
+    async def complete(**kwargs):
+        await asyncio.sleep(0)
+        response = '{"text":"' + kwargs["messages"][0]["content"] + '"}'
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=response))]
+        )
+
+    monkeypatch.setattr(sotopia_generation, "acompletion", complete)
+    recorded = [[], []]
+    await asyncio.gather(
+        *[
+            generate_structured_action(
+                model_name=AGENT_MODEL,
+                template=name,
+                input_values={},
+                output_parser=RecordingParser(pydantic_object=Reply),
+                temperature=1,
+                responses=recorded[index],
+            )
+            for index, name in enumerate(["Alice", "Bob"])
+        ]
+    )
+    assert recorded == [['{"text":"Alice"}'], ['{"text":"Bob"}']]

@@ -66,6 +66,7 @@ class DecisionEvent(EventBase):
     validation_errors: tuple[str, ...] = ()
     request_started_ms: float | None = None
     generation_fallback: bool = False
+    raw_responses: tuple[str | None, ...] = ()
 
 
 class HiddenSaidCreated(EventBase):

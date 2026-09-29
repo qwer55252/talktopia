@@ -119,16 +119,23 @@ async def test_accepted_speech_preserves_generated_synthesized_and_live_pcm(
 ):
     from sotopia.database import EpisodeLog
     from talktopia.evaluation.evaluator import duplex_history
+    from talktopia.full_duplex.events import DecisionEvent
     from talktopia.full_duplex.transcript import TranscriptBuilder
 
     decisions = 0
     original = "I need the other grand."
+    raw_response = (
+        '<think>Private raw diagnostic.</think>'
+        '{"argument":"I need the other grand."}'
+    )
 
     async def generate(**kwargs):
         nonlocal decisions
+        assert "Private raw diagnostic" not in kwargs["input_values"]["history"]
         if json.loads(kwargs["input_values"]["observation"])["source"] == "asr_partial":
             return joint_result(kwargs, "none")
         decisions += 1
+        kwargs["responses"].append(raw_response)
         return joint_result(kwargs, "speak" if decisions == 1 else "leave", original)
 
     monkeypatch.setattr(generation, "generate_structured_action", generate)
@@ -157,7 +164,16 @@ async def test_accepted_speech_preserves_generated_synthesized_and_live_pcm(
         == "Received words describing the proposed meeting time."
     )
     source = EpisodeLog.model_validate_json((tmp_path / result["original"]).read_text())
-    duplex_history(source, tmp_path / result["events"])
+    _, timed_history = duplex_history(source, tmp_path / result["events"])
+    assert "Private raw diagnostic" not in "\n".join(timed_history)
+    selected = next(
+        e for e in events if isinstance(e, DecisionEvent) and e.raw_responses
+    )
+    assert selected.raw_responses == (raw_response,)
+    legacy = selected.model_dump()
+    legacy.pop("raw_responses")
+    assert DecisionEvent.model_validate(legacy).raw_responses == ()
+    assert "Private raw diagnostic" not in (tmp_path / result["readable"]).read_text()
     assert "nods" not in (tmp_path / result["readable"]).read_text()
 
 

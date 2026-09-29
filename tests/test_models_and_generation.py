@@ -223,6 +223,7 @@ async def test_invalid_repair_falls_back_to_none_without_an_outer_retry(
     assert attempts == 2 and len(errors) == 2
     assert len(calls) == 2
     assert "Failed to generate action" in caplog.text
+    assert generated.raw_responses == ("not-json", "still not-json")
 
 
 @pytest.mark.asyncio
@@ -238,6 +239,7 @@ async def test_request_failure_is_a_logged_pass(monkeypatch):
         "server unavailable"
         in engine.decision_audit(generated.decision.decision_id)[1][0]
     )
+    assert generated.raw_responses == ()
 
 
 @pytest.mark.asyncio

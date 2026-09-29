@@ -578,6 +578,7 @@ class DuplexRuntime:
                     attempt=attempt,
                     validation_errors=(rejection,),
                     generation_fallback=generated.fallback,
+                    raw_responses=generated.raw_responses,
                 )
                 self._discarded_decisions.add(decision.decision_id)
                 return
@@ -596,6 +597,7 @@ class DuplexRuntime:
                 attempt=attempt,
                 validation_errors=validation_errors,
                 generation_fallback=generated.fallback,
+                raw_responses=generated.raw_responses,
                 request_started_ms=(
                     self._agents[agent].generation.decision_started_ns(
                         decision.decision_id

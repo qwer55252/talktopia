@@ -111,6 +111,7 @@ class GeneratedAction:
     decision: DuplexActionDecision
     argument: str
     fallback: bool = False
+    raw_responses: tuple[str | None, ...] = ()
 
 
 class _SpeechMarkupError(ValueError):
@@ -393,6 +394,7 @@ class DuplexGenerationEngine:
             temperature = sotopia_generation.DEFAULT_TEMPERATURE
         request_started_ns = time.monotonic_ns()
         fallback = False
+        raw_responses: list[str | None] = []
         errors: tuple[str, ...]
         try:
             action = await generate_structured_action(
@@ -408,6 +410,7 @@ class DuplexGenerationEngine:
                 output_parser=parser,
                 temperature=temperature,
                 context=context,
+                responses=raw_responses,
             )
             if not isinstance(action, _JointAction):
                 raise TypeError(
@@ -456,7 +459,12 @@ class DuplexGenerationEngine:
         self._decision_audits[decision_id] = (attempts, errors)
         if non_audio:
             self._non_audio_attempts[decision_id] = attempts
-        return GeneratedAction(decision=decision, argument=argument, fallback=fallback)
+        return GeneratedAction(
+            decision=decision,
+            argument=argument,
+            fallback=fallback,
+            raw_responses=tuple(raw_responses),
+        )
 
     def make_hidden_said(
         self, session: AgentSessionContext, generated: GeneratedAction
