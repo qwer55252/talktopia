@@ -77,10 +77,12 @@ class FakeSpeech:
     def __init__(self):
         self.seeds = []
         self.asr_audio_lengths = []
+        self.tts_inputs = []
 
     def handle(self, request):
         if request.url.path.endswith("/audio/speech"):
             body = json.loads(request.content)
+            self.tts_inputs.append(body["input"])
             assert body["voice"].startswith("voice-agent-")
             self.seeds.append(body["seed"])
             return httpx.Response(
@@ -109,6 +111,54 @@ def joint_result(kwargs, action, text="Generated speech that is private until he
         json.dumps({"action_type": action, "argument": argument, "to": []}),
         context=kwargs["context"],
     )
+
+
+@pytest.mark.asyncio
+async def test_stage_direction_filter_preserves_generated_synthesized_and_live_pcm(
+    profiles, tmp_path, monkeypatch
+):
+    from sotopia.database import EpisodeLog
+    from talktopia.evaluation.evaluator import duplex_history
+    from talktopia.full_duplex.transcript import TranscriptBuilder
+
+    decisions = 0
+    original = "*nods* We can meet at ten."
+
+    async def generate(**kwargs):
+        nonlocal decisions
+        if json.loads(kwargs["input_values"]["observation"])["source"] == "asr_partial":
+            return joint_result(kwargs, "none")
+        decisions += 1
+        return joint_result(kwargs, "speak" if decisions == 1 else "leave", original)
+
+    monkeypatch.setattr(generation, "agenerate", generate)
+    args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
+    args.tag = "stage-directions"
+    speech = FakeSpeech()
+    async with speech.client() as client:
+        resolved, agents = pipeline.build_episode(profiles, args, client, client)
+        result = await asyncio.wait_for(
+            pipeline.run_one_episode(resolved, agents, args, tmp_path, "episode_0001"),
+            10,
+        )
+    assert result["status"] == "completed"
+    assert speech.tts_inputs == ["We can meet at ten."]
+    events = read_events(tmp_path / result["events"])
+    spoken = [
+        e
+        for e in TranscriptBuilder.from_events(events).build()
+        if e.action_type == "speak"
+    ]
+    assert len(spoken) == 1
+    assert spoken[0].generated_text == original
+    assert spoken[0].synthesized_text == speech.tts_inputs[0]
+    assert (
+        spoken[0].received_text
+        == "Received words describing the proposed meeting time."
+    )
+    source = EpisodeLog.model_validate_json((tmp_path / result["original"]).read_text())
+    duplex_history(source, tmp_path / result["events"])
+    assert "nods" not in (tmp_path / result["readable"]).read_text()
 
 
 @pytest.mark.asyncio

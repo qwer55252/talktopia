@@ -22,6 +22,7 @@ def test_simulation_preserves_sotopia_body_and_round_robin_guidance():
         "simulation_FDB_v1.txt",
         "simulation_FDB_v2.txt",
         "simulation_FDB_v3.txt",
+        "simulation_FDB_v4.txt",
     }
     assert (
         runtime_settings()["simulation_prompt"] == generation.SIMULATION_PROMPT_VERSION
@@ -38,6 +39,8 @@ def test_simulation_preserves_sotopia_body_and_round_robin_guidance():
         in prompt
     )
     assert 'set "argument" to "" for "backchanneling"' in prompt
+    assert "only the words to be spoken aloud" in prompt
+    assert 'For "action" or "non-verbal communication"' in prompt
     assert prompt.count("{history}") == 1
     for phrase in (
         "make a concrete opening",

@@ -7,16 +7,22 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import gin
-from pydantic import ConfigDict, PrivateAttr, ValidationInfo, model_validator
+from pydantic import (
+    ConfigDict,
+    PrivateAttr,
+    ValidationInfo,
+    create_model,
+    model_validator,
+)
 from sotopia.generation_utils import PydanticOutputParser, agenerate
 from sotopia.generation_utils import generate as sotopia_generation
 from sotopia.messages import AgentAction
 
 from talktopia.models.config import CONFIRMATION_TTS_TAG as BACKCHANNEL_TTS_TEXT
-from talktopia.speech_agent import resolve_recipient_names
+from talktopia.speech_agent import prepare_tts_text, resolve_recipient_names
 
 from .actions import (
     DuplexActionDecision,
@@ -110,6 +116,14 @@ class _JointAction(AgentAction):
                 raise ValueError(f"{self.action_type} requires an empty argument")
         else:
             _validate_generated_text(self.argument, field_name="argument")
+            if self.action_type in {
+                "speak",
+                "hesitation",
+                "correction",
+                "interruption",
+            }:
+                if not prepare_tts_text(self.argument):
+                    raise ValueError("speech argument must contain audible words")
         if (
             info.context is not None
             and self.action_type in {"correction", "interruption"}
@@ -119,6 +133,19 @@ class _JointAction(AgentAction):
         if len(self.to) != len(set(self.to)):
             raise ValueError("duplicate recipients are not allowed")
         return self
+
+
+def _action_model(available_actions: list[DuplexActionType]) -> type[_JointAction]:
+    """Constrain both SOTOPIA requests to this observation's action mask."""
+    if not available_actions:
+        raise ValueError("An action request must have at least one available action")
+    fields: dict[str, Any] = {
+        "action_type": (Literal[tuple(available_actions)], ...),
+    }
+    if set(available_actions) <= {"none", "leave", "backchanneling"}:
+        fields["argument"] = (Literal[""], ...)
+    # A fresh subclass avoids mutating a schema used by another agent's request.
+    return create_model("Surface5Action", __base__=_JointAction, **fields)
 
 
 class Surface5ActionOutputParser(PydanticOutputParser[_JointAction]):
@@ -179,7 +206,9 @@ class DuplexGenerationEngine:
         observation: StreamingObservation,
         history: str,
     ) -> GeneratedAction:
-        parser = Surface5ActionOutputParser(pydantic_object=_JointAction)
+        parser = Surface5ActionOutputParser(
+            pydantic_object=_action_model(observation.canonical.available_actions)
+        )
         context = {
             "agent_names": [session.agent_name, session.peer_name],
             "sender": session.agent_name,
@@ -301,7 +330,10 @@ class DuplexGenerationEngine:
         return hidden
 
     def split_into_sentence_chunks(self, hidden_said: HiddenSaid) -> list[SpeechChunk]:
-        sentences = self._spoken_sentences(hidden_said.text)
+        # Match round-robin's TTS preparation, retaining the generated original
+        # in HiddenSaid and the actual synthesis input in each SpeechChunk.
+        spoken_text = prepare_tts_text(hidden_said.text)
+        sentences = self._spoken_sentences(spoken_text)
         if not sentences:
             raise ValueError("hidden said contains no sentence")
         utterance_id = hidden_said.hidden_said_id.replace("hidden-said", "utterance")
@@ -316,8 +348,8 @@ class DuplexGenerationEngine:
             )
             for index, sentence in enumerate(sentences)
         ]
-        if " ".join(chunk.text for chunk in chunks) != hidden_said.text:
-            raise AssertionError("speech chunks must reconstruct hidden said text")
+        if " ".join(chunk.text for chunk in chunks) != spoken_text:
+            raise AssertionError("speech chunks must reconstruct prepared TTS text")
         return chunks
 
     def decision_audit(self, decision_id: str) -> tuple[int, tuple[str, ...]]:

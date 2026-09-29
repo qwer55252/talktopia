@@ -83,7 +83,7 @@ completed episodes using measurement counts, rather than averaging episode means
 
 ## Prompts and evaluation
 
-The runtime loads `talktopia/full_duplex/prompts/simulation_FDB_v3.txt` directly.
+The runtime loads `talktopia/full_duplex/prompts/simulation_FDB_v4.txt` directly.
 It preserves the body of `sotopia_action_v1.txt`, including the participant's
 freedom to leave, and adds the same 40-word and recipient instructions as the
 round-robin speech prompt plus the partial-ASR and backchannel instructions.
@@ -91,6 +91,17 @@ One request generates `action_type`, `argument`, and `to` together. The runtime
 validates the current observation and floor before allowing TTS to start, and
 checks validity again before delivery. `HiddenSaid` records that same response's
 private speech text; it is not a second LLM request.
+
+Each request uses a separate SOTOPIA action-model subclass whose JSON schema
+contains only the currently available action types. The initial request and its
+possible repair use that same schema. When all available actions require an empty
+argument, the schema constrains `argument` to the empty string as well. Runtime
+validation still checks the current floor before synthesis and delivery.
+The prompt distinguishes words spoken aloud from nonverbal action descriptions.
+As in round-robin, starred spans are removed only from TTS input; this also removes
+starred emphasis. `HiddenSaid` preserves the original generated text, while each
+sentence chunk records the prepared synthesis input. A spoken action with no
+audible text after this preparation uses the existing repair/fallback path.
 
 Generation uses SOTOPIA's structured-output parser and JSON repair, recipient
 name resolution, configured action temperature (1.0 in the pipeline), and the
@@ -130,7 +141,8 @@ The runtime settings identify `generation_mode: sotopia_single_call` and
 `history_policy: full_canonical_asr`. Code and prompt fingerprints prevent resuming
 an old run with these changes; use a new output directory and reuse its complete
 canonical manifest to repeat a scenario. Prior prompts `simulation_FDB_v1.txt`
-and `simulation_FDB_v2.txt` retain their contents. The 50-word validation limit and
+and `simulation_FDB_v2.txt`, along with `simulation_FDB_v3.txt`, retain their
+contents. The 50-word validation limit and
 DeepSeek answer-only generation remain intact. The shared engine's existing JSON
 normalization, including removal of thinking tags and extraction of JSON from
 surrounding text, applies to all joint responses.

@@ -317,3 +317,122 @@ async def test_invalid_control_argument_or_missing_target_is_repaired(
     )
     assert not generated.fallback and generated.decision.action_type == "none"
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_partial_schema_matches_mask_in_initial_and_repair_requests(monkeypatch):
+    calls = mock_completions(
+        monkeypatch,
+        [
+            {"action_type": "speak", "argument": "A premature answer.", "to": []},
+            {"action_type": "backchanneling", "argument": "", "to": []},
+        ],
+    )
+    generated = await DuplexGenerationEngine(MODEL).generate_action(
+        make_context(),
+        make_observation(
+            ["none", "backchanneling"], source="asr_partial", peer_speaking=True
+        ),
+        "The peer has not finished speaking.",
+    )
+    assert not generated.fallback
+    assert generated.decision.action_type == "backchanneling"
+    assert len(calls) == 2
+    for call in calls:
+        schema = call["response_format"]["json_schema"]["schema"]
+        assert schema["properties"]["action_type"]["enum"] == ["none", "backchanneling"]
+        assert schema["properties"]["argument"]["const"] == ""
+        prompt = call["messages"][0]["content"]
+        assert '"enum": ["none", "backchanneling"]' in prompt
+
+
+@pytest.mark.asyncio
+async def test_concurrent_masks_do_not_change_each_others_schema(monkeypatch):
+    from talktopia.full_duplex.generation import _JointAction
+
+    original = _JointAction.model_json_schema()
+    backend = importlib.import_module("sotopia.generation_utils.generate")
+    calls = []
+
+    async def complete(**kwargs):
+        calls.append(kwargs)
+        await asyncio.sleep(0)  # Both requests are alive before either completes.
+        properties = kwargs["response_format"]["json_schema"]["schema"]["properties"]
+        allowed = properties["action_type"]["enum"]
+        action = "speak" if "speak" in allowed else "backchanneling"
+        content = json.dumps(
+            dict(
+                action_type=action,
+                argument="Hello." if action == "speak" else "",
+                to=[],
+            )
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+    monkeypatch.setattr(backend, "acompletion", complete)
+    results = await asyncio.gather(
+        *[
+            DuplexGenerationEngine(MODEL).generate_action(
+                make_context(), make_observation(actions), ""
+            )
+            for actions in [["none", "speak", "leave"], ["none", "backchanneling"]]
+        ]
+    )
+    assert [r.decision.action_type for r in results] == ["speak", "backchanneling"]
+    assert all(not r.fallback for r in results)
+    assert len(calls) == 2
+    assert _JointAction.model_json_schema() == original
+    assert (
+        "const"
+        not in calls[0]["response_format"]["json_schema"]["schema"]["properties"][
+            "argument"
+        ]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action_type", ["speak", "action", "non-verbal communication"])
+async def test_stage_directions_keep_original_text_and_only_filter_speech(
+    monkeypatch, action_type
+):
+    text = "*nods* Hello. **smiles** We can meet tomorrow."
+    calls = mock_completions(
+        monkeypatch, [dict(action_type=action_type, argument=text, to=[])]
+    )
+    engine = DuplexGenerationEngine(MODEL)
+    generated = await engine.generate_action(
+        make_context(), make_observation([action_type]), ""
+    )
+    assert not generated.fallback and generated.argument == text
+    if action_type == "speak":
+        hidden = engine.make_hidden_said(make_context(), generated)
+        assert hidden.text == text
+        assert [c.text for c in engine.split_into_sentence_chunks(hidden)] == [
+            "Hello.",
+            "We can meet tomorrow.",
+        ]
+    else:
+        assert generated.decision.non_audio_argument == text
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_stage_direction_only_speech_uses_existing_repair(monkeypatch):
+    calls = mock_completions(
+        monkeypatch,
+        [
+            dict(action_type="speak", argument="*nods*", to=[]),
+            dict(action_type="speak", argument="Hello.", to=[]),
+        ],
+    )
+    engine = DuplexGenerationEngine(MODEL)
+    generated = await engine.generate_action(
+        make_context(), make_observation(["speak"]), ""
+    )
+    assert not generated.fallback and generated.argument == "Hello."
+    assert len(calls) == 2
+    assert (
+        "audible words" in engine.decision_audit(generated.decision.decision_id)[1][0]
+    )
