@@ -26,6 +26,10 @@ from talktopia.models.config import (
     ASR_REVISION,
     CONFIRMATION_TTS_TAG,
     CONFIRMATION_TTS_DURATION_S,
+    CONFIRMATION_TARGET_RMS,
+    CONFIRMATION_MAX_GAIN,
+    CONFIRMATION_GAIN_PEAK,
+    CONFIRMATION_MIN_RMS,
     TTS_REPO,
     TTS_REVISION,
     TTS_BATCH_SIZE,
@@ -454,12 +458,43 @@ class SpeechBackend:
                 **duration_kwargs,
             )
         results = []
-        for audio in audios:
+        for item, audio in zip(requests, audios, strict=True):
             samples = self.np.asarray(audio, dtype=self.np.float32).reshape(-1)
             if not len(samples):
                 raise EmptyAudioError("OmniVoice returned empty audio")
             if not self.np.isfinite(samples).all():
                 raise RuntimeError("OmniVoice returned non-finite audio")
+            if item.text == CONFIRMATION_TTS_TAG:
+                rms = float(
+                    self.np.sqrt(self.np.mean(samples.astype(self.np.float64) ** 2))
+                )
+                if rms < CONFIRMATION_MIN_RMS:
+                    # Do not turn near-silent model output into amplified noise.
+                    raise EmptyAudioError(
+                        f"OmniVoice confirmation is near-silent (RMS={rms:.6f})"
+                    )
+                peak = float(self.np.max(self.np.abs(samples)))
+                # Boost the whole clip uniformly; the peak ceiling limits only
+                # added gain. Already-loud confirmations retain their waveform.
+                gain = max(
+                    1.0,
+                    min(
+                        CONFIRMATION_TARGET_RMS / rms,
+                        CONFIRMATION_MAX_GAIN,
+                        CONFIRMATION_GAIN_PEAK / peak,
+                    ),
+                )
+                samples = samples * gain
+                logging.info(
+                    "Confirmation volume: voice=%s seed=%s rms_before=%.6f "
+                    "rms_after=%.6f gain=%.6f peak_after=%.6f",
+                    item.voice_id,
+                    item.seed,
+                    rms,
+                    rms * gain,
+                    gain,
+                    peak * gain,
+                )
             pcm = (self.np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
             result = io.BytesIO()
             with wave.open(result, "wb") as wav:

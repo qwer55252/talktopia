@@ -111,8 +111,17 @@ voice. The tag is TTS input, not recognized speech. Backchannels with this tag u
 OmniVoice's [`duration=0.6` generation parameter](https://github.com/k2-fsa/OmniVoice/blob/main/docs/generation-parameters.md)
 uniformly across
 voices; the actual delivered duration is measured and may differ. Ordinary
-speech keeps its existing generation defaults. This adds no waveform cropping
-or amplitude adjustment. The input and duration are recorded in `backchannel_tts`.
+speech keeps its existing generation defaults and PCM encoding. Before encoding
+the exact confirmation tag's output, the speech server raises quiet backchannels
+toward a whole-clip RMS of 0.05 (about -26 dBFS), using one constant gain per clip.
+Gain is at most 8 (about +18 dB) and is further limited so amplification does not
+raise the peak above 0.8. Already-loud clips are unchanged, including those with
+an original peak above 0.8. There is no cropping or per-frame gain adjustment.
+The same adjusted PCM is delivered to the peer and saved in the live recording.
+Inputs below RMS 0.001 are treated as empty audio and use the existing two-attempt
+TTS retry, rather than amplifying near-silence. The input, duration, and volume
+policy are recorded in `backchannel_tts`; the speech server logs actual RMS,
+gain, and peak for each synthesized confirmation. This applies to new audio only.
 Delivered backchannels with empty ASR are retained as nonverbal actions with their measured interval and
 `[no recognized words]`; the raw ASR and transcript text remain empty. An empty
 TTS result produces no committed backchannel and no latency sample.

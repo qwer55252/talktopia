@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from talktopia.experiment import UNCOUNTED_ACTIONS
+from talktopia.models.config import confirmation_tts_settings
 
 import asyncio
 import hashlib
@@ -24,8 +25,6 @@ from .actions import (
 from .agent import ActiveUtterance, AgentOutput, CascadedDuplexAgent
 from .audio import AudioChunk, AudioRouter, StereoWavWriter
 from .config import (
-    CONFIRMATION_TTS_DURATION_S,
-    CONFIRMATION_TTS_TAG,
     RuntimeConfig,
     SIMULATION_PROMPT_VERSION,
 )
@@ -491,10 +490,7 @@ class DuplexRuntime:
                 "allow_backchannels": self.config.allow_backchannels,
                 "allow_corrections": self.config.allow_corrections,
                 "allow_interruptions": self.config.allow_interruptions,
-                "backchannel_tts": {
-                    "input": CONFIRMATION_TTS_TAG,
-                    "duration_s": CONFIRMATION_TTS_DURATION_S,
-                },
+                "backchannel_tts": confirmation_tts_settings(),
                 "seed": self.seed,
                 "max_turns": self.config.max_turns,
             },

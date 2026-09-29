@@ -4,7 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from talktopia.models.config import CONFIRMATION_TTS_DURATION_S, CONFIRMATION_TTS_TAG
+from talktopia.models.config import confirmation_tts_settings
+
 
 class RuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -61,8 +62,5 @@ def runtime_settings(max_turns: int = 12, **options) -> dict:
         "simulation_prompt": SIMULATION_PROMPT_VERSION,
         "evaluation_prompt": "evaluation_FDB_v1",
         "temporal_evaluation": "sentence_asr_delivery_v1",
-        "backchannel_tts": {
-            "input": CONFIRMATION_TTS_TAG,
-            "duration_s": CONFIRMATION_TTS_DURATION_S,
-        },
+        "backchannel_tts": confirmation_tts_settings(),
     }
