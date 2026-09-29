@@ -34,6 +34,7 @@ from .config import (
     ASR_REPO,
     ASR_REVISION,
     ASR_WITHOUT_TIMESTAMPS,
+    ASR_VAD_MODE,
     TTS_REPO,
     TTS_REVISION,
     default_ollama_models,
@@ -62,6 +63,7 @@ def speech_health(
         or data.get("database") != str(database_path())
         or data.get("asr_revision") != ASR_REVISION
         or data.get("asr_without_timestamps") is not ASR_WITHOUT_TIMESTAMPS
+        or data.get("asr_vad_mode") != ASR_VAD_MODE
         or data.get("tts_revision") != TTS_REVISION
         or data.get("gpu") != spec["gpu"]
         or data.get("tts_batch_size") != TTS_BATCH_SIZE
@@ -215,6 +217,7 @@ def create_speech_app(backend: Any = None, db: Path | None = None) -> Any:
             asr_model=ASR_REPO,
             asr_revision=ASR_REVISION,
             asr_without_timestamps=ASR_WITHOUT_TIMESTAMPS,
+            asr_vad_mode=ASR_VAD_MODE,
             tts_model=TTS_REPO,
             tts_revision=TTS_REVISION,
         )

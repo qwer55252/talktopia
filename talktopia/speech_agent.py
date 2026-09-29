@@ -530,9 +530,9 @@ class SpeechBackend:
             )
             if not timestamps:
                 return ""
-            samples = self.np.concatenate(
-                [samples[item["start"] : item["end"]] for item in timestamps]
-            )
+            # VAD gates silence only. Trimming even the leading padding can
+            # cause Whisper to stop after the first sentence of a short clip.
+            # Keep the entire resampled waveform, including pauses, for ASR.
             segments, _ = self.asr.transcribe(
                 samples,
                 language="en",

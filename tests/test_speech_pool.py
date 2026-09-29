@@ -167,9 +167,8 @@ def test_shared_asr_uses_text_only_decoding_without_changing_pcm():
         return spans
 
     def transcribe(samples, **kwargs):
-        np.testing.assert_array_equal(
-            samples, np.concatenate([expected[100:700], expected[900:2200]])
-        )
+        # Both sentences and all leading/intermediate/trailing PCM survive VAD.
+        np.testing.assert_array_equal(samples, expected)
         assert kwargs == dict(
             language="en",
             beam_size=1,
@@ -193,7 +192,7 @@ def test_shared_asr_uses_text_only_decoding_without_changing_pcm():
     assert (
         settings("round-robin")["asr_decoding"]
         == settings("surface5-full-duplex")["asr_decoding"]
-        == {"without_timestamps": True}
+        == {"without_timestamps": True, "vad_mode": "speech_presence_only"}
     )
     backend.get_speech_timestamps = lambda *args, **kwargs: []
     backend.asr.transcribe = lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -213,8 +212,9 @@ def test_speech_health_publishes_and_checks_decoder_policy(monkeypatch, tmp_path
     backend = SimpleNamespace(voices={})
     with TestClient(servers.create_speech_app(backend=backend, db=tmp_path)) as client:
         health = client.get("/health").json()
-    assert health["speech_protocol"] == SPEECH_PROTOCOL == "surface5-http-v4"
+    assert health["speech_protocol"] == SPEECH_PROTOCOL == "surface5-http-v5"
     assert health["asr_without_timestamps"] is True
+    assert health["asr_vad_mode"] == "speech_presence_only"
     monkeypatch.setattr(servers, "database_path", lambda: tmp_path)
     monkeypatch.setattr(servers, "get_json", lambda *args, **kwargs: health)
     assert servers.speech_health()["asr_without_timestamps"] is True
@@ -222,5 +222,12 @@ def test_speech_health_publishes_and_checks_decoder_policy(monkeypatch, tmp_path
     with pytest.raises(ValueError, match="Incompatible speech service"):
         servers.speech_health()
     health.pop("asr_without_timestamps")
+    with pytest.raises(ValueError, match="Incompatible speech service"):
+        servers.speech_health()
+    health["asr_without_timestamps"] = True
+    health["asr_vad_mode"] = "trim_and_concatenate"
+    with pytest.raises(ValueError, match="Incompatible speech service"):
+        servers.speech_health()
+    health.pop("asr_vad_mode")
     with pytest.raises(ValueError, match="Incompatible speech service"):
         servers.speech_health()

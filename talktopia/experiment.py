@@ -8,7 +8,7 @@ import os
 from collections import Counter
 from pathlib import Path
 
-from talktopia.models.config import ASR_WITHOUT_TIMESTAMPS, REPO_ROOT
+from talktopia.models.config import ASR_VAD_MODE, ASR_WITHOUT_TIMESTAMPS, REPO_ROOT
 
 INTERACTION_MODES = ("round-robin", "surface5-full-duplex")
 MAX_TURNS = 12
@@ -27,7 +27,10 @@ def settings(mode: str) -> dict:
         "opener": "agent1",
         "prompt_max_words": 40,
         "validated_max_words": 50 if mode == "surface5-full-duplex" else None,
-        "asr_decoding": {"without_timestamps": ASR_WITHOUT_TIMESTAMPS},
+        "asr_decoding": {
+            "without_timestamps": ASR_WITHOUT_TIMESTAMPS,
+            "vad_mode": ASR_VAD_MODE,
+        },
     }
 
 

@@ -142,10 +142,19 @@ The shared speech API uses `without_timestamps=True` when decoding Whisper text.
 In a recorded 3.63-second utterance, timestamp-token decoding reproducibly added
 unrelated repeated text; the same PCM and VAD preprocessing decoded correctly
 with only this option changed. This reduces that observed failure without
-guaranteeing error-free ASR. The ASR model, VAD, sampling, and full-utterance
-recognition policy remain unchanged. Round-robin and Surface5 both record the
-option under `experiment.asr_decoding`; speech protocol v4 and the health flag
-prevent reuse of an older server. All evaluation timestamps still come from
+guaranteeing error-free ASR. Silero VAD now checks only whether speech is present;
+Whisper receives the complete resampled PCM, including leading padding and pauses.
+In a separate recorded two-sentence utterance, the former VAD trimming caused
+Whisper to return only the first sentence in eight replays. Keeping the original
+waveform restored both sentences in all eight, without changing the decoder or
+providing reference text. VAD detected both sentences; the words were lost during
+decoding, not removed by VAD. This does not guarantee error-free recognition.
+The ASR model, sampling, and full-utterance recognition policy remain unchanged.
+Round-robin and Surface5 both record these settings under
+`experiment.asr_decoding`; speech protocol v5 and health flags prevent reuse of
+an older server. Future runs in both modes use this shared policy; previous runs
+used different preprocessing and should not be treated as identical conditions.
+All evaluation timestamps still come from
 measured audio delivery, not the ASR decoder. Historical recordings and
 transcripts are not rewritten.
 
