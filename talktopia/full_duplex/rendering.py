@@ -14,10 +14,10 @@ _AUDIBLE_ACTION_TYPES = frozenset(
 )
 
 
-def _timestamp(timestamp_ms: int | None) -> str:
+def _timestamp(timestamp_ms: float | None) -> str:
     if timestamp_ms is None:
         return "--:--.---"
-    minutes, remainder = divmod(timestamp_ms, 60_000)
+    minutes, remainder = divmod(round(timestamp_ms), 60_000)
     seconds, milliseconds = divmod(remainder, 1_000)
     return f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
 

@@ -12,7 +12,7 @@ from test_duplex_episode import profiles as profiles
 
 
 @pytest.mark.asyncio
-async def test_both_modes_use_the_same_scoring_prompt_and_settings(
+async def test_round_robin_preserves_the_original_scoring_prompt_and_settings(
     profiles, tmp_path, monkeypatch
 ):
     calls = []
@@ -32,7 +32,6 @@ async def test_both_modes_use_the_same_scoring_prompt_and_settings(
     monkeypatch.setattr(evaluator, "EpisodeLLMEvaluator", Judge)
     for mode, agent_class in [
         ("round-robin", "CascadedSpeechAgent"),
-        ("surface5-full-duplex", "CascadedDuplexAgent"),
     ]:
         source = EpisodeLog(
             environment=profiles["env_id"],
@@ -72,7 +71,9 @@ async def test_both_modes_use_the_same_scoring_prompt_and_settings(
         assert summary["interaction_mode"] == mode and summary["status"] == "completed"
         evaluated = json.loads((out / summary["original"]).read_text())
         assert evaluated["messages"] == json.loads(source.model_dump_json())["messages"]
-    assert calls[0] == calls[1]
+    assert len(calls) == 1
+    assert "Timing evidence" not in calls[0]["history"]
+    assert "[00:" not in calls[0]["history"]
     assert calls[0]["temperature"] == 0.0 and calls[0]["num_agents"] == 2
 
 

@@ -93,6 +93,7 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         self._decision_observations: dict[str, StreamingObservation] = {}
         self._backchannel_index = 0
         self._received_finals: dict[str, ASRUpdate] = {}
+        self._finalization_tasks: dict[str, asyncio.Task[ASRUpdate]] = {}
 
     def act(self, obs: DuplexObservation) -> DuplexAction:
         del obs
@@ -115,6 +116,7 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         self._background_changed = asyncio.Event()
         self._incoming_utterances.clear()
         self._received_finals.clear()
+        self._finalization_tasks.clear()
         self._recent_turns.clear()
         self._decision_observations.clear()
         self._backchannel_index = 0
@@ -155,11 +157,30 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
             await self.asr.start_utterance(frame.utterance_id, self.agent_name)
             self._incoming_utterances.add(frame.utterance_id)
         await self.asr.push_audio(frame)
-        if frame.is_utterance_end:
-            final = await self.asr.finish_utterance(frame.utterance_id)
-            self._incoming_utterances.remove(frame.utterance_id)
-            self._received_finals[frame.utterance_id] = final
-            await self._outputs.put(final)
+
+    def finish_received_audio(
+        self, utterance_id: str, *, cancelled: bool = False
+    ) -> None:
+        """Finalize recognition in the background after the last frame is delivered."""
+        if utterance_id in self._finalization_tasks:
+            raise ValueError("Audio was already finalized")
+        self._finalization_tasks[utterance_id] = self._track_background_task(
+            "final_asr",
+            asyncio.create_task(
+                self._finish_received_audio(utterance_id, cancelled=cancelled),
+                name=f"surface5-asr-final-{utterance_id}",
+            ),
+        )
+
+    async def _finish_received_audio(
+        self, utterance_id: str, *, cancelled: bool
+    ) -> ASRUpdate:
+        finalize = self.asr.cancel_utterance if cancelled else self.asr.finish_utterance
+        final = await finalize(utterance_id)
+        self._incoming_utterances.remove(utterance_id)
+        self._received_finals[utterance_id] = final
+        await self._outputs.put(final)
+        return final
 
     async def cancel_received_audio(self, utterance_id: str) -> ASRUpdate:
         self._require_active()
@@ -171,6 +192,8 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         return final
 
     async def finalize_received_audio(self, utterance_id: str) -> ASRUpdate | None:
+        if utterance_id in self._finalization_tasks:
+            return await self._finalization_tasks[utterance_id]
         if utterance_id in self._received_finals:
             return self._received_finals[utterance_id]
         if utterance_id in self._incoming_utterances:
@@ -288,6 +311,10 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
             self._decision_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._decision_task
+        for task in self._finalization_tasks.values():
+            task.cancel()
+        await asyncio.gather(*self._finalization_tasks.values(), return_exceptions=True)
+        self._finalization_tasks.clear()
         await self.asr.close()
         if self._asr_relay_task is not None and not self._asr_relay_task.done():
             with suppress(asyncio.CancelledError):
@@ -404,12 +431,12 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         if not self.state.session_active:
             raise RuntimeError("agent session is not active")
 
-    def _track_background_task(
+    def _track_background_task[T](
         self,
         role: str,
-        task: asyncio.Task[None],
-    ) -> asyncio.Task[None]:
-        def record_completion(completed: asyncio.Task[None]) -> None:
+        task: asyncio.Task[T],
+    ) -> asyncio.Task[T]:
+        def record_completion(completed: asyncio.Task[T]) -> None:
             if not completed.cancelled():
                 error = completed.exception()
                 if error is not None:

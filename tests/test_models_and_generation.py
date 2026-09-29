@@ -92,8 +92,11 @@ async def test_generation_keeps_decision_and_hidden_text_as_separate_calls(
     assert decision_schema["properties"]["action_type"]["enum"] == ["speak"]
     assert set(decision_schema["properties"]) == {"action_type"}
     assert "peer_utterance_id" not in calls[0]["input_values"]["observation"]
-    assert "Copy action_type character-for-character" in calls[0]["template"]
-    assert "if no listed intervention is clearly useful" in calls[0]["template"]
+    assert (
+        "Choose one action from the available list, using its exact spelling."
+        in calls[0]["template"]
+    )
+    assert 'normally choose "none"' in calls[0]["template"]
     assert calls[1]["structured_output"] is False
     assert len(calls) == 2
 

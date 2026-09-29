@@ -143,31 +143,31 @@ def duplex_history(
 ) -> tuple[list, list[str]]:
     if source.agent_classes and set(source.agent_classes) != {"CascadedDuplexAgent"}:
         raise ValueError("Surface5 evaluation requires full-duplex agents")
-    if events_path is not None:
-        from talktopia.full_duplex.events import (
-            ActionCommitted,
-            EpisodeStarted,
-            read_events,
+    if events_path is None:
+        raise ValueError(
+            "Surface5 temporal evaluation requires its event journal and recorded audio"
         )
-        from talktopia.full_duplex.rendering import render_sotopia_messages
-        from talktopia.full_duplex.transcript import TranscriptBuilder
+    from talktopia.full_duplex.events import (
+        ActionCommitted,
+        EpisodeStarted,
+        read_events,
+    )
+    from talktopia.full_duplex.rendering import render_sotopia_messages
+    from talktopia.full_duplex.transcript import TranscriptBuilder
+    from .temporal import timed_messages, validate_timing
 
-        events = read_events(events_path)
-        starts = [event for event in events if isinstance(event, EpisodeStarted)]
-        if len(starts) != 1:
-            raise ValueError("Expected one episode start event")
-        messages = render_sotopia_messages(
-            starts[0].initial_observations,
-            [event for event in events if isinstance(event, ActionCommitted)],
-            TranscriptBuilder.from_events(events).build(),
-        )
-        if messages != source.messages:
-            raise ValueError(
-                "Saved Surface5 messages differ from committed ASR evidence"
-            )
-    # Older standalone EpisodeLogs may not have sidecars. Their stored messages
-    # remain the evidence; generated text is never substituted for ASR text.
-    return source.render_for_humans()
+    events = read_events(events_path)
+    validate_timing(events, events_path, source)
+    start = next(event for event in events if isinstance(event, EpisodeStarted))
+    commits = [event for event in events if isinstance(event, ActionCommitted)]
+    entries = TranscriptBuilder.from_events(events).build()
+    messages = render_sotopia_messages(start.initial_observations, commits, entries)
+    if messages != source.messages:
+        raise ValueError("Saved Surface5 messages differ from committed ASR evidence")
+    timed = source.model_copy(
+        update={"messages": timed_messages(source, commits, entries, events)}
+    )
+    return timed.render_for_humans()
 
 
 async def evaluate_episode(
@@ -240,6 +240,23 @@ async def evaluate_episode(
             else:
                 events_path = None
             profiles, turns = duplex_history(source, events_path)
+            audio_path = (
+                events_path.parent.parent
+                / "audio"
+                / events_path.stem
+                / "conversation.wav"
+            )
+            audio_hash = file_hash(audio_path)
+            expected_audio_hash = getattr(
+                args, "source_conversation_audio_sha256", None
+            )
+            if expected_audio_hash and audio_hash != expected_audio_hash:
+                raise ValueError("Source audio changed since evaluation was prepared")
+            summary.update(
+                source_conversation_audio=str(audio_path),
+                source_conversation_audio_sha256=audio_hash,
+                temporal_evaluation="sentence_asr_delivery_v1",
+            )
         else:
             raise ValueError(f"Unknown evaluation mode: {args.interaction_mode}")
         names = [
@@ -262,6 +279,10 @@ async def evaluate_episode(
             + EVALUATION_EVIDENCE_INSTRUCTION
             + f"\nAgent mapping: agent_1 is {names[0]}; agent_2 is {names[1]}."
         )
+        if args.interaction_mode == "surface5-full-duplex":
+            from .temporal import TEMPORAL_INSTRUCTION
+
+            history += "\n\n" + TEMPORAL_INSTRUCTION
         history_path = artifact_dir / "evaluation/history" / f"{episode_id}.txt"
         history_path.parent.mkdir(parents=True, exist_ok=True)
         history_path.write_text(history, encoding="utf-8")

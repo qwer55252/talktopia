@@ -1,0 +1,24 @@
+Timing evidence for this Surface5 interaction:
+The timestamps are elapsed wall-clock times on a shared, recorded audio timeline.
+They include ASR, language-model, and speech-generation waiting time. Each
+sentence interval is tied to the PCM delivered to the listener and its ASR text.
+An utterance's sentence details describe that same action; do not count them as
+additional turns. ASR sentence boundaries and wording may differ from whole-
+utterance recognition. Use received speech as evidence, not generated text.
+The committed whole-utterance ASR is the message made available to the listening
+agent; use it to assess meaning, agreement, and goal attainment. Sentence ASR
+provides supporting timing context. Do not treat differences between these two
+recognitions as a participant changing their story or contradicting themselves.
+
+Use the intervals to identify pauses, response timing, and overlapping speech.
+Commit order can differ from speaking order; compare timestamps when determining
+who was speaking or listening. A backchannel can overlap the speaker without
+interrupting them or transferring the floor. An acknowledgment alone does not
+establish agreement, acceptance of an offer, or completion of a social goal.
+
+Consider timing when it supports an existing scoring dimension, and cite the
+relevant intervals in your explanation. Preserve the original seven dimensions
+and their score ranges. Do not award a score simply because a backchannel occurs,
+or infer rudeness, disinterest, or intent from a processing delay alone. Timing
+cannot establish financial gain, goal attainment, or other outcomes without
+supporting conversational evidence.

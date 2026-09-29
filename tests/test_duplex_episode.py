@@ -23,6 +23,7 @@ from talktopia.full_duplex.config import RuntimeConfig
 from talktopia.full_duplex.episode import run_with_timeout
 from talktopia.full_duplex.events import ActionCommitted, EpisodeEnded, read_events
 from talktopia.full_duplex.generation import AgentSessionContext, DuplexGenerationEngine
+from talktopia.full_duplex.speech_backends import WindowedASR
 from talktopia.speech_agent import AgentProfile
 
 
@@ -120,6 +121,13 @@ async def test_http_episode_limits_and_audible_history(
     count = 0
     intervened = False
     histories = []
+    original_cancel_asr = WindowedASR.cancel_utterance
+
+    async def slow_cancel_asr(self, utterance_id):
+        await asyncio.sleep(0.35)
+        return await original_cancel_asr(self, utterance_id)
+
+    monkeypatch.setattr(WindowedASR, "cancel_utterance", slow_cancel_asr)
 
     async def fake_generation(**kwargs):
         nonlocal count, intervened
@@ -142,10 +150,13 @@ async def test_http_episode_limits_and_audible_history(
         episode_module,
         "RuntimeConfig",
         lambda **kw: RuntimeConfig(
-            **kw,
-            realtime=False,
-            correction_min_stable_words=2,
-            interruption_min_stable_words=2,
+            **{
+                **kw,
+                "allow_corrections": intervention == "correction",
+                "allow_interruptions": intervention == "interruption",
+                "correction_min_stable_words": 2,
+                "interruption_min_stable_words": 2,
+            }
         ),
     )
     args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
@@ -209,6 +220,25 @@ async def test_http_episode_limits_and_audible_history(
             event.event_type == "speech_lifecycle" and event.phase == "cancelled"
             for event in events
         )
+        cancelled = next(
+            event
+            for event in events
+            if event.event_type == "speech_lifecycle" and event.phase == "cancelled"
+        )
+        final = next(
+            event
+            for event in events
+            if event.event_type == "asr_update"
+            and event.utterance_id == cancelled.utterance_id
+            and event.is_final
+        )
+        assert any(
+            cancelled.timestamp_ms < span["start_ms"] < final.timestamp_ms
+            for event in events
+            if event.event_type == "audio_delivered"
+            and event.utterance_id != cancelled.utterance_id
+            for span in event.frame_spans
+        )
 
 
 @pytest.mark.asyncio
@@ -228,7 +258,7 @@ async def test_exactly_twelve_commits_with_continuing_agents(
     monkeypatch.setattr(
         episode_module,
         "RuntimeConfig",
-        lambda **kw: RuntimeConfig(**kw, realtime=False),
+        lambda **kw: RuntimeConfig(**kw),
     )
     args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
     args.tag = "test-duplex"

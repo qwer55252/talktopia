@@ -37,6 +37,7 @@ from .events import (
     SpeechChunkSynthesized,
     SpeechLifecycleEvent,
     SpeechSynthesisFailed,
+    ResponseLatencyEvent,
 )
 from .generation import GenerationFailure
 from .sotopia_adapter import (
@@ -84,10 +85,10 @@ class DeferredObservation:
 @dataclass(slots=True)
 class RuntimeState:
     episode_id: str
-    now_ms: int
+    now_ms: float
     opener_agent: str
     floor_utterances: dict[str, str] = field(default_factory=dict)
-    next_floor_available_ms: int = 0
+    next_floor_available_ms: float = 0
     active_utterances: dict[str, str] = field(default_factory=dict)
     left_agents: set[str] = field(default_factory=set)
     latest_observations: dict[str, StreamingObservation] = field(default_factory=dict)
@@ -120,7 +121,7 @@ class RuntimeLivenessSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     episode_id: str
-    now_ms: int
+    now_ms: float
     leave_phase: LeavePhase
     stopping: bool
     audio_pending: bool
@@ -136,12 +137,15 @@ class RuntimeLivenessSnapshot(BaseModel):
 class FloorController:
     """Pure floor policy over the single mutable ``RuntimeState``."""
 
-    def __init__(self, *, minimum_gap_ms: int = 200) -> None:
+    def __init__(
+        self, *, minimum_gap_ms: int = 200, config: RuntimeConfig | None = None
+    ) -> None:
         if minimum_gap_ms < 0:
             raise ValueError("minimum_gap_ms must be non-negative")
         self.minimum_gap_ms = minimum_gap_ms
+        self.config = config or RuntimeConfig()
 
-    def available_actions(
+    def _available_actions(
         self,
         agent: str,
         state: RuntimeState,
@@ -191,6 +195,19 @@ class FloorController:
             "leave",
             "hesitation",
         ]
+
+    def available_actions(
+        self, agent: str, state: RuntimeState
+    ) -> list[DuplexActionType]:
+        allowed = self._available_actions(agent, state)
+        disabled = set()
+        if not self.config.allow_backchannels:
+            disabled.add("backchanneling")
+        if not self.config.allow_corrections:
+            disabled.add("correction")
+        if not self.config.allow_interruptions:
+            disabled.add("interruption")
+        return [action for action in allowed if action not in disabled]
 
     def reserve(
         self,
@@ -309,10 +326,11 @@ class _UtteranceRuntime:
 @dataclass(slots=True)
 class _ChunkDelivery:
     planned_frames: int
-    start_ms: int | None = None
-    end_ms: int | None = None
+    start_ms: float | None = None
+    end_ms: float | None = None
     delivered_frames: int = 0
     pcm: bytearray = field(default_factory=bytearray)
+    frame_spans: list[dict] = field(default_factory=list)
 
 
 class TurnLimitReached(Exception):
@@ -358,7 +376,9 @@ class DuplexRuntime:
             now_ms=0,
             opener_agent=opener,
         )
-        self.floor = FloorController(minimum_gap_ms=config.minimum_floor_gap_ms)
+        self.floor = FloorController(
+            minimum_gap_ms=config.minimum_floor_gap_ms, config=config
+        )
         self._snapshot: SemanticSnapshot | None = None
         self._pending_decisions: dict[str, DuplexActionDecision] = {}
         self._decision_observations: dict[str, StreamingObservation] = {}
@@ -380,6 +400,56 @@ class DuplexRuntime:
         self._audio_finished_utterances: set[str] = set()
         self._closed_deliveries: set[tuple[str, int]] = set()
         self._discarded_decisions: set[str] = set()
+        self._audio_task: asyncio.Task[None] | None = None
+        self._audio_stopping = False
+        self._audio_end_ms: dict[str, float] = {}
+        self.latencies: dict[str, list[float]] = {
+            "normal_response": [],
+            "backchannel": [],
+        }
+
+    @property
+    def now_ms(self) -> float:
+        self.state.now_ms = self.event_writer.now_ms()
+        return self.state.now_ms
+
+    def latency_summary(self) -> dict:
+        return {
+            kind: {
+                "count": len(values),
+                "mean_ms": sum(values) / len(values) if values else None,
+            }
+            for kind, values in self.latencies.items()
+        }
+
+    async def _pump_audio(self) -> None:
+        while not self._audio_stopping:
+            if self.audio_router.has_pending():
+                await self.tick_audio()
+            else:
+                self.stereo_writer.silence_until(self.now_ms)
+                await asyncio.sleep(self.frame_ms / 1000)
+
+    async def _stop_audio(self, *, check_errors: bool = True) -> None:
+        self._audio_stopping = True
+        if self._audio_task is not None:
+            # Drain the currently transmitted frame (at most one frame period).
+            # Never retain a recorded frame with no completed delivery timestamp.
+            task = self._audio_task
+            drain = asyncio.gather(task, return_exceptions=True)
+            cancellation = None
+            while not drain.done():
+                try:
+                    await asyncio.shield(drain)
+                except asyncio.CancelledError as error:
+                    cancellation = error
+            self._audio_task = None
+            if cancellation is not None:
+                self.stereo_writer.silence_until(self.now_ms)
+                raise cancellation
+            if check_errors and not task.cancelled():
+                task.result()
+        self.stereo_writer.silence_until(self.now_ms)
 
     async def run(self, initial_snapshot: SemanticSnapshot) -> EpisodeEnded:
         self._snapshot = initial_snapshot
@@ -400,7 +470,7 @@ class DuplexRuntime:
         self.state.latest_observations.update(initial_streams)
         self.event_writer.emit(
             EpisodeStarted,
-            self.state.now_ms,
+            self.now_ms,
             environment_id=str(self.resolved.env_profile.pk or ""),
             agent_ids=tuple(
                 str(profile.pk or "") for profile in self.resolved.agent_profiles
@@ -414,6 +484,12 @@ class DuplexRuntime:
                 "opener_policy": "agent1",
                 "minimum_floor_gap_ms": self.config.minimum_floor_gap_ms,
                 "realtime": self.config.realtime,
+                "clock": "monotonic_elapsed_ms",
+                "audio_capture": "live_delivered_pcm_v2",
+                "simulation_prompt": "simulation_v2.1",
+                "allow_backchannels": self.config.allow_backchannels,
+                "allow_corrections": self.config.allow_corrections,
+                "allow_interruptions": self.config.allow_interruptions,
                 "seed": self.seed,
                 "max_turns": self.config.max_turns,
             },
@@ -422,39 +498,39 @@ class DuplexRuntime:
             await self._agents[self.state.opener_agent].submit_observation(
                 initial_streams[self.state.opener_agent]
             )
+            self._audio_task = asyncio.create_task(
+                self._pump_audio(), name="surface5-live-audio"
+            )
             while self.state.leave_phase != "completed":
-                if self.audio_router.has_pending():
-                    ready = self._try_next_output()
-                    if ready is not None:
-                        await self.handle_agent_output(*ready)
-                    await self.tick_audio()
-                else:
-                    agent_name, output = await self._next_output()
-                    await self.handle_agent_output(agent_name, output)
+                agent_name, output = await self._next_output()
+                await self.handle_agent_output(agent_name, output)
+            await self._stop_audio()
             # The episode runner writes the terminal event after saving artifacts.
             # Evaluation is a separate Talktopia stage.
             ended = EpisodeEnded(
                 event_id=f"{self.state.episode_id}-runtime-completed",
                 episode_id=self.state.episode_id,
                 sequence=0,
-                timestamp_ms=self.state.now_ms,
+                timestamp_ms=self.now_ms,
                 status="completed",
                 reason="explicit_leave_handshake",
-                duration_ms=self.state.now_ms,
+                duration_ms=self.now_ms,
             )
             return ended
         except TurnLimitReached:
+            await self._stop_audio()
             await self._stop_at_turn_limit()
             return EpisodeEnded(
                 event_id=f"{self.state.episode_id}-runtime-completed",
                 episode_id=self.state.episode_id,
                 sequence=0,
-                timestamp_ms=self.state.now_ms,
+                timestamp_ms=self.now_ms,
                 status="completed",
                 reason="max_turns",
-                duration_ms=self.state.now_ms,
+                duration_ms=self.now_ms,
             )
         except BaseException as error:
+            await self._stop_audio(check_errors=False)
             reason = (
                 "external_cancellation"
                 if isinstance(error, asyncio.CancelledError)
@@ -463,10 +539,28 @@ class DuplexRuntime:
             self._record_stopped_audio(reason)
             raise
         finally:
+            await self._stop_audio(check_errors=False)
             await self._cancel_output_waiters()
 
     async def handle_agent_output(self, agent: str, output: AgentOutput) -> None:
         if isinstance(output, DuplexActionDecision):
+            if (
+                (
+                    output.action_type == "correction"
+                    and not self.config.allow_corrections
+                )
+                or (
+                    output.action_type == "interruption"
+                    and not self.config.allow_interruptions
+                )
+                or (
+                    output.action_type == "backchanneling"
+                    and not self.config.allow_backchannels
+                )
+            ):
+                raise ValueError(
+                    f"Action disabled for this experiment: {output.action_type}"
+                )
             observation = self._agents[agent].decision_observation(output.decision_id)
             attempt, validation_errors = self._agents[agent].generation.decision_audit(
                 output.decision_id
@@ -477,7 +571,7 @@ class DuplexRuntime:
             ):
                 self.event_writer.emit(
                     DecisionEvent,
-                    self.state.now_ms,
+                    self.now_ms,
                     status="rejected",
                     agent=agent,
                     decision_id=output.decision_id,
@@ -490,7 +584,7 @@ class DuplexRuntime:
             if latest.canonical.observation_id != observation.canonical.observation_id:
                 self.event_writer.emit(
                     DecisionEvent,
-                    self.state.now_ms,
+                    self.now_ms,
                     status="stale",
                     agent=agent,
                     decision_id=output.decision_id,
@@ -505,7 +599,7 @@ class DuplexRuntime:
             self._decision_observations[output.decision_id] = observation
             self.event_writer.emit(
                 DecisionEvent,
-                self.state.now_ms,
+                self.now_ms,
                 status="selected",
                 agent=agent,
                 decision_id=output.decision_id,
@@ -513,6 +607,13 @@ class DuplexRuntime:
                 decision=output,
                 attempt=attempt,
                 validation_errors=validation_errors,
+                request_started_ms=(
+                    self._agents[agent].generation.decision_started_ns(
+                        output.decision_id
+                    )
+                    - self.event_writer.started_ns
+                )
+                / 1_000_000,
             )
             await self.commit_selected_action(agent, output)
             return
@@ -527,7 +628,7 @@ class DuplexRuntime:
             self._hidden_by_decision[output.decision_id] = output
             self.event_writer.emit(
                 HiddenSaidCreated,
-                self.state.now_ms,
+                self.now_ms,
                 agent=agent,
                 observation_id=observation.canonical.observation_id,
                 hidden_said=output,
@@ -547,13 +648,14 @@ class DuplexRuntime:
         if isinstance(output, ASRUpdate):
             event = self.event_writer.emit(
                 ASRUpdateEvent,
-                self.state.now_ms,
+                self.now_ms,
                 utterance_id=output.utterance_id,
                 listener=output.listener,
                 text=output.text,
                 is_final=output.is_final,
                 is_stable=output.is_stable,
                 revision_id=output.revision_id,
+                sentence_texts=output.sentence_texts,
             )
             self._latest_asr_event[output.utterance_id] = event
             if output.is_final:
@@ -707,70 +809,88 @@ class DuplexRuntime:
 
     async def tick_audio(self) -> None:
         frames = self.audio_router.pop_tick()
-        if not any(frame is not None for frame in frames.values()):
-            return
-        self.stereo_writer.write_tick(frames)
-        tick_start = self.state.now_ms
-        deliveries: list[tuple[str, object]] = []
-        for source, frame in frames.items():
+        for source, frame in tuple(frames.items()):
             if frame is None:
                 continue
+            utterance = self._utterances[frame.utterance_id]
+            observation = self._decision_observations[utterance.decision.decision_id]
+            if (
+                utterance.action_type == "backchanneling"
+                and not utterance.started
+                and observation.peer_utterance_id in self._audio_end_ms
+            ):
+                await self._drop_late_backchannel(frame.utterance_id)
+                frames[source] = None
+        if not any(frames.values()):
+            return
+        tick_start = self.now_ms
+        delivered = {}
+        receive_error = None
+        try:
+            for source, frame in frames.items():
+                if frame is None:
+                    continue
+                utterance = self._utterances[frame.utterance_id]
+                # This only buffers PCM and starts background decoders; it never awaits inference.
+                await self._agents[utterance.listener].receive_audio(frame)
+                delivered[source] = frame
+        except BaseException as error:
+            # Preserve only acknowledged channels if a receiver fails mid-tick.
+            receive_error = error
+        if delivered:
+            start_sample = self.stereo_writer.write_tick(
+                delivered, timestamp_ms=tick_start
+            )
+        for source, frame in delivered.items():
             utterance = self._utterances[frame.utterance_id]
             delivery = self._deliveries[(frame.utterance_id, frame.chunk_index)]
             if delivery.start_ms is None:
                 delivery.start_ms = tick_start
-            delivery.end_ms = tick_start + frame.duration_ms
             delivery.delivered_frames += 1
             delivery.pcm.extend(frame.pcm_s16le)
+            delivery.frame_spans.append(
+                {
+                    "start_ms": tick_start,
+                    "start_sample": start_sample,
+                    "samples": len(frame.pcm_s16le) // 2,
+                    "pcm_sha256": hashlib.sha256(frame.pcm_s16le).hexdigest(),
+                }
+            )
             if not utterance.started:
                 utterance.started = True
                 self.event_writer.emit(
                     SpeechLifecycleEvent,
-                    tick_start,
+                    self.now_ms,
                     phase="started",
                     utterance_id=frame.utterance_id,
                     speaker=source,
                     action_type=utterance.action_type,
                     target_utterance_id=utterance.decision.target_utterance_id,
                 )
+                self._record_latency(frame.utterance_id, tick_start)
             self._agents[source].note_audio_played(frame.utterance_id)
-            deliveries.append((utterance.listener, frame))
-        if deliveries:
-            await asyncio.gather(
-                *(
-                    self._agents[listener].receive_audio(frame)  # type: ignore[arg-type]
-                    for listener, frame in deliveries
-                )
-            )
-        for source, frame in frames.items():
-            if frame is None:
-                continue
-            delivery = self._deliveries[(frame.utterance_id, frame.chunk_index)]
-            if frame.is_chunk_end:
-                self.event_writer.emit(
-                    AudioDeliveryEvent,
-                    delivery.end_ms or tick_start,
-                    utterance_id=frame.utterance_id,
-                    source_agent=source,
-                    chunk_index=frame.chunk_index,
-                    delivered_frames=delivery.delivered_frames,
-                    planned_frames=delivery.planned_frames,
-                    start_ms=(
-                        delivery.start_ms
-                        if delivery.start_ms is not None
-                        else tick_start
-                    ),
-                    end_ms=(
-                        delivery.end_ms if delivery.end_ms is not None else tick_start
-                    ),
-                    delivered_pcm_sha256=hashlib.sha256(delivery.pcm).hexdigest(),
-                )
-                self._closed_deliveries.add((frame.utterance_id, frame.chunk_index))
-            if frame.is_utterance_end:
+        # Observe each channel's actual completion, including a short last frame.
+        lengths = sorted({len(frame.pcm_s16le) for frame in delivered.values()})
+        for length in lengths:
+            duration_ms = length / 2 * 1000 / self.sample_rate_hz
+            await asyncio.sleep(max(0, (tick_start + duration_ms - self.now_ms) / 1000))
+            frame_end = self.now_ms
+            for source, frame in delivered.items():
+                if len(frame.pcm_s16le) != length:
+                    continue
+                delivery = self._deliveries[(frame.utterance_id, frame.chunk_index)]
+                delivery.end_ms = frame_end
+                delivery.frame_spans[-1]["end_ms"] = frame_end
+                if frame.is_chunk_end:
+                    self._emit_open_delivery_prefixes(
+                        frame.utterance_id, chunk_index=frame.chunk_index
+                    )
+                if not frame.is_utterance_end:
+                    continue
                 utterance = self._utterances[frame.utterance_id]
                 self.event_writer.emit(
                     SpeechLifecycleEvent,
-                    delivery.end_ms or tick_start,
+                    self.now_ms,
                     phase="finished",
                     utterance_id=frame.utterance_id,
                     speaker=source,
@@ -778,10 +898,74 @@ class DuplexRuntime:
                     target_utterance_id=utterance.decision.target_utterance_id,
                 )
                 self._audio_finished_utterances.add(frame.utterance_id)
-        self.state.now_ms += self.frame_ms
+                self._audio_end_ms[frame.utterance_id] = frame_end
+                self._agents[utterance.listener].finish_received_audio(
+                    frame.utterance_id
+                )
+        if receive_error is not None:
+            raise receive_error
         await self._apply_pending_cancellations()
-        if self.config.realtime:
-            await asyncio.sleep(self.frame_ms / 1000)
+
+    def _record_latency(self, utterance_id: str, first_audio_ms: float) -> None:
+        utterance = self._utterances[utterance_id]
+        observation = self._decision_observations[utterance.decision.decision_id]
+        peer_id = observation.peer_utterance_id
+        if not peer_id or utterance.closing:
+            return
+        if utterance.action_type == "backchanneling":
+            kind = "backchannel"
+            origin = (
+                self._agents[utterance.speaker].generation.decision_started_ns(
+                    utterance.decision.decision_id
+                )
+                - self.event_writer.started_ns
+            ) / 1_000_000
+        elif utterance.action_type == "speak" and observation.source == "asr_final":
+            kind = "normal_response"
+            origin = self._audio_end_ms.get(peer_id)
+        else:
+            return
+        if origin is None or origin > first_audio_ms:
+            raise ValueError("Missing or invalid measured latency origin")
+        latency = first_audio_ms - origin
+        self.latencies[kind].append(latency)
+        self.event_writer.emit(
+            ResponseLatencyEvent,
+            self.now_ms,
+            kind=kind,
+            speaker=utterance.speaker,
+            utterance_id=utterance_id,
+            decision_id=utterance.decision.decision_id,
+            observation_id=observation.canonical.observation_id,
+            peer_utterance_id=peer_id,
+            origin_ms=origin,
+            first_audio_ms=first_audio_ms,
+            latency_ms=latency,
+        )
+
+    async def _drop_late_backchannel(self, utterance_id: str) -> None:
+        utterance = self._utterances[utterance_id]
+        self.audio_router.cancel(utterance_id)
+        await self._agents[utterance.speaker].cancel_speech(
+            "peer_audio_already_finished"
+        )
+        self._discarded_utterances.add(utterance_id)
+        self._discarded_decisions.add(utterance.decision.decision_id)
+        self._emit_floor(
+            self.floor.release(self.state, utterance_id, "late_backchannel_dropped")
+        )
+        self.event_writer.emit(
+            SpeechLifecycleEvent,
+            self.now_ms,
+            phase="cancelled",
+            utterance_id=utterance_id,
+            speaker=utterance.speaker,
+            action_type=utterance.action_type,
+            reason="peer_audio_already_finished",
+        )
+        self._agents[utterance.speaker].finish_speech(utterance_id)
+        self._clear_utterance_state(utterance_id, utterance)
+        await self._resume_deferred_observation(utterance.speaker)
 
     async def stop(self, reason: str) -> None:
         if not reason.strip():
@@ -804,7 +988,7 @@ class DuplexRuntime:
         pcm_duration_ms = round(len(audio.pcm_s16le) / 2 * 1000 / audio.sample_rate_hz)
         self.event_writer.emit(
             SpeechChunkSynthesized,
-            self.state.now_ms,
+            self.now_ms,
             speaker=agent,
             chunk=chunk,
             pcm_duration_ms=max(1, pcm_duration_ms),
@@ -828,7 +1012,7 @@ class DuplexRuntime:
                 return
             if (
                 not self.state.floor_utterances
-                and self.state.now_ms < self.state.next_floor_available_ms
+                and self.now_ms < self.state.next_floor_available_ms
             ):
                 await self._advance_floor_gap()
             listener = self._peer(agent)
@@ -904,7 +1088,7 @@ class DuplexRuntime:
         reason = "target_unavailable_before_floor_claim"
         self.event_writer.emit(
             DecisionEvent,
-            self.state.now_ms,
+            self.now_ms,
             status="stale",
             agent=agent,
             decision_id=decision.decision_id,
@@ -915,7 +1099,7 @@ class DuplexRuntime:
         )
         self.event_writer.emit(
             SpeechLifecycleEvent,
-            self.state.now_ms,
+            self.now_ms,
             phase="cancelled",
             utterance_id=chunk.utterance_id,
             speaker=agent,
@@ -959,7 +1143,8 @@ class DuplexRuntime:
         )
         self.event_writer.emit(
             SpeechSynthesisFailed,
-            self.state.now_ms,
+            ResponseLatencyEvent,
+            self.now_ms,
             speaker=agent,
             decision_id=decision.decision_id,
             hidden_said_id=hidden.hidden_said_id,
@@ -970,7 +1155,7 @@ class DuplexRuntime:
         )
         self.event_writer.emit(
             DecisionEvent,
-            self.state.now_ms,
+            self.now_ms,
             status="cancelled",
             agent=agent,
             decision_id=decision.decision_id,
@@ -1010,7 +1195,7 @@ class DuplexRuntime:
             self._emit_open_delivery_prefixes(utterance_id)
             self.event_writer.emit(
                 SpeechLifecycleEvent,
-                self.state.now_ms,
+                self.now_ms,
                 phase="cancelled",
                 utterance_id=utterance_id,
                 speaker=utterance.speaker,
@@ -1020,15 +1205,22 @@ class DuplexRuntime:
             )
             self._cancelled_utterances.add(utterance_id)
             self._discarded_utterances.add(utterance_id)
-            final = await self._agents[utterance.listener].cancel_received_audio(
-                utterance_id
+            self._audio_end_ms[utterance_id] = max(
+                delivery.end_ms
+                for key, delivery in self._deliveries.items()
+                if key[0] == utterance_id and delivery.end_ms is not None
             )
-            await self.handle_agent_output(utterance.listener, final)
+            self._agents[utterance.listener].finish_received_audio(
+                utterance_id, cancelled=True
+            )
 
-    def _emit_open_delivery_prefixes(self, utterance_id: str) -> None:
+    def _emit_open_delivery_prefixes(
+        self, utterance_id: str, chunk_index: int | None = None
+    ) -> None:
         for key, delivery in self._deliveries.items():
             if (
                 key[0] != utterance_id
+                or (chunk_index is not None and key[1] != chunk_index)
                 or key in self._closed_deliveries
                 or delivery.delivered_frames == 0
                 or delivery.start_ms is None
@@ -1037,7 +1229,7 @@ class DuplexRuntime:
                 continue
             self.event_writer.emit(
                 AudioDeliveryEvent,
-                self.state.now_ms,
+                self.now_ms,
                 utterance_id=utterance_id,
                 source_agent=self._utterances[utterance_id].speaker,
                 chunk_index=key[1],
@@ -1046,11 +1238,16 @@ class DuplexRuntime:
                 start_ms=delivery.start_ms,
                 end_ms=delivery.end_ms,
                 delivered_pcm_sha256=hashlib.sha256(delivery.pcm).hexdigest(),
+                frame_spans=tuple(delivery.frame_spans),
             )
             self._closed_deliveries.add(key)
 
     async def _handle_asr_partial(self, update: ASRUpdate) -> None:
-        if not update.is_stable or update.utterance_id not in self._utterances:
+        if (
+            not update.is_stable
+            or update.utterance_id not in self._utterances
+            or update.utterance_id in self._audio_end_ms
+        ):
             return
         utterance = self._utterances[update.utterance_id]
         if utterance.action_type == "backchanneling":
@@ -1069,15 +1266,22 @@ class DuplexRuntime:
             update.listener,
             -_PARTIAL_DECISION_INTERVAL_MS,
         )
-        if self.state.now_ms - last_dispatch < _PARTIAL_DECISION_INTERVAL_MS:
+        if self.now_ms - last_dispatch < _PARTIAL_DECISION_INTERVAL_MS:
             return
-        if update.listener in self.state.active_utterances.values():
+        if (
+            update.listener in self.state.active_utterances.values()
+            or self._agents[update.listener].has_pending_generation
+        ):
             return
 
         await self._discard_unstarted_superseded_speech(update.listener)
 
         available = self.floor.available_actions(update.listener, self.state)
-        available = [action for action in available if action != "leave"]
+        available = [
+            action
+            for action in available
+            if action in {"none", "backchanneling", "correction", "interruption"}
+        ]
         word_count = len(stable_text.split())
         minimums = {
             "correction": self.config.correction_min_stable_words,
@@ -1115,7 +1319,7 @@ class DuplexRuntime:
             peer_speaking=True,
         )
         self._last_dispatched_stable[update.utterance_id] = stable_text
-        self._last_partial_dispatch_ms[update.listener] = self.state.now_ms
+        self._last_partial_dispatch_ms[update.listener] = self.now_ms
         self.state.latest_observations[update.listener] = observation
         await self._agents[update.listener].submit_observation(observation)
 
@@ -1157,7 +1361,7 @@ class DuplexRuntime:
             )
             self.event_writer.emit(
                 DecisionEvent,
-                self.state.now_ms,
+                self.now_ms,
                 status="cancelled",
                 agent=agent,
                 decision_id=active.decision_id,
@@ -1177,12 +1381,9 @@ class DuplexRuntime:
         return True
 
     async def _advance_floor_gap(self) -> None:
-        silence = {name: None for name in self._agents}
-        while self.state.now_ms < self.state.next_floor_available_ms:
-            self.stereo_writer.write_tick(silence)
-            self.state.now_ms += self.frame_ms
-            if self.config.realtime:
-                await asyncio.sleep(self.frame_ms / 1000)
+        remaining = self.state.next_floor_available_ms - self.now_ms
+        if remaining > 0:
+            await asyncio.sleep(remaining / 1000)
 
     async def _commit_leave(
         self,
@@ -1246,7 +1447,7 @@ class DuplexRuntime:
         commit = SemanticCommit(
             actions=actions,
             expected_turn_number=self._snapshot.turn_number,
-            timestamp_ms=self.state.now_ms,
+            timestamp_ms=self.now_ms,
             origin=origin,
             utterance_ids={actor: utterance_id, peer: None},
             metadata=metadata,
@@ -1263,7 +1464,7 @@ class DuplexRuntime:
         commit_id = f"{self.state.episode_id}-commit-{self._commit_sequence:04d}"
         self.event_writer.emit(
             ActionCommitted,
-            self.state.now_ms,
+            self.now_ms,
             causation_id=trigger_event_id,
             commit_id=commit_id,
             turn_number=snapshot.turn_number,
@@ -1304,7 +1505,7 @@ class DuplexRuntime:
             if utterance_id not in self._audio_finished_utterances:
                 self.event_writer.emit(
                     SpeechLifecycleEvent,
-                    self.state.now_ms,
+                    self.now_ms,
                     phase="cancelled",
                     utterance_id=utterance_id,
                     speaker=utterance.speaker,
@@ -1326,7 +1527,7 @@ class DuplexRuntime:
                 if final is not None:
                     self.event_writer.emit(
                         ASRUpdateEvent,
-                        self.state.now_ms,
+                        self.now_ms,
                         **final.model_dump(),
                     )
             self._agents[utterance.speaker].finish_speech(utterance_id)
@@ -1468,7 +1669,7 @@ class DuplexRuntime:
             )
         return RuntimeLivenessSnapshot(
             episode_id=self.state.episode_id,
-            now_ms=self.state.now_ms,
+            now_ms=self.now_ms,
             leave_phase=self.state.leave_phase,
             stopping=self.state.stopping,
             audio_pending=self.audio_router.has_pending(),
@@ -1531,10 +1732,16 @@ class DuplexRuntime:
     async def _next_output(self) -> tuple[str, AgentOutput]:
         while not self._ready_outputs:
             self._ensure_output_tasks()
+            waiters = set(self._output_tasks.values())
+            if self._audio_task is not None:
+                waiters.add(self._audio_task)
             done, _pending = await asyncio.wait(
-                set(self._output_tasks.values()),
+                waiters,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if self._audio_task in done:
+                self._audio_task.result()
+                raise RuntimeError("Live audio loop ended unexpectedly")
             self._collect_output_tasks(done)
         return self._ready_outputs.popleft()
 
@@ -1582,7 +1789,7 @@ class DuplexRuntime:
                             ):
                                 self.event_writer.emit(
                                     DecisionEvent,
-                                    self.state.now_ms,
+                                    self.now_ms,
                                     status="rejected",
                                     agent=name,
                                     decision_id=decision_id,
@@ -1616,7 +1823,7 @@ class DuplexRuntime:
     def _emit_floor(self, policy_event: FloorEvent) -> FloorEvent:
         return self.event_writer.emit(
             FloorEvent,
-            self.state.now_ms,
+            self.now_ms,
             change=policy_event.change,
             owner_before=policy_event.owner_before,
             owner_after=policy_event.owner_after,

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from talktopia.utils import write_json
 
-from .config import RuntimeConfig
+from .config import RuntimeConfig as RuntimeConfig
 
 
 def profile_name(profile) -> str:
@@ -70,3 +70,23 @@ def write_speech_log(path, entries, agents, args):
                 "status": "committed" if entry.commit_id else "not_committed",
             }
             output.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def summarize_latencies(summary: dict) -> None:
+    """Use observation counts, not an unweighted mean of episode means."""
+    summary["latency"] = {}
+    for kind in ("normal_response", "backchannel"):
+        values = [
+            row["latency"][kind]
+            for row in summary["episodes"]
+            if row["status"] == "completed" and "latency" in row
+        ]
+        count = sum(value["count"] for value in values)
+        total = sum(
+            value["mean_ms"] * value["count"] for value in values if value["count"]
+        )
+        summary["latency"][kind] = {
+            "count": count,
+            "mean_ms": total / count if count else None,
+        }
+    summary["latency_scope"] = "completed_episodes"

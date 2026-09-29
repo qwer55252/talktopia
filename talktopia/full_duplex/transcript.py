@@ -20,6 +20,15 @@ from .events import (
 )
 
 
+class SentenceSpan(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    chunk_index: int
+    start_ms: float
+    end_ms: float
+    received_text: str
+
+
 class TranscriptEntry(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -27,8 +36,8 @@ class TranscriptEntry(BaseModel):
     utterance_id: str
     speaker: str
     listener: str
-    start_ms: int | None
-    end_ms: int | None
+    start_ms: float | None
+    end_ms: float | None
     action_type: DuplexActionType
     generated_text: str
     synthesized_text: str
@@ -40,6 +49,7 @@ class TranscriptEntry(BaseModel):
     decision_id: str | None
     hidden_said_id: str | None
     commit_id: str | None
+    sentences: tuple[SentenceSpan, ...] = ()
 
 
 @dataclass(slots=True)
@@ -48,8 +58,8 @@ class _TranscriptDraft:
     utterance_id: str
     speaker: str = ""
     listener: str = ""
-    start_ms: int | None = None
-    end_ms: int | None = None
+    start_ms: float | None = None
+    end_ms: float | None = None
     action_type: DuplexActionType = "speak"
     hidden_said_id: str | None = None
     hidden_said: HiddenSaid | None = None
@@ -60,6 +70,8 @@ class _TranscriptDraft:
     interrupted: bool = False
     cancellation_reason: str | None = None
     commit_id: str | None = None
+    deliveries: dict[int, AudioDeliveryEvent] = field(default_factory=dict)
+    sentence_texts: dict[int, str] = field(default_factory=dict)
 
     def to_entry(self) -> TranscriptEntry:
         hidden = self.hidden_said
@@ -83,6 +95,15 @@ class _TranscriptDraft:
             decision_id=hidden.decision_id if hidden else None,
             hidden_said_id=hidden.hidden_said_id if hidden else None,
             commit_id=self.commit_id,
+            sentences=tuple(
+                SentenceSpan(
+                    chunk_index=index,
+                    start_ms=event.start_ms,
+                    end_ms=event.end_ms,
+                    received_text=self.sentence_texts.get(index, ""),
+                )
+                for index, event in sorted(self.deliveries.items())
+            ),
         )
 
 
@@ -118,12 +139,15 @@ class TranscriptBuilder:
             draft.speaker = event.speaker
             draft.action_type = event.action_type
             if event.phase == "started":
-                draft.start_ms = event.timestamp_ms
+                if draft.start_ms is None:
+                    draft.start_ms = event.timestamp_ms
             elif event.phase == "finished":
-                draft.end_ms = event.timestamp_ms
+                if draft.end_ms is None:
+                    draft.end_ms = event.timestamp_ms
                 draft.completed = True
             else:
-                draft.end_ms = event.timestamp_ms
+                if draft.end_ms is None:
+                    draft.end_ms = event.timestamp_ms
                 draft.completed = False
                 draft.interrupted = True
                 draft.cancellation_reason = event.reason
@@ -131,6 +155,7 @@ class TranscriptBuilder:
 
         if isinstance(event, AudioDeliveryEvent):
             draft = self._draft(event.episode_id, event.utterance_id)
+            draft.deliveries[event.chunk_index] = event
             draft.speaker = event.source_agent
             draft.start_ms = (
                 event.start_ms
@@ -150,6 +175,7 @@ class TranscriptBuilder:
             draft.listener = event.listener
             if event.is_final:
                 draft.received_text = event.text
+                draft.sentence_texts = event.sentence_texts
             return
 
         if isinstance(event, ActionCommitted):

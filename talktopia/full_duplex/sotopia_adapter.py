@@ -81,7 +81,7 @@ class SemanticSnapshot:
 class SemanticCommit:
     actions: Mapping[str, DuplexAction]
     expected_turn_number: int
-    timestamp_ms: int
+    timestamp_ms: float
     origin: str
     utterance_ids: Mapping[str, str | None]
     metadata: Mapping[str, object]

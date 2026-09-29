@@ -82,6 +82,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=INTERACTION_MODES,
         help="Conversation mode; new simulations default to round-robin.",
     )
+    for feature, default in (
+        ("backchannels", True),
+        ("corrections", False),
+        ("interruptions", False),
+    ):
+        parser.add_argument(
+            f"--duplex-{feature}",
+            action=argparse.BooleanOptionalAction,
+            default=default,
+            help=f"Allow {feature} in Surface5 (default: {default}).",
+        )
     parser.set_defaults(
         max_turns=MAX_TURNS,
         episode_timeout_s=EPISODE_TIMEOUT_S,
@@ -205,6 +216,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--seed must be nonnegative")
     if args.stage != "reevaluate" and args.interaction_mode is None:
         args.interaction_mode = "round-robin"
+    if args.interaction_mode == "round-robin" and (
+        not args.duplex_backchannels
+        or args.duplex_corrections
+        or args.duplex_interruptions
+    ):
+        parser.error(
+            "Duplex action controls require --interaction-mode surface5-full-duplex"
+        )
     evaluation.validate_arguments(parser, args)
     if args.stage in {"all", "simulate"} and not args.dry_run:
         for kind in ("asr", "tts"):
@@ -321,6 +340,8 @@ async def run_simulation_batch(
     concurrency = args.batch_size
     if concurrency_limit is not None:
         concurrency = min(concurrency, concurrency_limit)
+    from talktopia.full_duplex.episode import summarize_latencies
+
     return await utils.run_episode_batch(
         records,
         args,
@@ -344,6 +365,9 @@ async def run_simulation_batch(
             "interaction_mode": args.interaction_mode,
         },
         attempt_fields=("speech_worker",),
+        on_checkpoint=summarize_latencies
+        if args.interaction_mode == "surface5-full-duplex"
+        else None,
     )
 
 
@@ -685,6 +709,7 @@ async def run_duplex_episode(
         FRAME_MS,
         INTERACTION_MODE,
         SAMPLE_RATE_HZ,
+        runtime_options,
     )
     from talktopia.full_duplex.episode import (
         RuntimeConfig,
@@ -711,6 +736,7 @@ async def run_duplex_episode(
     original_path = base / "original" / f"{episode_id}.json"
     readable_path = base / "readable" / f"{episode_id}.md"
     timeout_path = base / "diagnostics" / f"{episode_id}.json"
+    latency_path = base / "latency" / f"{episode_id}.json"
     names = tuple(agent.agent_name for agent in agent_list)
     agents = tuple(agent_list)
     session = SotopiaSession(resolved, seed=args.seed)
@@ -723,7 +749,7 @@ async def run_duplex_episode(
         event_writer=writer,
         audio_router=AudioRouter(names),
         stereo_writer=stereo,
-        config=RuntimeConfig(max_turns=args.max_turns),
+        config=RuntimeConfig(**runtime_options(args)),
         model_names=tuple(agent.model_name for agent in agents),
         seed=args.seed,
         sample_rate_hz=SAMPLE_RATE_HZ,
@@ -746,6 +772,16 @@ async def run_duplex_episode(
         snapshot = session.open(agents)
         opened = True
         ended = await runtime.run(snapshot)
+        write_json(
+            latency_path,
+            {
+                "clock": "monotonic_elapsed_ms",
+                "normal_response": "peer last audio delivery end to response first audio delivery start",
+                "backchannel": "partial ASR first LLM request to backchannel first audio delivery start",
+                "statistics": runtime.latency_summary(),
+                "samples_ms": runtime.latencies,
+            },
+        )
         events = read_events(events_path)
         transcript = TranscriptBuilder.from_events(events)
         entries = transcript.build()
@@ -774,7 +810,7 @@ async def run_duplex_episode(
         )
         writer.emit(
             EpisodeEnded,
-            runtime.state.now_ms,
+            runtime.now_ms,
             status="completed",
             reason=ended.reason,
             duration_ms=ended.duration_ms,
@@ -791,6 +827,8 @@ async def run_duplex_episode(
             "opener": "agent1",
             "end_reason": ended.reason,
             "duration_ms": ended.duration_ms,
+            "latency": runtime.latency_summary(),
+            "latency_report": str(latency_path.relative_to(run_dir)),
             "wall_seconds": time.monotonic() - started,
             "episode_pk": episode.pk or None,
             "evaluation_status": "not_performed",
@@ -817,12 +855,12 @@ async def run_duplex_episode(
         )
         writer.emit(
             EpisodeEnded,
-            runtime.state.now_ms,
+            runtime.now_ms,
             status="cancelled"
             if isinstance(exc, asyncio.CancelledError) and not timed_out
             else "failed",
             reason="episode_timeout" if timed_out else "episode_error",
-            duration_ms=runtime.state.now_ms,
+            duration_ms=runtime.now_ms,
             error_type=type(exc).__name__,
             error_message=safe_error(exc),
         )
