@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -37,6 +38,9 @@ from .config import SIMULATION_PROMPT_VERSION
 
 # Keep the requested length independent from the validation safety margin.
 PROMPT_MAX_WORDS = 40
+_EMPTY_ARGUMENT_ACTIONS = frozenset({"none", "leave", "backchanneling"})
+_SPOKEN_ACTIONS = frozenset({"speak", "hesitation", "correction", "interruption"})
+_SPEECH_MARKUP_CHARACTERS = frozenset("*()[]{}")
 
 _SENTENCE_BOUNDARY = re.compile(
     r"(?P<terminal>[.!?。！？]+)(?P<closers>[\"”’')\]]*)(?P<space>\s+)"
@@ -108,8 +112,9 @@ class _JointAction(AgentAction):
     argument: str = Field(
         description=(
             "For speak, hesitation, correction, or interruption: only the words "
-            "spoken aloud, without asterisks, stage directions, speaker labels, "
-            "or narration. For action or non-verbal communication: describe the "
+            "spoken aloud, without asterisks, parentheses, square or curly brackets, "
+            "stage directions, speaker labels, or narration. "
+            "For action or non-verbal communication: describe the "
             "behavior. For none, leave, or backchanneling: an empty string. "
             "Use at most 40 words for a non-empty argument."
         )
@@ -121,21 +126,19 @@ class _JointAction(AgentAction):
         available = context.get("available_action_types")
         if available is not None and self.action_type not in available:
             raise ValueError(f"unavailable action: {self.action_type}")
-        if self.action_type in {"none", "leave", "backchanneling"}:
+        if self.action_type in _EMPTY_ARGUMENT_ACTIONS:
             if self.argument.strip():
                 raise ValueError(f"{self.action_type} requires an empty argument")
         else:
             _validate_generated_text(self.argument, field_name="argument")
-            if self.action_type in {
-                "speak",
-                "hesitation",
-                "correction",
-                "interruption",
-            }:
-                # A starred span could be emphasis or a stage direction. Do not
+            if self.action_type in _SPOKEN_ACTIONS:
+                # A marked span could be emphasis or a stage direction. Do not
                 # guess and silently remove words from the participant's speech.
-                if "*" in self.argument:
-                    raise ValueError("speech argument must not contain asterisks")
+                if _SPEECH_MARKUP_CHARACTERS.intersection(self.argument):
+                    raise ValueError(
+                        "speech argument must not contain asterisks or brackets: "
+                        "*()[]{}"
+                    )
                 if not prepare_tts_text(self.argument):
                     raise ValueError("speech argument must contain audible words")
         if (
@@ -149,6 +152,37 @@ class _JointAction(AgentAction):
         return self
 
 
+def _action_json_schema(schema: dict[str, Any]) -> None:
+    """Expose argument length per action without changing the parsed model."""
+    action_schema = schema["properties"]["action_type"]
+    available = action_schema.get("enum", [action_schema.get("const")])
+    branches = []
+    for empty_argument in (True, False):
+        actions = [
+            action
+            for action in available
+            if (action in _EMPTY_ARGUMENT_ACTIONS) == empty_argument
+        ]
+        if not actions:
+            continue
+        branch = deepcopy(schema)
+        branch["properties"]["action_type"] = {"type": "string", "enum": actions}
+        branch["properties"]["argument"].update(
+            {"const": ""} if empty_argument else {"minLength": 1}
+        )
+        branches.append(branch)
+
+    # Ollama's grammar converter does not intersect root properties with anyOf.
+    # Each alternative must retain the complete object and recipient contract.
+    # Keep speech markup checks in the validator: native regex conversion can
+    # permit invalid JSON escapes and quotes instead of a valid JSON string.
+    title = schema.get("title", "Surface5Action")
+    schema.clear()
+    schema.update(
+        branches[0] if len(branches) == 1 else {"title": title, "anyOf": branches}
+    )
+
+
 def _action_model(available_actions: list[DuplexActionType]) -> type[_JointAction]:
     """Constrain both SOTOPIA requests to this observation's action mask."""
     if not available_actions:
@@ -156,10 +190,15 @@ def _action_model(available_actions: list[DuplexActionType]) -> type[_JointActio
     fields: dict[str, Any] = {
         "action_type": (Literal[tuple(available_actions)], ...),
     }
-    if set(available_actions) <= {"none", "leave", "backchanneling"}:
+    if set(available_actions) <= _EMPTY_ARGUMENT_ACTIONS:
         fields["argument"] = (Literal[""], ...)
     # A fresh subclass avoids mutating a schema used by another agent's request.
-    return create_model("Surface5Action", __base__=_JointAction, **fields)
+    return create_model(
+        "Surface5Action",
+        __base__=_JointAction,
+        __config__=ConfigDict(json_schema_extra=_action_json_schema),
+        **fields,
+    )
 
 
 class Surface5ActionOutputParser(PydanticOutputParser[_JointAction]):

@@ -29,7 +29,7 @@ FRAME_MS = 40
 ASR_DECODE_INTERVAL_MS = 400
 ASR_WINDOW_MS = 3000
 INTERACTION_MODE = "surface5-full-duplex"
-SIMULATION_PROMPT_VERSION = "simulation_FDB_v5"
+SIMULATION_PROMPT_VERSION = "simulation_FDB_v6"
 
 
 def runtime_options(values) -> dict:

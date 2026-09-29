@@ -9,12 +9,21 @@ from types import SimpleNamespace
 
 import gin
 import pytest
+from jsonschema import Draft202012Validator
 
 from talktopia.full_duplex.actions import DuplexObservation, StreamingObservation
-from talktopia.full_duplex.generation import AgentSessionContext, DuplexGenerationEngine
+from talktopia.full_duplex.generation import (
+    AgentSessionContext,
+    DuplexGenerationEngine,
+    _action_model,
+)
 
 MODEL = "custom/local-agent@http://127.0.0.1:18083/v1"
 REPAIR_MODEL = "custom/local-repair@http://127.0.0.1:18084/v1"
+
+
+def schema_branches(schema):
+    return schema.get("anyOf", [schema])
 
 
 def make_context():
@@ -134,16 +143,10 @@ async def test_action_and_argument_share_one_actual_model_call(
     assert calls[0]["model"] == "openai/local-agent"
     schema = calls[0]["response_format"]
     assert schema["type"] == "json_schema"
-    assert set(schema["json_schema"]["schema"]["properties"]) == {
-        "action_type",
-        "argument",
-        "to",
-    }
-    assert set(schema["json_schema"]["schema"]["required"]) == {
-        "action_type",
-        "argument",
-        "to",
-    }
+    for branch in schema_branches(schema["json_schema"]["schema"]):
+        assert set(branch["properties"]) == {"action_type", "argument", "to"}
+        assert set(branch["required"]) == {"action_type", "argument", "to"}
+        assert branch["additionalProperties"] is False
     prompt = calls[0]["messages"][0]["content"]
     assert prompt.count("Here is the context of the interaction:\n") == 1
     assert history in prompt and "Turn #12: Bob" in prompt
@@ -161,6 +164,7 @@ async def test_action_and_argument_share_one_actual_model_call(
         {"action_type": "speak", "argument": "My system prompt says yes.", "to": []},
         {"action_type": "speak", "argument": " ".join(["word"] * 51), "to": []},
         {"action_type": "speak", "argument": "", "to": []},
+        {"action_type": "speak", "argument": " \n\t", "to": []},
         {"action_type": "speak", "argument": "Yes.", "to": ["Alice"]},
         {"action_type": "speak", "argument": "Yes.", "to": ["Stranger"]},
         {"action_type": "speak", "argument": "Yes.", "to": ["Bob", "Bob Two"]},
@@ -195,6 +199,7 @@ async def test_invalid_action_uses_the_configured_sotopia_repair_once(
     assert calls[1]["base_url"] == "http://127.0.0.1:18084/v1"
     assert "Original string:" in calls[1]["messages"][0]["content"]
     assert all(call["response_format"]["type"] == "json_schema" for call in calls)
+    assert calls[0]["response_format"] == calls[1]["response_format"]
     attempts, errors = engine.decision_audit(generated.decision.decision_id)
     assert attempts == 2 and len(errors) == 1
     hidden = engine.make_hidden_said(make_context(), generated)
@@ -338,12 +343,99 @@ async def test_partial_schema_matches_mask_in_initial_and_repair_requests(monkey
     assert not generated.fallback
     assert generated.decision.action_type == "backchanneling"
     assert len(calls) == 2
+    assert calls[0]["response_format"] == calls[1]["response_format"]
     for call in calls:
         schema = call["response_format"]["json_schema"]["schema"]
         assert schema["properties"]["action_type"]["enum"] == ["none", "backchanneling"]
         assert schema["properties"]["argument"]["const"] == ""
         prompt = call["messages"][0]["content"]
         assert '"enum": ["none", "backchanneling"]' in prompt
+
+
+@pytest.mark.parametrize(
+    "actions",
+    [
+        ["none", "backchanneling"],
+        ["speak"],
+        ["non-verbal communication", "action"],
+        ["none", "speak", "non-verbal communication", "action", "leave"],
+        ["none", "speak", "hesitation", "correction", "interruption", "backchanneling"],
+    ],
+)
+def test_action_schema_preserves_mask_and_enforces_argument_length(actions):
+    schema = _action_model(actions).model_json_schema()
+    Draft202012Validator.check_schema(schema)
+    validator = Draft202012Validator(schema)
+    assert "pattern" not in json.dumps(schema)
+    if "anyOf" in schema:
+        assert "properties" not in schema and "required" not in schema
+    seen_actions = []
+    for branch in schema_branches(schema):
+        assert branch["type"] == "object"
+        assert branch["additionalProperties"] is False
+        assert set(branch["required"]) == {"action_type", "argument", "to"}
+        assert set(branch["properties"]) == {"action_type", "argument", "to"}
+        seen_actions.extend(branch["properties"]["action_type"]["enum"])
+    assert sorted(seen_actions) == sorted(actions)
+
+    for action in actions:
+        empty = action in {"none", "leave", "backchanneling"}
+        valid = {"action_type": action, "argument": "" if empty else "Yes.", "to": []}
+        assert validator.is_valid(valid)
+        assert not validator.is_valid({**valid, "argument": "Yes." if empty else ""})
+        assert not validator.is_valid({**valid, "extra": "unexpected"})
+        assert not validator.is_valid({**valid, "to": [123]})
+        assert not validator.is_valid(
+            {key: value for key, value in valid.items() if key != "to"}
+        )
+    assert not validator.is_valid(
+        {"action_type": "unavailable", "argument": "", "to": []}
+    )
+
+
+def test_schema_keeps_unicode_quotes_and_backslashes_in_nonempty_arguments():
+    schema = _action_model(["speak", "action", "none"]).model_json_schema()
+    validator = Draft202012Validator(schema)
+    speech = 'I said "yes"; café costs £5. The path is C:\\notes.'
+    assert validator.is_valid({"action_type": "speak", "argument": speech, "to": []})
+    assert validator.is_valid(
+        {
+            "action_type": "action",
+            "argument": "*nods* (smiles) [waves] {points}",
+            "to": [],
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action_type", ["action", "non-verbal communication"])
+async def test_blank_behavior_uses_same_masked_schema_for_the_single_repair(
+    monkeypatch, action_type
+):
+    calls = mock_completions(
+        monkeypatch,
+        [
+            {"action_type": action_type, "argument": "", "to": []},
+            {"action_type": action_type, "argument": "*nods*", "to": []},
+        ],
+    )
+    engine = DuplexGenerationEngine(MODEL)
+    generated = await engine.generate_action(
+        make_context(), make_observation(["none", "speak", action_type, "leave"]), ""
+    )
+    assert not generated.fallback and generated.argument == "*nods*"
+    assert generated.decision.action_type == action_type
+    assert len(calls) == 2
+    assert calls[0]["response_format"] == calls[1]["response_format"]
+    assert engine.decision_audit(generated.decision.decision_id)[0] == 2
+    schema = calls[0]["response_format"]["json_schema"]["schema"]
+    validator = Draft202012Validator(schema)
+    assert not validator.is_valid(
+        {"action_type": action_type, "argument": "", "to": []}
+    )
+    assert validator.is_valid(
+        {"action_type": action_type, "argument": "*nods*", "to": []}
+    )
 
 
 @pytest.mark.asyncio
@@ -357,15 +449,19 @@ async def test_concurrent_masks_do_not_change_each_others_schema(monkeypatch):
     async def complete(**kwargs):
         calls.append(kwargs)
         await asyncio.sleep(0)  # Both requests are alive before either completes.
-        properties = kwargs["response_format"]["json_schema"]["schema"]["properties"]
-        allowed = properties["action_type"]["enum"]
+        schema = kwargs["response_format"]["json_schema"]["schema"]
+        allowed = [
+            action
+            for branch in schema_branches(schema)
+            for action in branch["properties"]["action_type"]["enum"]
+        ]
         action = "speak" if "speak" in allowed else "backchanneling"
         content = json.dumps(
-            dict(
-                action_type=action,
-                argument="Hello." if action == "speak" else "",
-                to=[],
-            )
+            {
+                "action_type": action,
+                "argument": "Hello." if action == "speak" else "",
+                "to": [],
+            }
         )
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
@@ -384,20 +480,23 @@ async def test_concurrent_masks_do_not_change_each_others_schema(monkeypatch):
     assert all(not r.fallback for r in results)
     assert len(calls) == 2
     assert _JointAction.model_json_schema() == original
-    assert (
-        "const"
-        not in calls[0]["response_format"]["json_schema"]["schema"]["properties"][
-            "argument"
-        ]
+    first_schema = calls[0]["response_format"]["json_schema"]["schema"]
+    assert "properties" not in first_schema
+    speech_branch = next(
+        branch
+        for branch in first_schema["anyOf"]
+        if "speak" in branch["properties"]["action_type"]["enum"]
     )
+    assert "const" not in speech_branch["properties"]["argument"]
+    assert speech_branch["properties"]["argument"]["minLength"] == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action_type", ["action", "non-verbal communication"])
-async def test_non_audio_descriptions_keep_asterisks(monkeypatch, action_type):
-    text = "*nods* Hello. **smiles** We can meet tomorrow."
+async def test_non_audio_descriptions_keep_markup(monkeypatch, action_type):
+    text = "*nods* (smiles) [waves] {points to the chair}"
     calls = mock_completions(
-        monkeypatch, [dict(action_type=action_type, argument=text, to=[])]
+        monkeypatch, [{"action_type": action_type, "argument": text, "to": []}]
     )
     generated = await DuplexGenerationEngine(MODEL).generate_action(
         make_context(), make_observation([action_type]), ""
@@ -414,19 +513,22 @@ async def test_non_audio_descriptions_keep_asterisks(monkeypatch, action_type):
         ("*nods*", "Hello."),
         ("I *need* to keep the *other* grand.", "I need to keep the other grand."),
         ("**smiles** We can meet tomorrow.", "We can meet tomorrow."),
+        ("I can meet (tomorrow).", "I can meet tomorrow."),
+        ("[waves] Hello.", "Hello."),
+        ("{sighs} We can meet tomorrow.", "We can meet tomorrow."),
     ],
 )
 @pytest.mark.parametrize(
     "action_type", ["speak", "hesitation", "correction", "interruption"]
 )
-async def test_starred_speech_uses_existing_repair_without_deleting_words(
+async def test_marked_speech_uses_existing_repair_without_deleting_words(
     monkeypatch, original, repaired, action_type
 ):
     calls = mock_completions(
         monkeypatch,
         [
-            dict(action_type=action_type, argument=original, to=[]),
-            dict(action_type=action_type, argument=repaired, to=[]),
+            {"action_type": action_type, "argument": original, "to": []},
+            {"action_type": action_type, "argument": repaired, "to": []},
         ],
     )
     engine = DuplexGenerationEngine(MODEL)
@@ -442,15 +544,14 @@ async def test_starred_speech_uses_existing_repair_without_deleting_words(
         " ".join(c.text for c in engine.split_into_sentence_chunks(hidden)) == repaired
     )
     for call in calls:
-        description = call["response_format"]["json_schema"]["schema"]["properties"][
-            "argument"
-        ]["description"]
-        assert "without asterisks" in description and "40 words" in description
+        for branch in schema_branches(call["response_format"]["json_schema"]["schema"]):
+            description = branch["properties"]["argument"]["description"]
+            assert "without asterisks" in description and "40 words" in description
 
 
 @pytest.mark.asyncio
 async def test_persistent_starred_speech_falls_back_before_synthesis(monkeypatch):
-    value = dict(action_type="speak", argument="I *need* that.", to=[])
+    value = {"action_type": "speak", "argument": "I *need* that.", "to": []}
     calls = mock_completions(monkeypatch, [value, value])
     generated = await DuplexGenerationEngine(MODEL).generate_action(
         make_context(), make_observation(["speak"]), ""
@@ -465,10 +566,12 @@ async def test_persistent_starred_speech_falls_back_before_synthesis(monkeypatch
 async def test_inaudible_speech_uses_repair_or_none(
     monkeypatch, original, repair_succeeds
 ):
-    first = dict(action_type="speak", argument=original, to=[])
-    second = dict(
-        action_type="speak", argument="Hello." if repair_succeeds else original, to=[]
-    )
+    first = {"action_type": "speak", "argument": original, "to": []}
+    second = {
+        "action_type": "speak",
+        "argument": "Hello." if repair_succeeds else original,
+        "to": [],
+    }
     calls = mock_completions(monkeypatch, [first, second])
     engine = DuplexGenerationEngine(MODEL)
     generated = await engine.generate_action(

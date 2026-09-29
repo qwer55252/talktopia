@@ -8,12 +8,12 @@ import pytest
 from talktopia.full_duplex.generation import Surface5ActionOutputParser, _JointAction
 
 
-def parse(raw):
+def parse(raw, actions=None):
     backend = importlib.import_module("sotopia.generation_utils.generate")
     return Surface5ActionOutputParser(pydantic_object=_JointAction).parse(
         backend._strip_thinking_tags(raw),
         context={
-            "available_action_types": ["speak"],
+            "available_action_types": actions or ["speak"],
             "agent_names": ["Alice", "Bob"],
             "sender": "Alice",
         },
@@ -52,12 +52,21 @@ def test_text_without_a_joint_action_cannot_bypass_contract(raw):
         parse(raw)
 
 
-def test_quotes_braces_and_backticks_inside_argument_are_preserved():
+def test_quotes_braces_and_backticks_inside_non_audio_argument_are_preserved():
     argument = 'Use {one} and say "yes"; ``` is a marker.'
     assert (
         parse(
-            json.dumps({"action_type": "speak", "argument": argument, "to": []})
+            json.dumps({"action_type": "action", "argument": argument, "to": []}),
+            actions=["action"],
         ).argument
+        == argument
+    )
+
+
+def test_speech_quotes_and_json_escapes_are_not_stripped():
+    argument = 'Say "yes"; backslash \\ is a marker.'
+    assert (
+        parse(json.dumps(dict(action_type="speak", argument=argument, to=[]))).argument
         == argument
     )
 

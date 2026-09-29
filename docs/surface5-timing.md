@@ -83,7 +83,7 @@ completed episodes using measurement counts, rather than averaging episode means
 
 ## Prompts and evaluation
 
-The runtime loads `talktopia/full_duplex/prompts/simulation_FDB_v5.txt` directly.
+The runtime loads `talktopia/full_duplex/prompts/simulation_FDB_v6.txt` directly.
 It preserves the body of `sotopia_action_v1.txt`, including the participant's
 freedom to leave, and adds the same 40-word and recipient instructions as the
 round-robin speech prompt plus the partial-ASR and backchannel instructions.
@@ -93,14 +93,18 @@ checks validity again before delivery. `HiddenSaid` records that same response's
 private speech text; it is not a second LLM request.
 
 Each request uses a separate SOTOPIA action-model subclass whose JSON schema
-contains only the currently available action types. The initial request and its
-possible repair use that same schema. When all available actions require an empty
-argument, the schema constrains `argument` to the empty string as well. Runtime
-validation still checks the current floor before synthesis and delivery.
+contains only the currently available action types. Complete object branches
+distinguish empty arguments for controls from non-empty arguments for speech and
+nonverbal behavior. The initial request and its possible repair use the same
+schema. Runtime validation retains the blank-text and 50-word checks and still
+checks the current floor before synthesis and delivery. The native decoder does
+not enforce the semantic distinction between dialogue and stage narration.
 The prompt distinguishes words spoken aloud from nonverbal action descriptions.
-Spoken arguments containing asterisks use the existing repair/fallback path.
-The runtime does not guess whether a starred span is emphasis or a stage direction
-and then delete it. The argument schema repeats the spoken-text rule for repair
+Spoken arguments containing asterisks or round, square, or curly brackets use
+the existing repair/fallback path. The runtime does not guess whether a marked
+span is emphasis, an aside, or a stage direction and then delete it. Ordinary
+quotes, apostrophes, and other punctuation remain allowed. These spoken-field
+rules do not change the shared relaxed JSON parser or nonverbal descriptions. The argument schema repeats the spoken-text rule for repair
 requests. `HiddenSaid` preserves the accepted generated text, while each sentence
 chunk records the actual synthesis input. Nonverbal action descriptions remain
 non-audio actions. No narration-removal heuristic is applied.
