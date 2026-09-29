@@ -313,3 +313,45 @@ async def test_concurrent_response_collectors_do_not_mix(monkeypatch):
         ]
     )
     assert recorded == [['{"text":"Alice"}'], ['{"text":"Bob"}']]
+
+
+@pytest.mark.asyncio
+async def test_repair_schema_factory_runs_after_failure_and_changes_only_repair(
+    monkeypatch,
+):
+    calls = mock_completions(
+        monkeypatch, ['{"text":"Wrong."}', '{"text":"Correct answer."}']
+    )
+    parser = RecordingParser(pydantic_object=Reply)
+    schema = Reply.model_json_schema()
+    schema["properties"]["text"]["pattern"] = "^Correct answer[.]$"
+    factory_calls = []
+
+    def repair_schema():
+        assert parser._failed
+        factory_calls.append(True)
+        return schema
+
+    result = await generate_structured_action(
+        **request_kwargs(parser), repair_schema_factory=repair_schema
+    )
+    assert result.text == "Correct answer."
+    assert factory_calls == [True] and len(calls) == 2
+    assert (
+        calls[0]["response_format"]["json_schema"]["schema"]
+        == Reply.model_json_schema()
+    )
+    assert calls[1]["response_format"]["json_schema"]["schema"] == schema
+
+
+@pytest.mark.asyncio
+async def test_valid_initial_response_never_requests_a_repair_schema(monkeypatch):
+    calls = mock_completions(monkeypatch, ['{"text":"Correct answer."}'])
+
+    def forbidden_factory():
+        raise AssertionError("initial response did not need repair")
+
+    await generate_structured_action(
+        **request_kwargs(), repair_schema_factory=forbidden_factory
+    )
+    assert len(calls) == 1

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
+from copy import deepcopy
 from typing import Any
 
 import gin
@@ -30,6 +32,7 @@ async def generate_structured_action[Result: BaseModel](
     temperature: float | None,
     context: dict[str, Any] | None = None,
     responses: list[str | None] | None = None,
+    repair_schema_factory: Callable[[], dict[str, Any] | None] | None = None,
 ) -> Result:
     """Keep the first SOTOPIA request unchanged; repair only a parse failure.
 
@@ -87,8 +90,14 @@ async def generate_structured_action[Result: BaseModel](
     try:
         parsed = output_parser.parse(result, context=context)
     except Exception:  # noqa: BLE001 - Match SOTOPIA's one parse-error repair.
+        repair_schema = repair_schema_factory() if repair_schema_factory else None
         repaired = await _repair_action(
-            result, output_parser, repair_model, base_url=base_url, responses=responses
+            result,
+            output_parser,
+            repair_model,
+            base_url=base_url,
+            responses=responses,
+            repair_schema=repair_schema,
         )
         parsed = output_parser.parse(repaired, context=context)
     return parsed
@@ -101,6 +110,7 @@ async def _repair_action[Result: BaseModel](
     *,
     base_url: str | None,
     responses: list[str | None] | None = None,
+    repair_schema: dict[str, Any] | None = None,
 ) -> str:
     # SOTOPIA's formatter rejects None before making a repair request.
     if result is None:
@@ -118,12 +128,15 @@ async def _repair_action[Result: BaseModel](
     elif base_url is not None:
         api_key = os.environ.get("CUSTOM_API_KEY", "EMPTY")
 
+    response_format = sotopia_generation._build_json_schema_response_format(
+        output_parser.pydantic_object
+    )
+    if repair_schema is not None:
+        response_format["json_schema"]["schema"] = deepcopy(repair_schema)
     response = await sotopia_generation.acompletion(
         model=model_name,
         messages=[{"role": "user", "content": content}],
-        response_format=sotopia_generation._build_json_schema_response_format(
-            output_parser.pydantic_object
-        ),
+        response_format=response_format,
         drop_params=True,
         base_url=base_url,
         api_key=api_key,

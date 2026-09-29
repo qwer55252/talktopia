@@ -44,6 +44,8 @@ PROMPT_MAX_WORDS = 40
 _EMPTY_ARGUMENT_ACTIONS = frozenset({"none", "leave", "backchanneling"})
 _SPOKEN_ACTIONS = frozenset({"speak", "hesitation", "correction", "interruption"})
 _SPEECH_MARKUP_CHARACTERS = frozenset("*()[]{}")
+_SPEECH_REPAIR_PATTERN = r"^[^\x00-\x1F\x7F\x22\x28-\x2A\x5B-\x5D\x7B\x7D]+$"
+_SPEECH_REPAIR_EXTRA_CHARACTERS = re.compile(r'[\x00-\x1F\x7F"\\]')
 _COMPACT_DOLLAR_AMOUNT = re.compile(r"\$\s*\d[\d,]*(?:\.\d+)?\s*[kKmMbB]\b")
 _REPAIR_TOKEN = re.compile(r"[+-]?\$?[+-]?\d+(?:[,.]\d+)*%?|[^\W\d_]+(?:'[^\W\d_]+)*")
 _MARKED_SPAN = re.compile(
@@ -247,8 +249,8 @@ def _action_json_schema(schema: dict[str, Any]) -> None:
 
     # Ollama's grammar converter does not intersect root properties with anyOf.
     # Each alternative must retain the complete object and recipient contract.
-    # Keep speech markup checks in the validator: native regex conversion can
-    # permit invalid JSON escapes and quotes instead of a valid JSON string.
+    # Keep the first request's string grammar intact: a native pattern can
+    # permit invalid JSON escapes unless it also narrows the allowed alphabet.
     title = schema.get("title", "Surface5Action")
     schema.clear()
     schema.update(
@@ -274,6 +276,35 @@ def _action_model(available_actions: list[DuplexActionType]) -> type[_JointActio
     )
 
 
+def _speech_repair_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Clone full action branches, narrowing only their spoken arguments."""
+    branches = []
+    changed = False
+    for branch in schema.get("anyOf", [schema]):
+        actions = branch["properties"]["action_type"]["enum"]
+        spoken = [action for action in actions if action in _SPOKEN_ACTIONS]
+        if not spoken:
+            branches.append(deepcopy(branch))
+            continue
+        changed = True
+        others = [action for action in actions if action not in _SPOKEN_ACTIONS]
+        if others:
+            non_audio_branch = deepcopy(branch)
+            non_audio_branch["properties"]["action_type"]["enum"] = others
+            branches.append(non_audio_branch)
+        speech_branch = deepcopy(branch)
+        speech_branch["properties"]["action_type"]["enum"] = spoken
+        # Native pattern conversion bypasses standard JSON string escaping.
+        # This repair-only alphabet must also exclude quote/backslash/controls.
+        speech_branch["properties"]["argument"]["pattern"] = _SPEECH_REPAIR_PATTERN
+        branches.append(speech_branch)
+    if not changed:
+        return deepcopy(schema)
+    if len(branches) == 1:
+        return branches[0]
+    return {"title": schema.get("title", "Surface5Action"), "anyOf": branches}
+
+
 class Surface5ActionOutputParser(PydanticOutputParser[_JointAction]):
     """Use the shared JSON parser and name resolution, retaining a local audit."""
 
@@ -289,10 +320,21 @@ class Surface5ActionOutputParser(PydanticOutputParser[_JointAction]):
     def errors(self) -> tuple[str, ...]:
         return tuple(self._errors)
 
+    def _can_narrow_speech_repair(self) -> bool:
+        return self._marked_action is not None and not (
+            _SPEECH_REPAIR_EXTRA_CHARACTERS.search(self._marked_action.argument)
+        )
+
+    def get_repair_schema(self) -> dict[str, Any] | None:
+        """Narrow only a typed markup failure without newly forbidden symbols."""
+        if not self._can_narrow_speech_repair():
+            return None
+        return _speech_repair_schema(self.pydantic_object.model_json_schema())
+
     def get_format_instructions(self) -> str:
         if not self._errors:
             return super().get_format_instructions()
-        # Native response_format still carries the identical schema. Repeating
+        # Native response_format carries the complete action schema. Repeating
         # it here obscures the content error in the one allowed repair request.
         return (
             "The original JSON may already be valid. Repair the invalid action "
@@ -335,6 +377,13 @@ class Surface5ActionOutputParser(PydanticOutputParser[_JointAction]):
                 )
                 if original_to_valid and set(recipients) != set(original_to):
                     raise ValueError("markup repair changed valid recipients")
+                if (
+                    self._can_narrow_speech_repair()
+                    and re.fullmatch(_SPEECH_REPAIR_PATTERN, validated.argument) is None
+                ):
+                    raise ValueError(
+                        "speech markup repair contains forbidden formatting characters"
+                    )
                 _validate_markup_repair(original.argument, validated.argument)
             if recipients != action.to:
                 sotopia_generation.log.info(
@@ -411,6 +460,7 @@ class DuplexGenerationEngine:
                 temperature=temperature,
                 context=context,
                 responses=raw_responses,
+                repair_schema_factory=parser.get_repair_schema,
             )
             if not isinstance(action, _JointAction):
                 raise TypeError(

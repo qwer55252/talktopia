@@ -564,6 +564,138 @@ async def test_persistent_starred_speech_falls_back_before_synthesis(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_markup_repair_schema_restricts_only_speech_and_preserves_initial_request(
+    monkeypatch,
+):
+    actions = ["none", "speak", "non-verbal communication", "action", "leave"]
+    original = "*adjusts cufflinks nervously* Three thousand’s quite the bite."
+    repaired = "Three thousand’s quite the bite."
+    original_schema = _action_model(actions).model_json_schema()
+    calls = mock_completions(
+        monkeypatch,
+        [
+            {"action_type": "speak", "argument": original, "to": ["Bob"]},
+            {"action_type": "speak", "argument": repaired, "to": ["Bob"]},
+        ],
+    )
+    generated = await DuplexGenerationEngine(MODEL).generate_action(
+        make_context(), make_observation(actions), ""
+    )
+    assert generated.argument == repaired and not generated.fallback
+    assert len(calls) == 2
+    assert calls[0]["response_format"]["json_schema"]["schema"] == original_schema
+    assert _action_model(actions).model_json_schema() == original_schema
+    schema = calls[1]["response_format"]["json_schema"]["schema"]
+    validator = Draft202012Validator(schema)
+
+    def valid(action, argument):
+        return validator.is_valid(
+            {"action_type": action, "argument": argument, "to": []}
+        )
+
+    assert valid("speak", "Café, ‘yes’—it’s fine.")
+    assert not valid("speak", "")
+    forbidden = list(range(32)) + [127] + list(map(ord, '"\\*()[]{}'))
+    for code in forbidden:
+        assert not valid("speak", "before" + chr(code) + "after")
+    for action in ("none", "leave"):
+        assert valid(action, "") and not valid(action, "words")
+    for action in ("action", "non-verbal communication"):
+        assert valid(action, '**nods** [slowly] "yes" \\')
+    assert not valid("interruption", "Wait.")
+    assert all(
+        branch["additionalProperties"] is False for branch in schema_branches(schema)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "original, repaired",
+    [
+        ('*nods* Say "yes".', 'Say "yes".'),
+        ("*nods* Path C:\\temp.", "Path C:\\temp."),
+        ("*nods* Say\tyes.", "Say yes."),
+        ("*nods* Say\nyes.", "Say yes."),
+        ("*nods* Say\x7fyes.", "Say\x7fyes."),
+    ],
+)
+async def test_existing_quote_backslash_or_control_keeps_original_repair_schema(
+    monkeypatch, original, repaired
+):
+    calls = mock_completions(
+        monkeypatch,
+        [
+            {"action_type": "speak", "argument": original, "to": []},
+            {"action_type": "speak", "argument": repaired, "to": []},
+        ],
+    )
+    generated = await DuplexGenerationEngine(MODEL).generate_action(
+        make_context(), make_observation(["speak"]), ""
+    )
+    assert not generated.fallback
+    assert calls[0]["response_format"] == calls[1]["response_format"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repaired", ['"Hello."', "Hello.\\", "Hello.\n", "Hello.\x7f"])
+async def test_narrow_repair_is_validated_when_provider_ignores_schema(
+    monkeypatch, repaired
+):
+    calls = mock_completions(
+        monkeypatch,
+        [
+            {"action_type": "speak", "argument": "*nods* Hello.", "to": []},
+            {"action_type": "speak", "argument": repaired, "to": []},
+        ],
+    )
+    generated = await DuplexGenerationEngine(MODEL).generate_action(
+        make_context(), make_observation(["speak"]), ""
+    )
+    assert generated.fallback and generated.argument == "" and len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_markup_repairs_do_not_share_schema_selection(monkeypatch):
+    backend = importlib.import_module("sotopia.generation_utils.generate")
+    repair_calls = {}
+
+    async def complete(**kwargs):
+        await asyncio.sleep(0)
+        content = kwargs["messages"][0]["content"]
+        is_repair = "Original string:" in content
+        quoted = "Quoted" in content
+        argument = 'Quoted "yes".' if quoted else "Plain yes."
+        if not is_repair:
+            argument = "*nods* " + argument
+        else:
+            repair_calls[quoted] = kwargs["response_format"]["json_schema"]["schema"]
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {"action_type": "speak", "argument": argument, "to": []}
+                        )
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(backend, "acompletion", complete)
+    results = await asyncio.gather(
+        *[
+            DuplexGenerationEngine(MODEL).generate_action(
+                make_context(), make_observation(["speak"]), history
+            )
+            for history in ("Plain", "Quoted")
+        ]
+    )
+    assert all(not result.fallback for result in results)
+    assert "pattern" in repair_calls[False]["properties"]["argument"]
+    assert "pattern" not in repair_calls[True]["properties"]["argument"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "original, repaired",
     [

@@ -95,8 +95,7 @@ private speech text; it is not a second LLM request.
 Each request uses a separate SOTOPIA action-model subclass whose JSON schema
 contains only the currently available action types. Complete object branches
 distinguish empty arguments for controls from non-empty arguments for speech and
-nonverbal behavior. The initial request and its possible repair use the same
-schema. Runtime validation retains the blank-text and 50-word checks and still
+nonverbal behavior. Runtime validation retains the blank-text and 50-word checks and still
 checks the current floor before synthesis and delivery. The native decoder does
 not enforce the semantic distinction between dialogue and stage narration.
 The prompt distinguishes words spoken aloud from nonverbal action descriptions
@@ -136,7 +135,17 @@ contain invalid speech. The parser includes its last validation error and asks
 the repair model to omit physical stage directions while preserving dialogue.
 The repair uses the same configured model and default sampling as before; no
 shared engine code is modified. The first request
-contains no previous-error feedback, and its JSON schema is unchanged for repair.
+contains no previous-error feedback. Most repairs retain its JSON schema.
+For a first failure specifically caused by speech markup, the repair can use a
+speech-only character constraint to prevent the model from copying those markers
+again. The native pattern converter bypasses ordinary JSON string escaping, so
+this constraint also excludes ASCII double quotes, backslashes, and control
+characters. If the original argument already contains any of these additional
+characters, the original repair schema is retained. Language, currency, recipient,
+and other repairs retain their original schema. Action masks, empty controls,
+and nonverbal descriptions are preserved. The parser checks the constrained
+repair again even if a provider ignores the schema. This is a repair formatting
+restriction; the initial request and common SOTOPIA body are unchanged.
 When the first parse fails specifically on speech markup, a lexical check rejects
 new or reordered words and deletion of words outside balanced marked spans. It
 also preserves the originally valid action type and recipients. Nested or
@@ -144,6 +153,9 @@ unbalanced markup fails this check. It never removes or replaces speech itself.
 Words inside marked spans can be retained or omitted, so this check cannot
 guarantee that emphasis or an aside is preserved, or that all stage narration is
 removed. Recorded conversations still require inspection for those model errors.
+For example, a diagnostic repair expressed a stage direction as `_nods_` and
+passed the lexical check. A character constraint cannot establish that all
+remaining words are dialogue.
 Final failure produces `none` and an error audit, not another Surface5
 regeneration loop. Decision events and committed passes distinguish this fallback
 with `generation_fallback`. Cancellation still propagates. All inference and
