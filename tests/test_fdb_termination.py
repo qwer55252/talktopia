@@ -120,6 +120,9 @@ async def test_time_limit_finishes_selected_speech_and_final_asr(
     source = EpisodeLog.model_validate_json((tmp_path / result["original"]).read_text())
     _, history = duplex_history(source, tmp_path / result["events"])
     assert "Heard spoken words." in "\n".join(history)
+    readable = (tmp_path / result["readable"]).read_text()
+    assert "\n\n".join(history[:-2]) in readable
+    assert "[00:" in readable and "Sentence ASR" in readable
     assert events[-1].status == "completed" and events[-1].reason == "time_limit"
     assert all(not agent.state.session_active for agent in agents)
 

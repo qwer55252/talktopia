@@ -709,6 +709,7 @@ async def run_duplex_episode(
     import time
 
     from sotopia.database import EpisodeLog
+    from talktopia.evaluation.temporal import timed_messages
     from talktopia.full_duplex.audio import AudioRouter, StereoWavWriter
     from talktopia.full_duplex.config import (
         FRAME_MS,
@@ -809,7 +810,10 @@ async def run_duplex_episode(
         if args.push_to_db:
             episode.save()
         write_json(original_path, episode.model_dump(mode="json"))
-        _, turns = render_episode_for_humans(episode)
+        readable_episode = episode.model_copy(
+            update={"messages": timed_messages(episode, commits, entries, events)}
+        )
+        _, turns = render_episode_for_humans(readable_episode)
         readable_path.parent.mkdir(parents=True, exist_ok=True)
         readable_path.write_text(
             "# Speech conversation\n\nEvaluation: not performed.\n\n"
