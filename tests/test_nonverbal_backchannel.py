@@ -273,3 +273,47 @@ async def test_empty_asr_cannot_commit_an_undelivered_backchannel():
     )
     with pytest.raises(RuntimeError, match="without delivered audio"):
         await runtime.commit_asr_final(update)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status, body, recover, expected_calls",
+    [
+        (503, {"message": "unavailable"}, True, 2),
+        (503, {"message": "unavailable"}, False, 2),
+        (400, {"message": "invalid request"}, False, 1),
+        (503, {"detail": {"code": "empty_audio"}}, False, 1),
+    ],
+)
+async def test_speech_transport_retry_is_bounded(status, body, recover, expected_calls):
+    from openai import APIStatusError, AsyncOpenAI
+    from talktopia.full_duplex.speech_client import _request_with_retry
+
+    calls = []
+
+    def respond(request):
+        calls.append(request.content)
+        if recover and len(calls) == 2:
+            return httpx.Response(200, json={"text": "Heard."})
+        return httpx.Response(status, json=body)
+
+    async with AsyncOpenAI(
+        api_key="test",
+        base_url="http://speech.test/v1",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+    ) as client:
+
+        async def request():
+            return await _request_with_retry(
+                client.audio.transcriptions.create,
+                model="test",
+                file=("audio.wav", wav_bytes(), "audio/wav"),
+            )
+
+        if recover:
+            assert (await request()).text == "Heard."
+        else:
+            with pytest.raises(APIStatusError):
+                await request()
+    assert len(calls) == expected_calls

@@ -1002,7 +1002,8 @@ async def stage_3_simulate(
         )
     async with (
         AsyncOpenAI(
-            base_url=args.asr_base_url, api_key=asr_key, timeout=120, max_retries=2
+            base_url=args.asr_base_url, api_key=asr_key, timeout=120,
+            max_retries=0 if args.interaction_mode == "surface5-full-duplex" else 2
         ) as asr_client,
         AsyncOpenAI(
             base_url=args.tts_base_url, api_key=tts_key, timeout=120, max_retries=0
