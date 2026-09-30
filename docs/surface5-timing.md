@@ -8,17 +8,54 @@ backchannels and disables hesitation, correction, and interruption:
 ```
 
 For a comparison within the same Surface5 implementation, disable backchannels
-with `--no-duplex-backchannels`. Correction and interruption remain disabled.
-`--duplex-corrections` and `--duplex-interruptions` explicitly enable those actions
-for a separate condition. The flags are saved in `run_config.json` and the episode
-start event; resume uses the saved settings. A comparison with round-robin also
-changes turn handling, audio delivery, and observations, so it does not isolate the
-effect of backchannels.
+with `--no-duplex-backchannels`. The live runtime supports only `speak`, `leave`,
+`backchanneling`, and listening `none`. The correction/interruption switches and
+execution branches have been removed. Legacy action and event types remain
+readable for existing artifacts. A comparison with round-robin changes more than
+backchannels, including turn handling, delivery, and observations.
 
-Both modes retain the common 12-action budget and 120-second episode deadline.
-Backchannels and `none` do not consume the action budget. Shutdown drains the
-in-flight audio frame before closing the capture; it does not start another frame.
-No change to the canonical 450-combination population is made by these controls.
+Backchannel decisions are offered only after a non-final sentence has finished
+audio delivery and its ASR result is ready. At that boundary, the audio frame's
+`is_utterance_end` carries the sentence chunk's `is_final`, so
+`has_next_sentence = not is_final`. A non-final sentence produces an `asr_partial`
+observation containing ASR through that sentence, its `sentence_index`, and
+`has_next_sentence: true`. Rolling ASR updates are still logged but do not trigger
+LLM calls. ASR results are assembled in sentence order, without exposing the
+speaker's generated text or later sentence results.
+
+The listener chooses `backchanneling` or `none` under the default controls. The
+runtime permits at most one played backchannel per peer utterance. Once its first
+audio frame is delivered, later sentence ASR results for that utterance are still
+logged but cannot trigger another listener LLM request. Choosing `none` leaves the
+next non-final sentence eligible, and a new peer utterance gets a new opportunity.
+A backchannel that fails synthesis or is discarded before playback does not use
+this allowance. There is no minimum-word threshold. An already busy or speaking
+listener does not start another concurrent decision. The speaker does not wait for
+sentence ASR, the listener's decision, or backchannel synthesis before continuing.
+Sentence results that arrive after the utterance ends cannot trigger a backchannel. Pending late
+backchannels are rejected before their first frame. The final sentence instead
+leads to whole-utterance ASR and one general response with
+`has_next_sentence: false`.
+
+Both modes retain the 12-action budget and the 120-second time setting.
+Surface5 treats 120 seconds as the boundary for selecting new actions. At that
+point it cancels unfinished LLM decisions, stops new response and backchannel
+requests, and finishes speech already selected before the boundary. This includes
+pending TTS, every remaining sentence, any already selected backchannel, and final
+ASR commits. The complete final speech appears in the recording and evaluation
+history. The episode is saved as `completed` with `end_reason: time_limit`, and its
+measured duration can exceed 120 seconds. No extra goodbye or `leave` is generated.
+Run settings record `time_limit_policy: finish_selected_speech_v1`.
+
+`simulation/readable/episode_XXXX.md` uses the same measured utterance and sentence
+timestamps as evaluation history. Its `[MM:SS.mmm - MM:SS.mmm]` spans come from
+delivered audio, including the final utterance that finishes after the time limit.
+
+Actual backend errors and request timeouts still fail the episode; external
+cancellation still cancels it. Round-robin retains its existing hard timeout.
+Backchannels and `none` do not consume the action budget. Ordinary shutdown drains
+the in-flight audio frame before closing the capture. No change to the canonical
+450-combination population is made by these controls.
 
 The first selected `leave` ends a Surface5 episode with reason `agent_left`,
 including when it is the twelfth counted action. No closing sentence or second
@@ -26,15 +63,21 @@ leave is generated. Shutdown preserves delivered PCM and final ASR evidence,
 cancels pending generation, and does not commit further actions. The frozen
 runtime settings record `termination_policy: first_leave`.
 
-The opening and subsequent idle opportunities include SOTOPIA's five base actions.
-An idle `none` commits a pass and gives the other participant an opportunity.
-SOTOPIA's rule evaluator ends the episode as `stale` after three consecutive
-actual passes (`max_stale_turn=2`). Peer placeholders and partial-ASR `none`
-observations are not passes. `ActionCommitted.metadata.actor` identifies the
-actual participant; new ordinary and timed histories retain that participant's
-pass. A first leave or all-pass conversation may contain no delivered audio and
-no latency samples. Existing evaluation rules exclude conversations with no
-interaction; generation does not force speech to make them evaluable.
+Opening and ordinary responses allow only `speak` and `leave`. This includes a
+response deferred until the listener's backchannel finishes. Under the default
+controls, non-final sentence decisions allow only `backchanneling` and `none`.
+`action` and `non-verbal communication` are excluded from all live action masks,
+request schemas, and runtime commits: action-description text cannot substitute
+for delivered speech. Run settings record `surface5_speech_or_leave_v1` as the
+turn-taking policy.
+
+Listening `none` and peer placeholders are not committed passes. If generation
+fails where `none` is unavailable, including the opening, the
+episode fails with diagnostic events instead of consuming a silent turn. Existing
+logs containing passes or non-audio actions remain readable and evaluable.
+`ActionCommitted.metadata.actor` identifies the actual participant in those logs.
+Existing evaluation rules exclude conversations with no interaction; an immediate
+`leave` remains allowed.
 
 ## Clock and audio
 
@@ -71,7 +114,7 @@ counts and arithmetic means for:
 - **Normal response:** the peer utterance's last audio delivery end to the
   response's first audio delivery start. Final ASR, LLM, TTS, and scheduling waits
   are included.
-- **Backchannel:** the first LLM request using the triggering partial ASR
+- **Backchannel:** the first LLM request using the triggering completed-sentence ASR
   observation to the backchannel's first audio delivery start. Retries and TTS
   waits are included. The decision/observation/peer utterance identifiers are
   recorded in `response_latency` events.
@@ -83,39 +126,34 @@ completed episodes using measurement counts, rather than averaging episode means
 
 ## Prompts and evaluation
 
-The runtime loads `talktopia/full_duplex/prompts/simulation_FDB_v7.txt` directly.
-It preserves the body of `sotopia_action_v1.txt`, including the participant's
-freedom to leave, and adds the same 40-word and recipient instructions as the
-round-robin speech prompt plus the partial-ASR and backchannel instructions.
+The runtime loads two templates from `talktopia/full_duplex/prompts/`:
+`simulation_action_general_v1.txt` for opening and ordinary responses, and
+`simulation_action_FDB_v1.txt` for non-final sentence decisions. The general
+template preserves the body of `sotopia_action_v1.txt`, including the participant's
+freedom to leave, and retains the 40-word and recipient instructions. It contains
+no backchannel guidance. The FDB template keeps SOTOPIA's role, social goal,
+naturalness, history, available-action list, and JSON output structure, adding
+only listening and backchannel instructions. It does not instruct the listener
+to generate spoken text or choose a backchannel sound by meaning. Both templates
+receive the same canonical history and role context. Their versions and the
+sentence-based trigger policy are saved in run settings and the start event.
 One request generates `action_type`, `argument`, and `to` together. The runtime
 validates the current observation and floor before allowing TTS to start, and
 checks validity again before delivery. `HiddenSaid` records that same response's
 private speech text; it is not a second LLM request.
 
-Each request uses a separate SOTOPIA action-model subclass whose JSON schema
-contains only the currently available action types. Complete object branches
-distinguish empty arguments for controls from non-empty arguments for speech and
-nonverbal behavior. Runtime validation retains the blank-text and 50-word checks and still
-checks the current floor before synthesis and delivery. The native decoder does
-not enforce the semantic distinction between dialogue and stage narration.
-The prompt distinguishes words spoken aloud from nonverbal action descriptions
-and makes the English-only ASR channel explicit. Spoken arguments with alphabetic
-non-Latin characters use the existing repair/fallback path. This is a script check,
-not an English-language classifier; Latin accents and combining marks are allowed.
-Recipient names and nonverbal descriptions are not subject to this speech rule.
-Compact dollar amounts such as `$1k` or `$3K` also use the existing repair path
-so the model can express the same amount in spoken words. No numeric value is
-estimated or replaced by the runtime. In replay tests, the original compact
-forms were misrecognized while full-word variants preserved the amounts. This
-is an end-to-end TTS/ASR observation, not a guarantee about either model alone.
-Spoken arguments containing asterisks or round, square, or curly brackets use
-the existing repair/fallback path. The runtime does not guess whether a marked
-span is emphasis, an aside, or a stage direction and then delete it. Ordinary
-quotes, apostrophes, and other punctuation remain allowed. These spoken-field
-rules do not change the shared relaxed JSON parser or nonverbal descriptions. The argument schema repeats the spoken-text rule for repair
-requests. `HiddenSaid` preserves the accepted generated text, while each sentence
-chunk records the actual synthesis input. Nonverbal action descriptions remain
-non-audio actions. No narration-removal heuristic is applied.
+Action validation retains required fields/types, the current action mask, and
+nonblank speech with at most 50 whitespace-separated words. Extra JSON fields are
+ignored. A control action's argument is ignored. The model's recipient names do
+not route speech: in this two-agent simulation, audio always goes to the peer.
+
+There are no content filters for controller-related phrases, non-Latin letters,
+compact currency, emphasis, or brackets. The prompt still asks for spoken dialogue
+in English, but formatting does not fail an episode. Before TTS, only `*` symbols
+and redundant whitespace are removed; enclosed words are preserved. Parenthesized
+text and stage directions are not guessed away. OmniVoice backchannel tags remain
+intact. `HiddenSaid` preserves the generated words and sentence chunks record the
+actual synthesis input. Currency and contractions are not expanded.
 
 For Qwen3.5:9b structured requests with reasoning disabled, the Ollama proxy uses
 the native raw generation endpoint with the verified Qwen chat template and an
@@ -126,50 +164,26 @@ unsupported request shapes retain their previous routes. This transport fix also
 applies to round-robin Qwen requests using this proxy; historical frozen runs are
 unchanged, but newly generated outputs may differ.
 
-Generation uses SOTOPIA's structured-output parser and relaxed JSON parsing, recipient
-name resolution, configured action temperature (1.0 in the pipeline), and the
-configured bad-output processing model. A failed parse can issue one repair
-request. A local request adapter preserves the first SOTOPIA HTTP payload and
-uses a content-correction instruction for the one repair: valid JSON can still
-contain invalid speech. The parser includes its last validation error and asks
-the repair model to omit physical stage directions while preserving dialogue.
-The repair uses the same configured model and default sampling as before; no
-shared engine code is modified. The first request
-contains no previous-error feedback. Most repairs retain its JSON schema.
-For a first failure specifically caused by speech markup, the repair can use a
-speech-only character constraint to prevent the model from copying those markers
-again. The native pattern converter bypasses ordinary JSON string escaping, so
-this constraint also excludes ASCII double quotes, backslashes, and control
-characters. If the original argument already contains any of these additional
-characters, the original repair schema is retained. Language, currency, recipient,
-and other repairs retain their original schema. Action masks, empty controls,
-and nonverbal descriptions are preserved. The parser checks the constrained
-repair again even if a provider ignores the schema. This is a repair formatting
-restriction; the initial request and common SOTOPIA body are unchanged.
-When the first parse fails specifically on speech markup, a lexical check rejects
-new or reordered words and deletion of words outside balanced marked spans. It
-also preserves the originally valid action type and recipients. Nested or
-unbalanced markup fails this check. It never removes or replaces speech itself.
-Words inside marked spans can be retained or omitted, so this check cannot
-guarantee that emphasis or an aside is preserved, or that all stage narration is
-removed. Recorded conversations still require inspection for those model errors.
-For example, a diagnostic repair expressed a stage direction as `_nods_` and
-passed the lexical check. A character constraint cannot establish that all
-remaining words are dialogue.
-Final failure produces `none` and an error audit, not another Surface5
-regeneration loop. Decision events and committed passes distinguish this fallback
-with `generation_fallback`. Cancellation still propagates. All inference and
-repair waits remain in measured latency and the live recording.
+Generation never calls another LLM to repair an invalid response. A failed general
+response records the original output and actual error and fails the attempt
+without manufacturing a `none` action. A failed listening decision records the
+error and skips that backchannel opportunity. Completed or failed attempts retain
+their existing event/raw-response audit. Legacy repair logs remain readable.
 
-Completed generation records the exact model response strings in
-`DecisionEvent.raw_responses`, ordered as the initial response and optional
-repair, before removing thinking tags. The existing decision ID links these
-strings to the observation, validation errors, and final action or fallback.
-An actual null response is recorded as null; an API failure adds no response.
-The strings remain diagnostic data and never enter participant history or
-evaluation dialogue. The event file is covered by the existing artifact hashes.
-Work cancelled before returning a decision is outside this completed-decision
-audit. Older events without the field remain readable.
+Full-duplex episodes have one attempt; failures are not automatically restarted.
+Only transient LLM/ASR/TTS transport errors get one request-level retry. Empty TTS
+retains its existing one retry with a different deterministic seed, without a
+nested HTTP retry for that same error. Invalid PCM or inconsistent internal state
+still fails. External cancellation propagates.
+
+An empty final ASR transcript is allowed when audio was actually delivered. Its
+empty text, sentence timestamps, and PCM evidence are kept in agent/evaluation
+history; generated text is never substituted for missing recognition.
+
+Frozen run settings and start events record `validation_policy: essential_v1`,
+`output_repair_policy: disabled`, and `episode_max_attempts: 1`. Old configurations
+cannot silently resume under these rules. Round-robin and evaluation retain their
+existing behavior, and the shared engine is unchanged.
 
 The shared speech API uses `without_timestamps=True` when decoding Whisper text.
 In a recorded 3.63-second utterance, timestamp-token decoding reproducibly added
@@ -195,10 +209,11 @@ The agent history contains the initial SOTOPIA observation and every subsequent
 canonical observation, without an eight-entry limit. Both participants see the
 confirmed ASR text, including for their own earlier utterances. Private generated
 speech is kept in artifacts, not substituted for ASR in that history. Only the
-current partial ASR observation is appended to the request. Backchannel responses
-have an empty model argument. After runtime validation, the exact OmniVoice tag
-`[confirmation-en]` produces a short nonverbal acknowledgment in the agent's
-voice. The tag is TTS input, not recognized speech. Backchannels with this tag use
+current completed-sentence ASR observation is appended to the listening request.
+Backchannel responses have an empty model argument. After runtime validation,
+the runtime selects uniformly from `yeah`, `[confirmation-en]`, `Uh-huh`,
+`Mm-hmm`, and `Yep`, independently of their meanings. The selected item is TTS
+input, not recognized speech. Backchannels with `[confirmation-en]` use
 OmniVoice's [`duration=0.6` generation parameter](https://github.com/k2-fsa/OmniVoice/blob/main/docs/generation-parameters.md)
 uniformly across
 voices; the actual delivered duration is measured and may differ. Ordinary
