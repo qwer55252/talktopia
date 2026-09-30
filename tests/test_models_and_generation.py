@@ -1,4 +1,4 @@
-"""Surface5 preserves the first SOTOPIA request and bounds content repair."""
+"""Surface5 generates once, validates locally, and never asks an LLM to repair."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from talktopia.full_duplex.actions import DuplexObservation, StreamingObservatio
 from talktopia.full_duplex.generation import (
     AgentSessionContext,
     DuplexGenerationEngine,
+    GeneratedAction,
+    GenerationFailure,
     _action_model,
 )
 from talktopia.models.config import BACKCHANNEL_TTS_INPUTS
@@ -90,74 +92,6 @@ def configured_generation():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "action_type, argument",
-    [
-        ("speak", "I can propose a practical solution. One more sentence."),
-        ("action", "slides the signed form across the table"),
-        ("non-verbal communication", "nods toward the empty chair"),
-        ("backchanneling", ""),
-        ("none", ""),
-        ("leave", ""),
-    ],
-)
-async def test_action_and_argument_share_one_actual_model_call(
-    monkeypatch, action_type, argument
-):
-    calls = mock_completions(
-        monkeypatch, [{"action_type": action_type, "argument": argument, "to": ["Bob"]}]
-    )
-    engine = DuplexGenerationEngine(MODEL)
-    session = make_context()
-    history = (
-        "Here is the context of the interaction:\nParticipants: Alice One; Bob Two\n"
-        "Alice's goal: Reach a workable plan.\n"
-        + "\n".join(
-            f"Turn #{index}: Bob said: statement {index}." for index in range(13)
-        )
-    )
-    generated = await engine.generate_action(
-        session, make_observation([action_type]), history
-    )
-    assert generated.argument == argument
-    assert generated.decision.action_type == action_type
-    assert generated.decision.to == ["Bob Two"]
-    assert not generated.fallback
-    assert engine.decision_audit(generated.decision.decision_id) == (1, ())
-    assert engine.decision_started_ns(generated.decision.decision_id) > 0
-    if action_type == "speak":
-        hidden = engine.make_hidden_said(session, generated)
-        assert hidden.text == argument
-        assert engine.hidden_said_attempt(hidden.hidden_said_id) == 1
-        assert (
-            " ".join(chunk.text for chunk in engine.split_into_sentence_chunks(hidden))
-            == argument
-        )
-    elif action_type in {"action", "non-verbal communication"}:
-        assert generated.decision.non_audio_argument == argument
-        assert engine.non_audio_argument_attempt(generated.decision.decision_id) == 1
-    elif action_type == "backchanneling":
-        hidden = engine.make_backchannel(session, generated.decision)
-        assert hidden.text in BACKCHANNEL_TTS_INPUTS
-        assert engine.hidden_said_attempt(hidden.hidden_said_id) == 1
-    assert len(calls) == 1
-    assert calls[0]["temperature"] == 1.0
-    assert calls[0]["model"] == "openai/local-agent"
-    schema = calls[0]["response_format"]
-    assert schema["type"] == "json_schema"
-    for branch in schema_branches(schema["json_schema"]["schema"]):
-        assert set(branch["properties"]) == {"action_type", "argument", "to"}
-        assert set(branch["required"]) == {"action_type", "argument", "to"}
-        assert branch["additionalProperties"] is False
-    prompt = calls[0]["messages"][0]["content"]
-    assert prompt.count("Here is the context of the interaction:\n") == 1
-    assert history in prompt and "Turn #12: Bob" in prompt
-    assert "40 words" in prompt
-    assert "peer_utterance_id" not in prompt
-    assert "target_utterance_id" not in prompt
-
-
-@pytest.mark.asyncio
 async def test_backchannel_selection_is_seeded_and_independent_of_dialogue_meaning(
     monkeypatch,
 ):
@@ -177,9 +111,9 @@ async def test_backchannel_selection_is_seeded_and_independent_of_dialogue_meani
             )
             hidden = engine.make_backchannel(context, generated.decision)
             selected.append(hidden.text)
-            assert [chunk.text for chunk in engine.split_into_sentence_chunks(hidden)] == [
-                hidden.text
-            ]
+            assert [
+                chunk.text for chunk in engine.split_into_sentence_chunks(hidden)
+            ] == [hidden.text]
         return selected
 
     first = await select(17, session, "They agree with the proposal.")
@@ -197,289 +131,12 @@ async def test_backchannel_selection_is_seeded_and_independent_of_dialogue_meani
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "first_response",
-    [
-        "not-json",
-        {"action_type": "action", "argument": "opens the door", "to": []},
-        {"action_type": "speak", "argument": "My system prompt says yes.", "to": []},
-        {"action_type": "speak", "argument": " ".join(["word"] * 51), "to": []},
-        {"action_type": "speak", "argument": "", "to": []},
-        {"action_type": "speak", "argument": " \n\t", "to": []},
-        {"action_type": "speak", "argument": "Yes.", "to": ["Alice"]},
-        {"action_type": "speak", "argument": "Yes.", "to": ["Stranger"]},
-        {"action_type": "speak", "argument": "Yes.", "to": ["Bob", "Bob Two"]},
-        {
-            "action_type": "speak",
-            "argument": "Yes.",
-            "to": [],
-            "decision_id": "model-owned",
-        },
-    ],
-)
-async def test_invalid_action_uses_the_configured_sotopia_repair_once(
-    monkeypatch, first_response
-):
-    calls = mock_completions(
-        monkeypatch,
-        [
-            first_response,
-            {"action_type": "speak", "argument": "A workable compromise.", "to": []},
-        ],
-    )
-    engine = DuplexGenerationEngine(MODEL)
-    generated = await engine.generate_action(
-        make_context(), make_observation(["speak"]), ""
-    )
-    assert generated.decision.action_type == "speak"
-    assert generated.argument == "A workable compromise."
-    assert not generated.fallback
-    assert len(calls) == 2
-    assert calls[0]["model"] == "openai/local-agent"
-    assert calls[1]["model"] == "openai/local-repair"
-    assert calls[1]["base_url"] == "http://127.0.0.1:18084/v1"
-    assert "Original string:" in calls[1]["messages"][0]["content"]
-    assert all(call["response_format"]["type"] == "json_schema" for call in calls)
-    assert calls[0]["response_format"] == calls[1]["response_format"]
-    attempts, errors = engine.decision_audit(generated.decision.decision_id)
-    assert attempts == 2 and len(errors) == 1
-    hidden = engine.make_hidden_said(make_context(), generated)
-    assert engine.hidden_said_attempt(hidden.hidden_said_id) == 2
-    assert len(calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_invalid_repair_falls_back_to_none_without_an_outer_retry(
-    monkeypatch, caplog
-):
-    calls = mock_completions(monkeypatch, ["not-json", "still not-json"])
-    engine = DuplexGenerationEngine(MODEL)
-    generated = await engine.generate_action(
-        make_context(), make_observation(["speak"]), ""
-    )
-    assert generated.fallback and generated.decision.action_type == "none"
-    assert generated.argument == "" and generated.decision.to == []
-    attempts, errors = engine.decision_audit(generated.decision.decision_id)
-    assert attempts == 2 and len(errors) == 2
-    assert len(calls) == 2
-    assert "Failed to generate action" in caplog.text
-    assert generated.raw_responses == ("not-json", "still not-json")
-
-
-@pytest.mark.asyncio
-async def test_request_failure_is_a_logged_pass(monkeypatch):
-    calls = mock_completions(monkeypatch, [RuntimeError("server unavailable")])
-    engine = DuplexGenerationEngine(MODEL)
-    generated = await engine.generate_action(
-        make_context(), make_observation(["speak"]), ""
-    )
-    assert generated.fallback and generated.decision.action_type == "none"
-    assert len(calls) == 1
-    assert (
-        "server unavailable"
-        in engine.decision_audit(generated.decision.decision_id)[1][0]
-    )
-    assert generated.raw_responses == ()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "responses", [[asyncio.CancelledError()], ["not-json", asyncio.CancelledError()]]
-)
-async def test_cancellation_propagates_from_generation_or_repair(
-    monkeypatch, responses
-):
-    calls = mock_completions(monkeypatch, responses)
+async def test_cancellation_propagates_from_generation(monkeypatch):
+    calls = mock_completions(monkeypatch, [asyncio.CancelledError()])
     engine = DuplexGenerationEngine(MODEL)
     with pytest.raises(asyncio.CancelledError):
         await engine.generate_action(make_context(), make_observation(["speak"]), "")
-    assert len(calls) == len(responses)
-    assert not engine._decision_audits
-
-
-@pytest.mark.asyncio
-async def test_fifty_word_speech_remains_valid(monkeypatch):
-    text = " ".join(["word"] * 50)
-    calls = mock_completions(
-        monkeypatch, [{"action_type": "speak", "argument": text, "to": []}]
-    )
-    engine = DuplexGenerationEngine(MODEL)
-    generated = await engine.generate_action(
-        make_context(), make_observation(["speak"]), ""
-    )
-    assert not generated.fallback
-    assert engine.make_hidden_said(make_context(), generated).text == text
-    assert len(calls) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("action_type", ["correction", "interruption"])
-@pytest.mark.parametrize("wrapped", [False, True])
-async def test_target_comes_only_from_current_observation(
-    monkeypatch, action_type, wrapped
-):
-    response = {"action_type": action_type, "argument": "That was Thursday.", "to": []}
-    calls = mock_completions(
-        monkeypatch, [{"properties": response} if wrapped else response]
-    )
-    engine = DuplexGenerationEngine(MODEL)
-    generated = await engine.generate_action(
-        make_context(),
-        make_observation(
-            ["none", action_type],
-            source="asr_partial",
-            peer_speaking=True,
-            peer_utterance_id="utterance-bob-1",
-            target_utterance_id="utterance-bob-1",
-        ),
-        "",
-    )
-    assert generated.decision.action_type == action_type
-    assert generated.decision.target_utterance_id == "utterance-bob-1"
-    assert len(calls) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "action_type, argument",
-    [
-        ("backchanneling", "yes"),
-        ("leave", "bye"),
-        ("none", "hmm"),
-        ("correction", "Thursday."),
-    ],
-)
-async def test_invalid_control_argument_or_missing_target_is_repaired(
-    monkeypatch, action_type, argument
-):
-    calls = mock_completions(
-        monkeypatch,
-        [
-            {"action_type": action_type, "argument": argument, "to": []},
-            {"action_type": "none", "argument": "", "to": []},
-        ],
-    )
-    engine = DuplexGenerationEngine(MODEL)
-    generated = await engine.generate_action(
-        make_context(), make_observation(["none", action_type]), ""
-    )
-    assert not generated.fallback and generated.decision.action_type == "none"
-    assert len(calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_partial_schema_matches_mask_in_initial_and_repair_requests(monkeypatch):
-    calls = mock_completions(
-        monkeypatch,
-        [
-            {"action_type": "speak", "argument": "A premature answer.", "to": []},
-            {"action_type": "backchanneling", "argument": "", "to": []},
-        ],
-    )
-    generated = await DuplexGenerationEngine(MODEL).generate_action(
-        make_context(),
-        make_observation(
-            ["none", "backchanneling"], source="asr_partial", peer_speaking=True
-        ),
-        "The peer has not finished speaking.",
-    )
-    assert not generated.fallback
-    assert generated.decision.action_type == "backchanneling"
-    assert len(calls) == 2
-    assert calls[0]["response_format"] == calls[1]["response_format"]
-    for call in calls:
-        schema = call["response_format"]["json_schema"]["schema"]
-        assert schema["properties"]["action_type"]["enum"] == ["none", "backchanneling"]
-        assert schema["properties"]["argument"]["const"] == ""
-    prompt = calls[0]["messages"][0]["content"]
-    assert '"enum": ["none", "backchanneling"]' in prompt
-    assert "failed content validation" in calls[1]["messages"][0]["content"]
-
-
-@pytest.mark.parametrize(
-    "actions",
-    [
-        ["none", "backchanneling"],
-        ["speak"],
-        ["non-verbal communication", "action"],
-        ["none", "speak", "non-verbal communication", "action", "leave"],
-        ["none", "speak", "hesitation", "correction", "interruption", "backchanneling"],
-    ],
-)
-def test_action_schema_preserves_mask_and_enforces_argument_length(actions):
-    schema = _action_model(actions).model_json_schema()
-    Draft202012Validator.check_schema(schema)
-    validator = Draft202012Validator(schema)
-    assert "pattern" not in json.dumps(schema)
-    if "anyOf" in schema:
-        assert "properties" not in schema and "required" not in schema
-    seen_actions = []
-    for branch in schema_branches(schema):
-        assert branch["type"] == "object"
-        assert branch["additionalProperties"] is False
-        assert set(branch["required"]) == {"action_type", "argument", "to"}
-        assert set(branch["properties"]) == {"action_type", "argument", "to"}
-        seen_actions.extend(branch["properties"]["action_type"]["enum"])
-    assert sorted(seen_actions) == sorted(actions)
-
-    for action in actions:
-        empty = action in {"none", "leave", "backchanneling"}
-        valid = {"action_type": action, "argument": "" if empty else "Yes.", "to": []}
-        assert validator.is_valid(valid)
-        assert not validator.is_valid({**valid, "argument": "Yes." if empty else ""})
-        assert not validator.is_valid({**valid, "extra": "unexpected"})
-        assert not validator.is_valid({**valid, "to": [123]})
-        assert not validator.is_valid(
-            {key: value for key, value in valid.items() if key != "to"}
-        )
-    assert not validator.is_valid(
-        {"action_type": "unavailable", "argument": "", "to": []}
-    )
-
-
-def test_schema_keeps_unicode_quotes_and_backslashes_in_nonempty_arguments():
-    schema = _action_model(["speak", "action", "none"]).model_json_schema()
-    validator = Draft202012Validator(schema)
-    speech = 'I said "yes"; café costs £5. The path is C:\\notes.'
-    assert validator.is_valid({"action_type": "speak", "argument": speech, "to": []})
-    assert validator.is_valid(
-        {
-            "action_type": "action",
-            "argument": "*nods* (smiles) [waves] {points}",
-            "to": [],
-        }
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("action_type", ["action", "non-verbal communication"])
-async def test_blank_behavior_uses_same_masked_schema_for_the_single_repair(
-    monkeypatch, action_type
-):
-    calls = mock_completions(
-        monkeypatch,
-        [
-            {"action_type": action_type, "argument": "", "to": []},
-            {"action_type": action_type, "argument": "*nods*", "to": []},
-        ],
-    )
-    engine = DuplexGenerationEngine(MODEL)
-    generated = await engine.generate_action(
-        make_context(), make_observation(["none", "speak", action_type, "leave"]), ""
-    )
-    assert not generated.fallback and generated.argument == "*nods*"
-    assert generated.decision.action_type == action_type
-    assert len(calls) == 2
-    assert calls[0]["response_format"] == calls[1]["response_format"]
-    assert engine.decision_audit(generated.decision.decision_id)[0] == 2
-    schema = calls[0]["response_format"]["json_schema"]["schema"]
-    validator = Draft202012Validator(schema)
-    assert not validator.is_valid(
-        {"action_type": action_type, "argument": "", "to": []}
-    )
-    assert validator.is_valid(
-        {"action_type": action_type, "argument": "*nods*", "to": []}
-    )
+    assert len(calls) == 1 and not engine._decision_audits
 
 
 @pytest.mark.asyncio
@@ -521,7 +178,7 @@ async def test_concurrent_masks_do_not_change_each_others_schema(monkeypatch):
         ]
     )
     assert [r.decision.action_type for r in results] == ["speak", "backchanneling"]
-    assert all(not r.fallback for r in results)
+    assert all(isinstance(r, GeneratedAction) for r in results)
     assert len(calls) == 2
     assert _JointAction.model_json_schema() == original
     first_schema = calls[0]["response_format"]["json_schema"]["schema"]
@@ -536,497 +193,130 @@ async def test_concurrent_masks_do_not_change_each_others_schema(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action_type", ["action", "non-verbal communication"])
-async def test_non_audio_descriptions_keep_markup(monkeypatch, action_type):
-    text = "*nods* (smiles) [waves] {points to the chair}"
+@pytest.mark.parametrize(
+    "action,argument",
+    [
+        ("speak", "I can offer a solution."),
+        ("leave", "Goodbye."),
+        ("none", "Still listening."),
+        ("backchanneling", "Yeah."),
+    ],
+)
+async def test_one_call_routes_to_peer_and_ignores_control_arguments(
+    monkeypatch, action, argument
+):
     calls = mock_completions(
-        monkeypatch, [{"action_type": action_type, "argument": text, "to": []}]
+        monkeypatch,
+        [
+            {
+                "action_type": action,
+                "argument": argument,
+                "to": ["Unknown", "Alice One", "Unknown"],
+                "unused": 123,
+            }
+        ],
     )
-    generated = await DuplexGenerationEngine(MODEL).generate_action(
-        make_context(), make_observation([action_type]), ""
+    engine = DuplexGenerationEngine(MODEL)
+    generated = await engine.generate_action(
+        make_context(), make_observation([action]), "full history"
     )
-    assert not generated.fallback and generated.argument == text
-    assert generated.decision.non_audio_argument == text
+    assert isinstance(generated, GeneratedAction)
+    assert generated.decision.action_type == action and generated.decision.to == []
+    assert generated.argument == (argument if action == "speak" else "")
+    assert len(calls) == 1 and calls[0]["temperature"] == 1.0
+    assert "full history" in calls[0]["messages"][0]["content"]
+    assert engine.decision_audit(generated.decision.decision_id) == (1, ())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The table’s like a blueprint for *my* portfolio.",
+        "I can contribute **five hundred** dollars.",
+        "*takes a slow breath* We agree (for now).",
+        "I need $3K. Спасибо. evaluator social goal.",
+        "The table's legs are uneven.",
+        " ".join(["word"] * 50),
+    ],
+)
+async def test_speech_words_reach_tts_without_content_filters(monkeypatch, text):
+    calls = mock_completions(
+        monkeypatch, [{"action_type": "speak", "argument": text, "to": []}]
+    )
+    engine = DuplexGenerationEngine(MODEL)
+    generated = await engine.generate_action(
+        make_context(), make_observation(["speak"]), ""
+    )
+    assert isinstance(generated, GeneratedAction)
+    hidden = engine.make_hidden_said(make_context(), generated)
+    assert generated.argument == hidden.text == text
+    assert " ".join(
+        c.text for c in engine.split_into_sentence_chunks(hidden)
+    ) == " ".join(text.replace("*", "").split())
     assert len(calls) == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "action_type, original, repaired",
+    "response",
     [
-        # Cover each markup form on speak, then the shared guard on other actions.
-        (
-            "speak",
-            "I *need* to keep the *other* grand.",
-            "I need to keep the other grand.",
-        ),
-        ("speak", "**smiles** We can meet tomorrow.", "We can meet tomorrow."),
-        ("speak", "I can meet (tomorrow).", "I can meet tomorrow."),
-        ("speak", "[waves] Hello.", "Hello."),
-        ("speak", "{sighs} We can meet tomorrow.", "We can meet tomorrow."),
-        ("hesitation", "[waves] Hello.", "Hello."),
-        ("correction", "[waves] Hello.", "Hello."),
-        ("interruption", "[waves] Hello.", "Hello."),
+        "not-json",
+        {"action_type": "speak", "argument": "  ", "to": []},
+        {"action_type": "speak", "argument": " ".join(["word"] * 51), "to": []},
+        {"action_type": "speak", "argument": 123, "to": []},
+        {"action_type": "speak", "argument": "Hello."},
+        {"action_type": "action", "argument": "opens a door", "to": []},
+        {"action_type": "speak", "argument": "Hello.", "to": "Bob"},
     ],
 )
-async def test_marked_speech_uses_existing_repair_without_deleting_words(
-    monkeypatch, original, repaired, action_type
-):
-    calls = mock_completions(
-        monkeypatch,
-        [
-            {"action_type": action_type, "argument": original, "to": []},
-            {"action_type": action_type, "argument": repaired, "to": []},
-        ],
-    )
+async def test_unusable_response_returns_explicit_error_not_none(monkeypatch, response):
+    calls = mock_completions(monkeypatch, [response])
     engine = DuplexGenerationEngine(MODEL)
-    generated = await engine.generate_action(
-        make_context(), make_observation([action_type], peer_utterance_id="peer-1"), ""
+    result = await engine.generate_action(
+        make_context(), make_observation(["speak", "leave"]), ""
     )
-    assert not generated.fallback and generated.argument == repaired
-    assert generated.decision.action_type == action_type
-    assert len(calls) == 2
-    assert "asterisks" in engine.decision_audit(generated.decision.decision_id)[1][0]
-    hidden = engine.make_hidden_said(make_context(), generated)
-    assert hidden.text == repaired
-    assert (
-        " ".join(c.text for c in engine.split_into_sentence_chunks(hidden)) == repaired
-    )
-    for call in calls:
-        for branch in schema_branches(call["response_format"]["json_schema"]["schema"]):
-            description = branch["properties"]["argument"]["description"]
-            assert "without asterisks" in description and "40 words" in description
+    assert isinstance(result, GenerationFailure) and result.error
+    assert len(calls) == 1 and len(result.raw_responses) == 1
+    assert engine.decision_audit(result.decision_id) == (1, (result.error,))
+    assert not hasattr(result, "decision")
 
 
 @pytest.mark.asyncio
-async def test_persistent_starred_speech_falls_back_before_synthesis(monkeypatch):
-    value = {"action_type": "speak", "argument": "I *need* that.", "to": []}
-    calls = mock_completions(monkeypatch, [value, value])
-    generated = await DuplexGenerationEngine(MODEL).generate_action(
+async def test_api_error_is_explicit_and_carries_no_invented_response(monkeypatch):
+    calls = mock_completions(monkeypatch, [RuntimeError("server unavailable")])
+    result = await DuplexGenerationEngine(MODEL).generate_action(
         make_context(), make_observation(["speak"]), ""
     )
-    assert generated.fallback and generated.decision.action_type == "none"
-    assert generated.argument == "" and len(calls) == 2
+    assert isinstance(result, GenerationFailure)
+    assert (
+        "server unavailable" in result.error
+        and result.raw_responses == ()
+        and len(calls) == 1
+    )
 
 
-@pytest.mark.asyncio
-async def test_markup_repair_schema_restricts_only_speech_and_preserves_initial_request(
-    monkeypatch,
-):
-    actions = ["none", "speak", "non-verbal communication", "action", "leave"]
-    original = "*adjusts cufflinks nervously* Three thousand’s quite the bite."
-    repaired = "Three thousand’s quite the bite."
-    original_schema = _action_model(actions).model_json_schema()
-    calls = mock_completions(
-        monkeypatch,
-        [
-            {"action_type": "speak", "argument": original, "to": ["Bob"]},
-            {"action_type": "speak", "argument": repaired, "to": ["Bob"]},
-        ],
-    )
-    generated = await DuplexGenerationEngine(MODEL).generate_action(
-        make_context(), make_observation(actions), ""
-    )
-    assert generated.argument == repaired and not generated.fallback
-    assert len(calls) == 2
-    assert calls[0]["response_format"]["json_schema"]["schema"] == original_schema
-    assert _action_model(actions).model_json_schema() == original_schema
-    schema = calls[1]["response_format"]["json_schema"]["schema"]
+@pytest.mark.parametrize("actions", [["speak", "leave"], ["none", "backchanneling"]])
+def test_schema_keeps_types_and_action_mask_without_rejecting_extra_fields(actions):
+    schema = _action_model(actions).model_json_schema()
+    Draft202012Validator.check_schema(schema)
     validator = Draft202012Validator(schema)
-
-    def valid(action, argument):
-        return validator.is_valid(
-            {"action_type": action, "argument": argument, "to": []}
+    for action in actions:
+        valid = {"action_type": action, "argument": "Hello.", "to": [], "unused": 1}
+        assert validator.is_valid(valid)
+        assert not validator.is_valid({**valid, "argument": 5})
+        assert not validator.is_valid(
+            {k: v for k, v in valid.items() if k != "argument"}
         )
-
-    assert valid("speak", "Café, ‘yes’—it’s fine.")
-    assert not valid("speak", "")
-    forbidden = list(range(32)) + [127] + list(map(ord, '"\\*()[]{}'))
-    for code in forbidden:
-        assert not valid("speak", "before" + chr(code) + "after")
-    for action in ("none", "leave"):
-        assert valid(action, "") and not valid(action, "words")
-    for action in ("action", "non-verbal communication"):
-        assert valid(action, '**nods** [slowly] "yes" \\')
-    assert not valid("interruption", "Wait.")
-    assert all(
-        branch["additionalProperties"] is False for branch in schema_branches(schema)
+    assert not validator.is_valid(
+        {"action_type": "interruption", "argument": "Hello", "to": []}
     )
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "original, repaired",
-    [
-        ('*nods* Say "yes".', 'Say "yes".'),
-        ("*nods* Path C:\\temp.", "Path C:\\temp."),
-        ("*nods* Say\tyes.", "Say yes."),
-        ("*nods* Say\nyes.", "Say yes."),
-        ("*nods* Say\x7fyes.", "Say\x7fyes."),
-    ],
+    "action",
+    ["hesitation", "correction", "interruption", "action", "non-verbal communication"],
 )
-async def test_existing_quote_backslash_or_control_keeps_original_repair_schema(
-    monkeypatch, original, repaired
-):
-    calls = mock_completions(
-        monkeypatch,
-        [
-            {"action_type": "speak", "argument": original, "to": []},
-            {"action_type": "speak", "argument": repaired, "to": []},
-        ],
-    )
-    generated = await DuplexGenerationEngine(MODEL).generate_action(
-        make_context(), make_observation(["speak"]), ""
-    )
-    assert not generated.fallback
-    assert calls[0]["response_format"] == calls[1]["response_format"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("repaired", ['"Hello."', "Hello.\\", "Hello.\n", "Hello.\x7f"])
-async def test_narrow_repair_is_validated_when_provider_ignores_schema(
-    monkeypatch, repaired
-):
-    calls = mock_completions(
-        monkeypatch,
-        [
-            {"action_type": "speak", "argument": "*nods* Hello.", "to": []},
-            {"action_type": "speak", "argument": repaired, "to": []},
-        ],
-    )
-    generated = await DuplexGenerationEngine(MODEL).generate_action(
-        make_context(), make_observation(["speak"]), ""
-    )
-    assert generated.fallback and generated.argument == "" and len(calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_concurrent_markup_repairs_do_not_share_schema_selection(monkeypatch):
-    backend = importlib.import_module("sotopia.generation_utils.generate")
-    repair_calls = {}
-
-    async def complete(**kwargs):
-        await asyncio.sleep(0)
-        content = kwargs["messages"][0]["content"]
-        is_repair = "Original string:" in content
-        quoted = "Quoted" in content
-        argument = 'Quoted "yes".' if quoted else "Plain yes."
-        if not is_repair:
-            argument = "*nods* " + argument
-        else:
-            repair_calls[quoted] = kwargs["response_format"]["json_schema"]["schema"]
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content=json.dumps(
-                            {"action_type": "speak", "argument": argument, "to": []}
-                        )
-                    )
-                )
-            ]
-        )
-
-    monkeypatch.setattr(backend, "acompletion", complete)
-    results = await asyncio.gather(
-        *[
-            DuplexGenerationEngine(MODEL).generate_action(
-                make_context(), make_observation(["speak"]), history
-            )
-            for history in ("Plain", "Quoted")
-        ]
-    )
-    assert all(not result.fallback for result in results)
-    assert "pattern" in repair_calls[False]["properties"]["argument"]
-    assert "pattern" not in repair_calls[True]["properties"]["argument"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "original, repaired",
-    [
-        ("*nods*", "Hello."),
-        ("*raises an eyebrow* Could we talk privately?", "You mentioned it yesterday."),
-        ("*nods* Ava, I can help.", "I can help."),
-        ("*nods* I cannot help.", "I can help."),
-        ("*nods* I can't help.", "I can help."),
-        ("*nods* The balance is -50.", "The balance is 50."),
-        ("*nods* The balance is $50.", "The balance is 50."),
-        ("*nods* The balance is 5%.", "The balance is 5."),
-        ("I *need* the other grand.", "I need the other half."),
-        ("*nods* I can help. I can wait.", "I can wait. I can help."),
-        ("*I can help* I can help.", "I can."),
-        ("*nods Hello.", "Hello."),
-        ("(nods [quietly]) Hello.", "Hello."),
-        ("**nods*** Hello.", "Hello."),
-        ("[] Hello.", "Hello."),
-    ],
-)
-async def test_markup_repair_rejects_new_words_and_ambiguous_spans(
-    monkeypatch, original, repaired
-):
-    calls = mock_completions(
-        monkeypatch,
-        [
-            {"action_type": "speak", "argument": original, "to": []},
-            {"action_type": "speak", "argument": repaired, "to": []},
-        ],
-    )
-    generated = await DuplexGenerationEngine(MODEL).generate_action(
-        make_context(), make_observation(["speak"]), ""
-    )
-    assert generated.fallback and generated.decision.action_type == "none"
-    assert generated.argument == "" and len(calls) == 2
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "original, repaired",
-    [
-        ("[nods] I can’t help.", "I can't help!"),
-        ("**nods** We can meet tomorrow.", "we can meet tomorrow"),
-        ("*I can help* I can help.", "I can help."),
-        ("*nods* Your smiles make me happy.", "Your smiles make me happy."),
-    ],
-)
-async def test_markup_repair_keeps_lexical_content_and_common_punctuation(
-    monkeypatch, original, repaired
-):
-    mock_completions(
-        monkeypatch,
-        [
-            {"action_type": "speak", "argument": original, "to": ["Bob"]},
-            {"action_type": "speak", "argument": repaired, "to": ["Bob Two"]},
-        ],
-    )
-    generated = await DuplexGenerationEngine(MODEL).generate_action(
-        make_context(), make_observation(["speak"]), ""
-    )
-    assert not generated.fallback and generated.argument == repaired
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "original_to, repaired_type, repaired_to, fallback",
-    [
-        (["Bob"], "speak", [], True),
-        ([], "speak", ["Bob"], True),
-        ([], "hesitation", [], True),
-        ([], "none", [], True),
-        (["Stranger"], "speak", ["Bob"], False),
-        (["Alice"], "speak", ["Bob"], False),
-        (["Bob", "Bob Two"], "speak", ["Bob"], False),
-    ],
-)
-async def test_markup_repair_preserves_valid_action_and_recipients(
-    monkeypatch, original_to, repaired_type, repaired_to, fallback
-):
-    mock_completions(
-        monkeypatch,
-        [
-            {"action_type": "speak", "argument": "*nods* Hello.", "to": original_to},
-            {
-                "action_type": repaired_type,
-                "argument": "" if repaired_type == "none" else "Hello.",
-                "to": repaired_to,
-            },
-        ],
-    )
-    generated = await DuplexGenerationEngine(MODEL).generate_action(
-        make_context(), make_observation(["speak", "hesitation", "none"]), ""
-    )
-    assert generated.fallback is fallback
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("original", ["...", "—", "🙂"])
-@pytest.mark.parametrize("repair_succeeds", [True, False])
-async def test_inaudible_speech_uses_repair_or_none(
-    monkeypatch, original, repair_succeeds
-):
-    first = {"action_type": "speak", "argument": original, "to": []}
-    second = {
-        "action_type": "speak",
-        "argument": "Hello." if repair_succeeds else original,
-        "to": [],
-    }
-    calls = mock_completions(monkeypatch, [first, second])
-    engine = DuplexGenerationEngine(MODEL)
-    generated = await engine.generate_action(
-        make_context(), make_observation(["speak"]), ""
-    )
-    assert len(calls) == 2
-    assert (
-        "audible words" in engine.decision_audit(generated.decision.decision_id)[1][0]
-    )
-    assert generated.fallback is not repair_succeeds
-    assert generated.decision.action_type == ("speak" if repair_succeeds else "none")
-    if repair_succeeds:
-        hidden = engine.make_hidden_said(make_context(), generated)
-        assert [chunk.text for chunk in engine.split_into_sentence_chunks(hidden)] == [
-            "Hello."
-        ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "action_type, original",
-    [
-        ("speak", "Family first—但不多聊那回事。"),
-        ("speak", "Please help. Спасибо."),
-        ("hesitation", "Please help. Спасибо."),
-        ("correction", "Please help. Спасибо."),
-        ("interruption", "Please help. Спасибо."),
-    ],
-)
-async def test_non_latin_speech_uses_existing_repair_with_error_feedback(
-    monkeypatch, action_type, original
-):
-    repaired = "Family comes first. Let us discuss the details."
-    calls = mock_completions(
-        monkeypatch,
-        [
-            {"action_type": action_type, "argument": original, "to": []},
-            {"action_type": action_type, "argument": repaired, "to": []},
-        ],
-    )
-    engine = DuplexGenerationEngine(MODEL)
-    generated = await engine.generate_action(
-        make_context(), make_observation([action_type], peer_utterance_id="peer-1"), ""
-    )
-    assert not generated.fallback and generated.argument == repaired
-    assert generated.decision.action_type == action_type
-    assert len(calls) == 2
-    assert (
-        "The previous action failed validation"
-        not in calls[0]["messages"][0]["content"]
-    )
-    assert (
-        "English speech requires Latin-script letters"
-        in calls[1]["messages"][0]["content"]
-    )
-    assert calls[0]["response_format"] == calls[1]["response_format"]
-    hidden = engine.make_hidden_said(make_context(), generated)
-    assert (
-        " ".join(c.text for c in engine.split_into_sentence_chunks(hidden)) == repaired
-    )
-
-
-@pytest.mark.asyncio
-async def test_repeated_non_latin_speech_falls_back_without_extra_calls(monkeypatch):
-    response = {"action_type": "speak", "argument": "你好，朋友。", "to": []}
-    calls = mock_completions(monkeypatch, [response, response])
-    generated = await DuplexGenerationEngine(MODEL).generate_action(
-        make_context(), make_observation(["speak"]), ""
-    )
-    assert len(calls) == 2 and generated.fallback
-    assert generated.decision.action_type == "none"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "action_type, text",
-    [
-        ("speak", "José, the café is open. Nai\u0308ve “yes” isn’t a promise."),
-        ("action", "递给对方一杯茶。"),
-        ("non-verbal communication", "*点头*"),
-    ],
-)
-async def test_speech_script_guard_keeps_accents_and_non_audio_unicode(
-    monkeypatch, action_type, text
-):
-    calls = mock_completions(
-        monkeypatch, [{"action_type": action_type, "argument": text, "to": ["李明"]}]
-    )
-    session = make_context()
-    session = replace(session, peer_name="李明")
-    generated = await DuplexGenerationEngine(MODEL).generate_action(
-        session, make_observation([action_type]), ""
-    )
-    assert not generated.fallback and generated.argument == text
-    assert generated.decision.to == ["李明"] and len(calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_concurrent_requests_do_not_share_repair_feedback(monkeypatch):
-    backend = importlib.import_module("sotopia.generation_utils.generate")
-    calls = []
-
-    async def complete(**kwargs):
-        calls.append(kwargs)
-        prompt = kwargs["messages"][0]["content"]
-        await asyncio.sleep(0)
-        if "Original string:" in prompt:
-            assert "English speech requires Latin-script letters" in prompt
-            argument = "I can help with A."
-        elif "Context A" in prompt:
-            argument = "你好。"
-        else:
-            assert "Context B" in prompt
-            assert "The previous action failed validation" not in prompt
-            argument = "I can help with B."
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content=json.dumps(
-                            {"action_type": "speak", "argument": argument, "to": []}
-                        )
-                    )
-                )
-            ]
-        )
-
-    monkeypatch.setattr(backend, "acompletion", complete)
-    results = await asyncio.gather(
-        *[
-            DuplexGenerationEngine(MODEL).generate_action(
-                make_context(), make_observation(["speak"]), f"Context {label}"
-            )
-            for label in ["A", "B"]
-        ]
-    )
-    assert [r.argument for r in results] == ["I can help with A.", "I can help with B."]
-    assert all(not r.fallback for r in results) and len(calls) == 3
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "original, repaired",
-    [
-        ("I can lend $1k.", "I can lend one thousand dollars."),
-        ("I need $3K.", "I need three thousand dollars."),
-        ("The budget is $1.5M.", "The budget is one point five million dollars."),
-    ],
-)
-async def test_compact_dollar_amount_uses_repair_without_runtime_value_rewrite(
-    monkeypatch, original, repaired
-):
-    calls = mock_completions(
-        monkeypatch,
-        [
-            {"action_type": "speak", "argument": original, "to": []},
-            {"action_type": "speak", "argument": repaired, "to": []},
-        ],
-    )
-    engine = DuplexGenerationEngine(MODEL)
-    generated = await engine.generate_action(
-        make_context(), make_observation(["speak"]), ""
-    )
-    assert not generated.fallback and generated.argument == repaired
-    assert len(calls) == 2
-    assert "preserving their value" in calls[1]["messages"][0]["content"]
-    assert calls[0]["response_format"] == calls[1]["response_format"]
-    assert engine.make_hidden_said(make_context(), generated).text == repaired
-
-
-@pytest.mark.asyncio
-async def test_non_audio_currency_not_rewritten(monkeypatch):
-    text = "writes $1k on the form"
-    calls = mock_completions(
-        monkeypatch, [{"action_type": "action", "argument": text, "to": []}]
-    )
-    generated = await DuplexGenerationEngine(MODEL).generate_action(
-        make_context(), make_observation(["action"]), ""
-    )
-    assert not generated.fallback and generated.argument == text and len(calls) == 1
+def test_legacy_actions_cannot_enter_the_live_generation_path(action):
+    with pytest.raises(ValueError, match="Unsupported live action mask"):
+        _action_model([action])

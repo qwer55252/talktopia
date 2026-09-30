@@ -6,7 +6,6 @@ import json
 import random
 import re
 import time
-import unicodedata
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +16,6 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
-    ValidationError,
     ValidationInfo,
     create_model,
     model_validator,
@@ -27,7 +25,6 @@ from sotopia.generation_utils import generate as sotopia_generation
 from sotopia.messages import AgentAction
 
 from talktopia.models.config import BACKCHANNEL_TTS_INPUTS
-from talktopia.speech_agent import prepare_tts_text, resolve_recipient_names
 
 from .actions import (
     DuplexActionDecision,
@@ -37,23 +34,12 @@ from .actions import (
     StreamingObservation,
     _validate_generated_text,
 )
-from .config import SIMULATION_PROMPT_VERSION
+from .config import BACKCHANNEL_PROMPT_VERSION, SIMULATION_PROMPT_VERSION
 from .requests import generate_structured_action
 
 # Keep the requested length independent from the validation safety margin.
 PROMPT_MAX_WORDS = 40
 _EMPTY_ARGUMENT_ACTIONS = frozenset({"none", "leave", "backchanneling"})
-_SPOKEN_ACTIONS = frozenset({"speak", "hesitation", "correction", "interruption"})
-_SPEECH_MARKUP_CHARACTERS = frozenset("*()[]{}")
-_SPEECH_REPAIR_PATTERN = r"^[^\x00-\x1F\x7F\x22\x28-\x2A\x5B-\x5D\x7B\x7D]+$"
-_SPEECH_REPAIR_EXTRA_CHARACTERS = re.compile(r'[\x00-\x1F\x7F"\\]')
-_COMPACT_DOLLAR_AMOUNT = re.compile(r"\$\s*\d[\d,]*(?:\.\d+)?\s*[kKmMbB]\b")
-_REPAIR_TOKEN = re.compile(r"[+-]?\$?[+-]?\d+(?:[,.]\d+)*%?|[^\W\d_]+(?:'[^\W\d_]+)*")
-_MARKED_SPAN = re.compile(
-    r"\*\*([^*()\[\]{}]+)\*\*|\*([^*()\[\]{}]+)\*"
-    r"|\(([^*()\[\]{}]+)\)|\[([^*()\[\]{}]+)\]|\{([^*()\[\]{}]+)\}"
-)
-
 _SENTENCE_BOUNDARY = re.compile(
     r"(?P<terminal>[.!?。！？]+)(?P<closers>[\"”’')\]]*)(?P<space>\s+)"
 )
@@ -81,6 +67,8 @@ _INITIALISM = re.compile(r"(?:[A-Za-z]\.){1,5}$")
 
 _PROMPT_PATH = Path(__file__).with_name("prompts") / f"{SIMULATION_PROMPT_VERSION}.txt"
 _ACTION_PROMPT = _PROMPT_PATH.read_text(encoding="utf-8")
+_BACKCHANNEL_PROMPT_PATH = _PROMPT_PATH.with_name(f"{BACKCHANNEL_PROMPT_VERSION}.txt")
+_BACKCHANNEL_PROMPT = _BACKCHANNEL_PROMPT_PATH.read_text(encoding="utf-8")
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,119 +101,39 @@ class GeneratedAction:
 
     decision: DuplexActionDecision
     argument: str
-    fallback: bool = False
     raw_responses: tuple[str | None, ...] = ()
 
 
-class _SpeechMarkupError(ValueError):
-    def __init__(self, action: _JointAction) -> None:
-        self.action = action
-        super().__init__(
-            "speech argument must not contain asterisks or brackets: *()[]{}. "
-            "For spoken actions, remove stage directions rather than just their "
-            "markers. Preserve dialogue words marked only for emphasis."
-        )
-
-
-def _repair_tokens(text: str) -> list[str]:
-    return _REPAIR_TOKEN.findall(text.lower().replace("’", "'").replace("−", "-"))
-
-
-def _validate_markup_repair(original: str, repaired: str) -> None:
-    """Reject invented/reordered words and deletion outside balanced markup.
-
-    Marked words may be retained or omitted. This lexical check cannot decide
-    whether those words are a stage direction, emphasis, or a meaningful aside.
-    It only validates the model's output; it never edits text sent to TTS.
-    """
-    source: list[tuple[str, bool]] = []
-    end = 0
-    for span in _MARKED_SPAN.finditer(original):
-        outside = original[end : span.start()]
-        if _SPEECH_MARKUP_CHARACTERS.intersection(outside):
-            raise ValueError("cannot safely compare nested or unbalanced speech markup")
-        source.extend((token, True) for token in _repair_tokens(outside))
-        inside = next(group for group in span.groups() if group is not None)
-        source.extend((token, False) for token in _repair_tokens(inside))
-        end = span.end()
-    outside = original[end:]
-    if _SPEECH_MARKUP_CHARACTERS.intersection(outside):
-        raise ValueError("cannot safely compare nested or unbalanced speech markup")
-    source.extend((token, True) for token in _repair_tokens(outside))
-
-    candidate = _repair_tokens(repaired)
-    # Track possible alignments so repeated words cannot hide a deleted required
-    # word. Only tokens from marked spans may be skipped.
-    positions = {0}
-    for token, required in source:
-        matched = {
-            index + 1
-            for index in positions
-            if index < len(candidate) and candidate[index] == token
-        }
-        positions = matched if required else positions | matched
-    if len(candidate) not in positions:
-        raise ValueError("markup repair changed words outside the marked spans")
+@dataclass(frozen=True, slots=True)
+class GenerationFailure:
+    decision_id: str
+    error: str
+    raw_responses: tuple[str | None, ...]
 
 
 class _JointAction(AgentAction):
-    """Keep SOTOPIA's wire format, adding only Surface5 action literals."""
+    """Read the action payload; the two-agent runtime owns recipient routing."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    action_type: DuplexActionType  # type: ignore[assignment]
+    model_config = ConfigDict(extra="ignore", frozen=True)
+    action_type: Literal["speak", "leave", "backchanneling", "none"]
     argument: str = Field(
-        description=(
-            "For speak, hesitation, correction, or interruption: only the words "
-            "spoken aloud in English, without asterisks, parentheses, square or curly brackets, "
-            "stage directions, speaker labels, or narration. "
-            "Write monetary amounts in spoken words, not dollar abbreviations like $1k. "
-            "For action or non-verbal communication: describe the "
-            "behavior. For none, leave, or backchanneling: an empty string. "
-            "Use at most 40 words for a non-empty argument."
-        )
+        description="Words to speak, at most 40 words. Ignored for other actions."
     )
 
     @model_validator(mode="after")
     def validate_surface5_contract(self, info: ValidationInfo) -> _JointAction:
-        context = info.context or {}
-        available = context.get("available_action_types")
+        available = (info.context or {}).get("available_action_types")
         if available is not None and self.action_type not in available:
             raise ValueError(f"unavailable action: {self.action_type}")
-        if self.action_type in _EMPTY_ARGUMENT_ACTIONS:
-            if self.argument.strip():
-                raise ValueError(f"{self.action_type} requires an empty argument")
-        else:
+        if self.action_type == "speak":
             _validate_generated_text(self.argument, field_name="argument")
-            if self.action_type in _SPOKEN_ACTIONS:
-                if any(
-                    character.isalpha()
-                    and "LATIN" not in unicodedata.name(character, "")
-                    for character in self.argument
-                ):
-                    raise ValueError(
-                        "English speech requires Latin-script letters; "
-                        "write foreign names in Latin letters"
-                    )
-                if _COMPACT_DOLLAR_AMOUNT.search(self.argument):
-                    raise ValueError(
-                        "write compact dollar amounts in spoken words "
-                        "while preserving their value"
-                    )
-                # A marked span could be emphasis or a stage direction. Do not
-                # guess and silently remove words from the participant's speech.
-                if _SPEECH_MARKUP_CHARACTERS.intersection(self.argument):
-                    raise _SpeechMarkupError(self)
-                if not prepare_tts_text(self.argument):
-                    raise ValueError("speech argument must contain audible words")
-        if (
-            info.context is not None
-            and self.action_type in {"correction", "interruption"}
-            and not context.get("target_utterance_id")
-        ):
-            raise ValueError(f"{self.action_type} requires a current peer utterance")
-        if len(self.to) != len(set(self.to)):
-            raise ValueError("duplicate recipients are not allowed")
-        return self
+        # Both participants receive public speech. Model-written names do not route audio.
+        return self.model_copy(
+            update={
+                "to": [],
+                "argument": self.argument if self.action_type == "speak" else "",
+            }
+        )
 
 
 def _action_json_schema(schema: dict[str, Any]) -> None:
@@ -243,9 +151,8 @@ def _action_json_schema(schema: dict[str, Any]) -> None:
             continue
         branch = deepcopy(schema)
         branch["properties"]["action_type"] = {"type": "string", "enum": actions}
-        branch["properties"]["argument"].update(
-            {"const": ""} if empty_argument else {"minLength": 1}
-        )
+        if not empty_argument:
+            branch["properties"]["argument"]["minLength"] = 1
         branches.append(branch)
 
     # Ollama's grammar converter does not intersect root properties with anyOf.
@@ -260,14 +167,17 @@ def _action_json_schema(schema: dict[str, Any]) -> None:
 
 
 def _action_model(available_actions: list[DuplexActionType]) -> type[_JointAction]:
-    """Constrain both SOTOPIA requests to this observation's action mask."""
-    if not available_actions:
-        raise ValueError("An action request must have at least one available action")
+    """Constrain the model request to this observation's action mask."""
+    if not available_actions or not set(available_actions) <= {
+        "speak",
+        "leave",
+        "backchanneling",
+        "none",
+    }:
+        raise ValueError("Unsupported live action mask")
     fields: dict[str, Any] = {
         "action_type": (Literal[tuple(available_actions)], ...),
     }
-    if set(available_actions) <= _EMPTY_ARGUMENT_ACTIONS:
-        fields["argument"] = (Literal[""], ...)
     # A fresh subclass avoids mutating a schema used by another agent's request.
     return create_model(
         "Surface5Action",
@@ -277,41 +187,11 @@ def _action_model(available_actions: list[DuplexActionType]) -> type[_JointActio
     )
 
 
-def _speech_repair_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Clone full action branches, narrowing only their spoken arguments."""
-    branches = []
-    changed = False
-    for branch in schema.get("anyOf", [schema]):
-        actions = branch["properties"]["action_type"]["enum"]
-        spoken = [action for action in actions if action in _SPOKEN_ACTIONS]
-        if not spoken:
-            branches.append(deepcopy(branch))
-            continue
-        changed = True
-        others = [action for action in actions if action not in _SPOKEN_ACTIONS]
-        if others:
-            non_audio_branch = deepcopy(branch)
-            non_audio_branch["properties"]["action_type"]["enum"] = others
-            branches.append(non_audio_branch)
-        speech_branch = deepcopy(branch)
-        speech_branch["properties"]["action_type"]["enum"] = spoken
-        # Native pattern conversion bypasses standard JSON string escaping.
-        # This repair-only alphabet must also exclude quote/backslash/controls.
-        speech_branch["properties"]["argument"]["pattern"] = _SPEECH_REPAIR_PATTERN
-        branches.append(speech_branch)
-    if not changed:
-        return deepcopy(schema)
-    if len(branches) == 1:
-        return branches[0]
-    return {"title": schema.get("title", "Surface5Action"), "anyOf": branches}
-
-
 class Surface5ActionOutputParser(PydanticOutputParser[_JointAction]):
     """Use the shared JSON parser and name resolution, retaining a local audit."""
 
     _attempts: int = PrivateAttr(default=0)
     _errors: list[str] = PrivateAttr(default_factory=list)
-    _marked_action: _JointAction | None = PrivateAttr(default=None)
 
     @property
     def attempts(self) -> int:
@@ -321,89 +201,21 @@ class Surface5ActionOutputParser(PydanticOutputParser[_JointAction]):
     def errors(self) -> tuple[str, ...]:
         return tuple(self._errors)
 
-    def _can_narrow_speech_repair(self) -> bool:
-        return self._marked_action is not None and not (
-            _SPEECH_REPAIR_EXTRA_CHARACTERS.search(self._marked_action.argument)
-        )
-
-    def get_repair_schema(self) -> dict[str, Any] | None:
-        """Narrow only a typed markup failure without newly forbidden symbols."""
-        if not self._can_narrow_speech_repair():
-            return None
-        return _speech_repair_schema(self.pydantic_object.model_json_schema())
-
-    def get_format_instructions(self) -> str:
-        if not self._errors:
-            return super().get_format_instructions()
-        # Native response_format carries the complete action schema. Repeating
-        # it here obscures the content error in the one allowed repair request.
-        return (
-            "The original JSON may already be valid. Repair the invalid action "
-            "content, not just JSON syntax. For spoken actions, output only the "
-            "words said to the listener. Omit descriptions of physical actions; "
-            "preserve all actual dialogue words, action type, and recipients "
-            "unless they violate the reported rule.\n"
-            "Stage directions describe movements, facial expressions, posture, "
-            "or tone; they are not words said to the listener. This remains true "
-            "when directions use bold/double asterisks, single asterisks, or "
-            "brackets. Remove the direction itself. Preserve every word of the "
-            "actual dialogue verbatim, including emphasized words, and do not "
-            "paraphrase, add words, or quote the dialogue.\n"
-            "The previous action failed validation:\n"
-            + self._errors[-1][:800]
-            + "\nReturn an action that satisfies the reported validation rule."
-        )
-
     def parse(self, result: str, context: dict[str, Any] | None = None) -> _JointAction:
         self._attempts += 1
         context = context or {}
         try:
             action = super().parse(result, context={**context, "agent_names": []})
-            recipients = resolve_recipient_names(
-                action.to, context.get("agent_names", [])
+            return _JointAction.model_validate(
+                action.model_dump(), context={**context, "agent_names": []}
             )
-            validated = _JointAction.model_validate(
-                {**action.model_dump(), "to": recipients}, context=context
-            )
-            if self._marked_action is not None:
-                original = self._marked_action
-                if validated.action_type != original.action_type:
-                    raise ValueError("markup repair changed a valid action type")
-                original_to = resolve_recipient_names(
-                    original.to, context.get("agent_names", [])
-                )
-                allowed = set(context.get("agent_names", [])) - {context.get("sender")}
-                original_to_valid = len(original_to) == len(set(original_to)) and (
-                    not context.get("agent_names") or set(original_to) <= allowed
-                )
-                if original_to_valid and set(recipients) != set(original_to):
-                    raise ValueError("markup repair changed valid recipients")
-                if (
-                    self._can_narrow_speech_repair()
-                    and re.fullmatch(_SPEECH_REPAIR_PATTERN, validated.argument) is None
-                ):
-                    raise ValueError(
-                        "speech markup repair contains forbidden formatting characters"
-                    )
-                _validate_markup_repair(original.argument, validated.argument)
-            if recipients != action.to:
-                sotopia_generation.log.info(
-                    f"Resolved action recipients: {action.to} -> {recipients}"
-                )
-            return validated
         except Exception as error:
-            if self._attempts == 1 and isinstance(error, ValidationError):
-                for detail in error.errors():
-                    cause = detail.get("ctx", {}).get("error")
-                    if isinstance(cause, _SpeechMarkupError):
-                        self._marked_action = cause.action
-                        break
             self._errors.append(f"{type(error).__name__}: {error}")
             raise
 
 
 class DuplexGenerationEngine:
-    """Generate action and argument together, with SOTOPIA's one repair attempt."""
+    """Generate action and argument together, without LLM output repair."""
 
     def __init__(self, model_name: str, *, seed: int = 0) -> None:
         if not model_name.strip():
@@ -414,7 +226,6 @@ class DuplexGenerationEngine:
         self._hidden_sequence = 0
         self._decision_audits: dict[str, tuple[int, tuple[str, ...]]] = {}
         self._hidden_attempts: dict[str, int] = {}
-        self._non_audio_attempts: dict[str, int] = {}
         self._decision_starts_ns: dict[str, int] = {}
 
     def decision_started_ns(self, decision_id: str) -> int:
@@ -425,7 +236,7 @@ class DuplexGenerationEngine:
         session: AgentSessionContext,
         observation: StreamingObservation,
         history: str,
-    ) -> GeneratedAction:
+    ) -> GeneratedAction | GenerationFailure:
         parser = Surface5ActionOutputParser(
             pydantic_object=_action_model(observation.canonical.available_actions)
         )
@@ -444,13 +255,19 @@ class DuplexGenerationEngine:
         except ValueError:
             temperature = sotopia_generation.DEFAULT_TEMPERATURE
         request_started_ns = time.monotonic_ns()
-        fallback = False
+        self._decision_sequence += 1
+        decision_id = f"{session.episode_id}-{self._slug(session.agent_name)}-decision-{self._decision_sequence:04d}"
+        self._decision_starts_ns[decision_id] = request_started_ns
         raw_responses: list[str | None] = []
         errors: tuple[str, ...]
         try:
             action = await generate_structured_action(
                 model_name=self.model_name,
-                template=_ACTION_PROMPT,
+                template=(
+                    _BACKCHANNEL_PROMPT
+                    if observation.source == "asr_partial"
+                    else _ACTION_PROMPT
+                ),
                 input_values={
                     "agent": session.agent_name,
                     "history": history,
@@ -462,46 +279,28 @@ class DuplexGenerationEngine:
                 temperature=temperature,
                 context=context,
                 responses=raw_responses,
-                repair_schema_factory=parser.get_repair_schema,
             )
             if not isinstance(action, _JointAction):
                 raise TypeError(
                     f"expected _JointAction, received {type(action).__name__}"
                 )
             errors = parser.errors
-        except Exception as error:  # noqa: BLE001 - Match SOTOPIA request/parse fallback.
-            # Match the Round-robin agent: failed generation skips this action.
-            # asyncio.CancelledError inherits BaseException and propagates.
-            sotopia_generation.log.warning(f"Failed to generate action due to {error}")
-            fallback = True
+        except Exception as error:
+            # Cancellation is a BaseException and propagates to the caller.
             detail = f"{type(error).__name__}: {error}"
-            errors = parser.errors
-            if not errors or errors[-1] != detail:
-                errors += (detail,)
-            action = _JointAction(action_type="none", argument="", to=[])
+            self._decision_audits[decision_id] = (1, (detail,))
+            return GenerationFailure(decision_id, detail, tuple(raw_responses))
 
-        self._decision_sequence += 1
-        decision_id = (
-            f"{session.episode_id}-{self._slug(session.agent_name)}-"
-            f"decision-{self._decision_sequence:04d}"
-        )
-        self._decision_starts_ns[decision_id] = request_started_ns
         argument = " ".join(action.argument.split())
-        non_audio = action.action_type in {"action", "non-verbal communication"}
         decision = DuplexActionDecision.model_validate(
             {
                 "decision_id": decision_id,
                 "action_type": action.action_type,
-                "non_audio_argument": argument if non_audio else "",
+                "non_audio_argument": "",
                 "to": action.to,
-                "target_utterance_id": self._derived_target(
-                    observation, action.action_type
-                ),
             },
             context={
-                "available_actions": (
-                    ["none"] if fallback else observation.canonical.available_actions
-                ),
+                "available_actions": observation.canonical.available_actions,
                 "agent_names": context["agent_names"],
                 "sender": session.agent_name,
                 "require_decision_id": True,
@@ -509,12 +308,9 @@ class DuplexGenerationEngine:
         )
         attempts = max(1, parser.attempts)
         self._decision_audits[decision_id] = (attempts, errors)
-        if non_audio:
-            self._non_audio_attempts[decision_id] = attempts
         return GeneratedAction(
             decision=decision,
             argument=argument,
-            fallback=fallback,
             raw_responses=tuple(raw_responses),
         )
 
@@ -522,12 +318,7 @@ class DuplexGenerationEngine:
         self, session: AgentSessionContext, generated: GeneratedAction
     ) -> HiddenSaid:
         decision = generated.decision
-        if decision.action_type not in {
-            "speak",
-            "hesitation",
-            "correction",
-            "interruption",
-        }:
+        if decision.action_type != "speak":
             raise ValueError(
                 f"hidden said is not valid for action {decision.action_type!r}"
             )
@@ -564,9 +355,9 @@ class DuplexGenerationEngine:
         return hidden
 
     def split_into_sentence_chunks(self, hidden_said: HiddenSaid) -> list[SpeechChunk]:
-        # Spoken actions reject asterisks before reaching this preparation, so
-        # round-robin's star-span removal cannot silently discard spoken words.
-        spoken_text = prepare_tts_text(hidden_said.text)
+        # Strip formatting symbols only; never remove the enclosed words.
+        # OmniVoice backchannel tags such as [confirmation-en] remain intact.
+        spoken_text = " ".join(hidden_said.text.replace("*", "").split())
         sentences = self._spoken_sentences(spoken_text)
         if not sentences:
             raise ValueError("hidden said contains no sentence")
@@ -594,9 +385,6 @@ class DuplexGenerationEngine:
         """The text came from the same parse attempt as the action."""
         return self._hidden_attempts[hidden_said_id]
 
-    def non_audio_argument_attempt(self, decision_id: str) -> int:
-        return self._non_audio_attempts[decision_id]
-
     def _hidden_said(
         self,
         *,
@@ -614,18 +402,6 @@ class DuplexGenerationEngine:
             speaker=session.agent_name,
             text=text,
         )
-
-    @staticmethod
-    def _derived_target(
-        observation: StreamingObservation,
-        action_type: DuplexActionType,
-    ) -> str | None:
-        if action_type in {"correction", "interruption"}:
-            expected = observation.target_utterance_id or observation.peer_utterance_id
-            if not expected:
-                raise ValueError(f"{action_type} requires a current peer utterance")
-            return expected
-        return None
 
     @staticmethod
     def _observation_json(observation: StreamingObservation) -> str:

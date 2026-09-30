@@ -151,6 +151,11 @@ async def test_accepted_speech_preserves_generated_synthesized_and_live_pcm(
     assert result["status"] == "completed"
     assert speech.tts_inputs == [original]
     events = read_events(tmp_path / result["events"])
+    assert all(
+        event.observation.source != "asr_partial"
+        for event in events
+        if isinstance(event, DecisionEvent)
+    )
     spoken = [
         e
         for e in TranscriptBuilder.from_events(events).build()
@@ -179,10 +184,14 @@ async def test_accepted_speech_preserves_generated_synthesized_and_live_pcm(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "intervention", ["none", "backchanneling", "interruption", "correction"]
+    "intervention,cancel_delay",
+    [
+        ("none", 0.35),
+        ("backchanneling", 0.35),
+    ],
 )
 async def test_http_episode_limits_and_audible_history(
-    profiles, tmp_path, monkeypatch, intervention
+    profiles, tmp_path, monkeypatch, intervention, cancel_delay
 ):
     count = 0
     intervened = False
@@ -190,7 +199,7 @@ async def test_http_episode_limits_and_audible_history(
     original_cancel_asr = WindowedASR.cancel_utterance
 
     async def slow_cancel_asr(self, utterance_id):
-        await asyncio.sleep(0.35)
+        await asyncio.sleep(cancel_delay)
         return await original_cancel_asr(self, utterance_id)
 
     monkeypatch.setattr(WindowedASR, "cancel_utterance", slow_cancel_asr)
@@ -201,27 +210,24 @@ async def test_http_episode_limits_and_audible_history(
         obs = json.loads(values["observation"])
         histories.append(values["history"])
         if obs["source"] == "asr_partial":
+            assert "none" in kwargs["context"]["available_action_types"]
+            assert obs["has_next_sentence"] is True
+            assert obs["sentence_index"] == 0
             if intervention != "none" and not intervened:
                 intervened = True
                 return joint_result(kwargs, intervention)
             return joint_result(kwargs, "none")
+        if obs["source"] == "asr_final":
+            assert "none" not in kwargs["context"]["available_action_types"]
+            assert obs["has_next_sentence"] is False
         count += 1
-        return joint_result(kwargs, "speak" if count <= 2 else "leave")
+        return joint_result(
+            kwargs,
+            "speak" if count <= 2 else "leave",
+            "Generated first sentence. Generated second sentence.",
+        )
 
     monkeypatch.setattr(generation, "generate_structured_action", fake_generation)
-    monkeypatch.setattr(
-        episode_module,
-        "RuntimeConfig",
-        lambda **kw: RuntimeConfig(
-            **{
-                **kw,
-                "allow_corrections": intervention == "correction",
-                "allow_interruptions": intervention == "interruption",
-                "correction_min_stable_words": 2,
-                "interruption_min_stable_words": 2,
-            }
-        ),
-    )
     args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
     args.tag = "test-duplex"
     speech = FakeSpeech()
@@ -284,34 +290,6 @@ async def test_http_episode_limits_and_audible_history(
             action.action_type == intervention
             for event in commits
             for action in event.actions.values()
-        )
-    if intervention in {"correction", "interruption"}:
-        assert any(
-            event.event_type == "floor" and event.change == "transferred"
-            for event in events
-        )
-        assert any(
-            event.event_type == "speech_lifecycle" and event.phase == "cancelled"
-            for event in events
-        )
-        cancelled = next(
-            event
-            for event in events
-            if event.event_type == "speech_lifecycle" and event.phase == "cancelled"
-        )
-        final = next(
-            event
-            for event in events
-            if event.event_type == "asr_update"
-            and event.utterance_id == cancelled.utterance_id
-            and event.is_final
-        )
-        assert any(
-            cancelled.timestamp_ms < span["start_ms"] < final.timestamp_ms
-            for event in events
-            if event.event_type == "audio_delivered"
-            and event.utterance_id != cancelled.utterance_id
-            for span in event.frame_spans
         )
 
 

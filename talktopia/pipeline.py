@@ -82,11 +82,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=INTERACTION_MODES,
         help="Conversation mode; new simulations default to round-robin.",
     )
-    for feature, default in (
-        ("backchannels", True),
-        ("corrections", False),
-        ("interruptions", False),
-    ):
+    for feature, default in (("backchannels", True),):
         parser.add_argument(
             f"--duplex-{feature}",
             action=argparse.BooleanOptionalAction,
@@ -168,7 +164,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         if len(set(args.episode_ids)) != len(args.episode_ids):
             parser.error("--episode-id values must be distinct")
         if args.stage == "reevaluate":
-            parser.error("--episode-id selects simulations; use --reeval-episode-id for evaluation")
+            parser.error(
+                "--episode-id selects simulations; use --reeval-episode-id for evaluation"
+            )
     if args.resume_run:
         allowed = {
             "--resume-run",
@@ -227,11 +225,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--seed must be nonnegative")
     if args.stage != "reevaluate" and args.interaction_mode is None:
         args.interaction_mode = "round-robin"
-    if args.interaction_mode == "round-robin" and (
-        not args.duplex_backchannels
-        or args.duplex_corrections
-        or args.duplex_interruptions
-    ):
+    if args.interaction_mode == "round-robin" and (not args.duplex_backchannels):
         parser.error(
             "Duplex action controls require --interaction-mode surface5-full-duplex"
         )
@@ -369,7 +363,7 @@ async def run_simulation_batch(
         },
         concurrency=concurrency,
         selected_episode_ids=getattr(args, "episode_ids", None),
-        max_attempts=3,
+        max_attempts=1 if args.interaction_mode == "surface5-full-duplex" else 3,
         validate_artifacts=result_artifacts,
         error_fields={
             "conversation_audio": None,
@@ -791,7 +785,7 @@ async def run_duplex_episode(
             {
                 "clock": "monotonic_elapsed_ms",
                 "normal_response": "peer last audio delivery end to response first audio delivery start",
-                "backchannel": "partial ASR first LLM request to backchannel first audio delivery start",
+                "backchannel": "completed-sentence ASR first LLM request to backchannel first audio delivery start",
                 "statistics": runtime.latency_summary(),
                 "samples_ms": runtime.latencies,
             },
@@ -979,10 +973,16 @@ async def stage_3_simulate(
                 record["speech_worker"] = worker
                 async with (
                     AsyncOpenAI(
-                        base_url=url, api_key=asr_key, timeout=120, max_retries=0
+                        base_url=url,
+                        api_key=asr_key,
+                        timeout=120,
+                        max_retries=0,
                     ) as asr_client,
                     AsyncOpenAI(
-                        base_url=url, api_key=tts_key, timeout=120, max_retries=0
+                        base_url=url,
+                        api_key=tts_key,
+                        timeout=120,
+                        max_retries=0,
                     ) as tts_client,
                 ):
                     resolved, agents = build_episode(
@@ -1002,11 +1002,16 @@ async def stage_3_simulate(
         )
     async with (
         AsyncOpenAI(
-            base_url=args.asr_base_url, api_key=asr_key, timeout=120,
-            max_retries=0 if args.interaction_mode == "surface5-full-duplex" else 2
+            base_url=args.asr_base_url,
+            api_key=asr_key,
+            timeout=120,
+            max_retries=0 if args.interaction_mode == "surface5-full-duplex" else 2,
         ) as asr_client,
         AsyncOpenAI(
-            base_url=args.tts_base_url, api_key=tts_key, timeout=120, max_retries=0
+            base_url=args.tts_base_url,
+            api_key=tts_key,
+            timeout=120,
+            max_retries=0,
         ) as tts_client,
     ):
         # Wait here, before the HTTP timeout starts, instead of filling the TTS

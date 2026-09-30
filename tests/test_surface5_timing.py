@@ -47,7 +47,7 @@ from talktopia.full_duplex.speech_backends import WindowedASR
 from talktopia.full_duplex.speech_client import SpeechClient
 
 
-async def run_timed_episode(profiles, tmp_path, monkeypatch, *, late_backchannel=False):
+async def run_timed_episode(profiles, tmp_path, monkeypatch, *, late_backchannel=None):
     decisions = 0
     sent_backchannel = False
 
@@ -59,9 +59,14 @@ async def run_timed_episode(profiles, tmp_path, monkeypatch, *, late_backchannel
         available = kwargs["context"]["available_action_types"]
         assert not {"correction", "interruption", "hesitation"}.intersection(available)
         if observation["source"] == "asr_partial":
+            assert observation["has_next_sentence"] is True
             action = "backchanneling" if not sent_backchannel else "none"
             sent_backchannel = True
+            if action == "backchanneling" and late_backchannel == "llm":
+                await asyncio.sleep(2.8)
         else:
+            if observation["source"] == "asr_final":
+                assert observation["has_next_sentence"] is False
             decisions += 1
             action = "speak" if decisions <= 2 else "leave"
         return joint_result(
@@ -70,7 +75,7 @@ async def run_timed_episode(profiles, tmp_path, monkeypatch, *, late_backchannel
 
     async def synthesize(self, text, reference, seed):
         backchannel = text in generation.BACKCHANNEL_TTS_INPUTS
-        await asyncio.sleep(2.8 if backchannel and late_backchannel else 0.09)
+        await asyncio.sleep(2.8 if backchannel and late_backchannel == "tts" else 0.09)
         count = 4800 if backchannel else 28800
         sample = 2000 if backchannel else 1000
         return sample.to_bytes(2, "little", signed=True) * count
@@ -153,6 +158,24 @@ async def test_live_pcm_survives_model_waits_and_slow_final_asr(
             )
             assert event.origin_ms == decision.request_started_ms
             assert decision.observation.source == "asr_partial"
+            assert decision.observation.has_next_sentence is True
+            sentence_delivery = next(
+                e
+                for e in deliveries
+                if e.utterance_id == event.peer_utterance_id
+                and e.chunk_index == decision.observation.sentence_index
+            )
+            sentence_asr = next(
+                e
+                for e in events
+                if isinstance(e, ASRUpdateEvent)
+                and e.utterance_id == event.peer_utterance_id
+                and e.sentence_index == decision.observation.sentence_index
+                and e.has_next_sentence is True
+            )
+            assert (
+                sentence_delivery.end_ms <= sentence_asr.timestamp_ms <= event.origin_ms
+            )
     backchannel = next(event for event in latencies if event.kind == "backchannel")
     bc_end = max(
         e.end_ms for e in deliveries if e.utterance_id == backchannel.utterance_id
@@ -258,16 +281,20 @@ async def test_live_pcm_survives_model_waits_and_slow_final_asr(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("late_stage", ["llm", "tts"])
 async def test_late_backchannel_is_not_played_or_counted(
-    profiles, tmp_path, monkeypatch
+    profiles, tmp_path, monkeypatch, late_stage
 ):
     result, events = await run_timed_episode(
-        profiles, tmp_path, monkeypatch, late_backchannel=True
+        profiles, tmp_path, monkeypatch, late_backchannel=late_stage
     )
     assert result["latency"]["backchannel"] == {"count": 0, "mean_ms": None}
-    assert any(
+    assert result["end_reason"] == "agent_left"
+    assert result["action_counts"] == {"speak": 2, "leave": 1}
+    assert not any(
         event.event_type == "speech_lifecycle"
-        and event.reason == "peer_audio_already_finished"
+        and event.phase == "started"
+        and event.action_type == "backchanneling"
         for event in events
     )
     late_ids = {
@@ -276,6 +303,8 @@ async def test_late_backchannel_is_not_played_or_counted(
         if event.event_type == "speech_lifecycle"
         and event.reason == "peer_audio_already_finished"
     }
+    if late_stage == "tts":
+        assert late_ids
     assert not any(
         event.utterance_id in late_ids
         for event in events
@@ -286,11 +315,7 @@ async def test_late_backchannel_is_not_played_or_counted(
 def test_action_controls_and_weighted_latency_summary():
     args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
     config = RuntimeConfig(**runtime_options(args))
-    assert (
-        config.allow_backchannels
-        and not config.allow_corrections
-        and not config.allow_interruptions
-    )
+    assert config.allow_backchannels
     state = RuntimeState(
         episode_id="test",
         now_ms=0,
@@ -298,10 +323,13 @@ def test_action_controls_and_weighted_latency_summary():
         active_utterances={"speech": "Alice"},
     )
     available = FloorController(config=config).available_actions("Bob", state)
-    assert "backchanneling" in available and not {
-        "correction",
-        "interruption",
-    }.intersection(available)
+    assert available == ["none", "backchanneling"]
+    assert FloorController(config=config).available_actions("Alice", state) == ["none"]
+    state.active_utterances.clear()
+    assert FloorController(config=config).available_actions("Bob", state) == [
+        "speak", "leave"
+    ]
+    state.active_utterances["speech"] = "Alice"
     off = pipeline.parse_args(
         [
             "--interaction-mode",
@@ -310,9 +338,9 @@ def test_action_controls_and_weighted_latency_summary():
         ]
     )
     assert not runtime_settings(**runtime_options(off))["allow_backchannels"]
-    assert "backchanneling" not in FloorController(
+    assert FloorController(
         config=RuntimeConfig(**runtime_options(off))
-    ).available_actions("Bob", state)
+    ).available_actions("Bob", state) == ["none"]
     with pytest.raises(SystemExit):
         pipeline.parse_args(["--duplex-interruptions"])
     summary = {

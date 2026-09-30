@@ -124,11 +124,9 @@ def render_sotopia_messages(
                         f"audible commit {commit.commit_id} has no transcript entry "
                         f"for {actor}"
                     )
-                if not entry.received_text.strip() and not (
-                    action.action_type == "backchanneling" and entry.sentences
-                ):
+                if not entry.sentences:
                     raise ValueError(
-                        f"audible commit {commit.commit_id} has empty ASR final text"
+                        f"audible commit {commit.commit_id} has no delivered sentence evidence"
                     )
                 rendered_action = action.model_copy(
                     update={"argument": entry.received_text}

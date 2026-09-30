@@ -60,7 +60,15 @@ class BackchannelSpeech(FakeSpeech):
 
 
 async def run_backchannel_episode(
-    profiles, tmp_path, monkeypatch, *, text="[confirmation-en]", received="", fail=False
+    profiles,
+    tmp_path,
+    monkeypatch,
+    *,
+    text="[confirmation-en]",
+    received="",
+    fail=False,
+    backchannel_sentence_index=None,
+    requests=None,
 ):
     regular_decisions = 0
     attempted_backchannel = False
@@ -70,9 +78,16 @@ async def run_backchannel_episode(
         nonlocal regular_decisions, attempted_backchannel
         prompts.append(kwargs["input_values"]["history"])
         observation = json.loads(kwargs["input_values"]["observation"])
+        if requests is not None:
+            requests.append(observation)
         if observation["source"] == "asr_partial":
+            eligible = (
+                observation["sentence_index"] >= backchannel_sentence_index
+                if backchannel_sentence_index is not None
+                else not attempted_backchannel
+            )
             if (
-                not attempted_backchannel
+                eligible
                 and "backchanneling" in kwargs["context"]["available_action_types"]
             ):
                 attempted_backchannel = True
@@ -83,7 +98,14 @@ async def run_backchannel_episode(
             regular_decisions += 1
             action = "speak" if regular_decisions <= 2 else "leave"
         return joint_result(
-            kwargs, action, "We should agree on the proposed meeting time."
+            kwargs,
+            action,
+            "We should agree on the meeting time. I can meet before noon."
+            + (
+                " Would that work for you? We can meet at the shop."
+                if backchannel_sentence_index is not None
+                else ""
+            ),
         )
 
     async def decode(self, pcm, rate):
@@ -95,9 +117,9 @@ async def run_backchannel_episode(
     # Exercise each history path deterministically; selection has its own test.
     monkeypatch.setattr(generation, "BACKCHANNEL_TTS_INPUTS", (text,))
     monkeypatch.setattr(SpeechClient, "decode", decode)
-    args = pipeline.parse_args([
-        "--interaction-mode", "surface5-full-duplex", "--seed", "17"
-    ])
+    args = pipeline.parse_args(
+        ["--interaction-mode", "surface5-full-duplex", "--seed", "17"]
+    )
     args.tag = "nonverbal-test"
     speech = BackchannelSpeech(text, fail=fail)
     async with speech.client() as client:
@@ -105,13 +127,70 @@ async def run_backchannel_episode(
         assert all(agent.generation.seed == 17 for agent in agents)
         result = await asyncio.wait_for(
             pipeline.run_one_episode(resolved, agents, args, tmp_path, "episode_0001"),
-            15,
+            20,
         )
     return result, read_events(tmp_path / result["events"]), speech, prompts
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("text,received", [("[confirmation-en]", ""), ("Mm-hmm", "Mm-hmm.")])
+@pytest.mark.parametrize("backchannel_sentence_index", [0, 1])
+async def test_no_more_listener_requests_after_one_backchannel_per_utterance(
+    profiles, tmp_path, monkeypatch, backchannel_sentence_index
+):
+    from talktopia.full_duplex.events import DecisionEvent
+
+    requests = []
+    result, events, speech, _ = await run_backchannel_episode(
+        profiles,
+        tmp_path,
+        monkeypatch,
+        backchannel_sentence_index=backchannel_sentence_index,
+        requests=requests,
+    )
+    decisions = [
+        event
+        for event in events
+        if isinstance(event, DecisionEvent)
+        and event.status == "selected"
+        and event.decision.action_type == "backchanneling"
+    ]
+    assert result["status"] == "completed"
+    assert result["action_counts"]["backchanneling"] == 2
+    assert result["action_counts"]["speak"] == 2
+    assert result["action_counts"]["leave"] == 1
+    assert events[0].run_config["backchannel_limit_per_utterance"] == 1
+    assert runtime_settings()["backchannel_limit_per_utterance"] == 1
+    assert [event.observation.sentence_index for event in decisions] == [
+        backchannel_sentence_index,
+        backchannel_sentence_index,
+    ]
+    peer_ids = [event.observation.peer_utterance_id for event in decisions]
+    assert len(set(peer_ids)) == 2
+    # Count actual generation calls, including `none`, not just selected actions.
+    listener_requests = [r for r in requests if r["source"] == "asr_partial"]
+    assert [r["sentence_index"] for r in listener_requests] == (
+        list(range(backchannel_sentence_index + 1)) * 2
+    )
+    for peer_id in peer_ids:
+        assert [
+            event.sentence_index
+            for event in events
+            if isinstance(event, ASRUpdateEvent)
+            and event.utterance_id == peer_id
+            and event.has_next_sentence is True
+        ] == [0, 1, 2]
+    assert [r["source"] for r in requests if r["source"] != "asr_partial"] == [
+        "reset",
+        "asr_final",
+        "asr_final",
+    ]
+    assert speech.inputs.count("[confirmation-en]") == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text,received", [("[confirmation-en]", ""), ("Mm-hmm", "Mm-hmm.")]
+)
 async def test_backchannel_survives_into_agent_and_evaluation_history(
     profiles, tmp_path, monkeypatch, text, received
 ):
@@ -119,7 +198,9 @@ async def test_backchannel_survives_into_agent_and_evaluation_history(
         profiles, tmp_path, monkeypatch, text=text, received=received
     )
     assert result["status"] == "completed"
-    assert events[0].run_config["backchannel_tts"] == runtime_settings()["backchannel_tts"]
+    assert (
+        events[0].run_config["backchannel_tts"] == runtime_settings()["backchannel_tts"]
+    )
     assert speech.inputs.count(text) == 1
     commits = [event for event in events if isinstance(event, ActionCommitted)]
     committed = [
@@ -141,7 +222,9 @@ async def test_backchannel_survives_into_agent_and_evaluation_history(
     entries = TranscriptBuilder.from_events(events).build()
     entry = next(entry for entry in entries if entry.action_type == "backchanneling")
     assert entry.generated_text == entry.synthesized_text == text
-    assert entry.received_text == received and entry.sentences[0].received_text == received
+    assert (
+        entry.received_text == received and entry.sentences[0].received_text == received
+    )
     assert entry.commit_id == commit.commit_id and entry.completed
     assert entry.start_ms < entry.end_ms
     assert any(
@@ -165,7 +248,8 @@ async def test_backchannel_survives_into_agent_and_evaluation_history(
     assert result["latency"]["backchannel"]["count"] == 1
     label = (
         f'backchanneled: "{received}"'
-        if received else "made a nonverbal backchannel [no recognized words]"
+        if received
+        else "made a nonverbal backchannel [no recognized words]"
     )
     assert any(label in history for history in prompts)
     if text.startswith("["):
@@ -220,12 +304,13 @@ async def test_empty_tts_does_not_invent_a_nonverbal_backchannel(
     assert not result["action_counts"].get("backchanneling", 0)
 
 
-def test_empty_asr_permission_is_limited_to_backchannels():
+def test_committed_speech_can_preserve_empty_asr():
+    assert DuplexAction(action_type="speak", argument="").argument == ""
     assert (
         "nonverbal backchannel"
         in DuplexAction(action_type="backchanneling", argument="").to_natural_language()
     )
-    for action in ("speak", "hesitation", "action", "non-verbal communication"):
+    for action in ("hesitation", "action", "non-verbal communication"):
         with pytest.raises(ValueError, match="non-empty argument"):
             DuplexAction(action_type=action, argument="")
 

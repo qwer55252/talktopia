@@ -12,15 +12,14 @@ class RuntimeConfig(BaseModel):
 
     realtime: Literal[True] = True
     allow_backchannels: bool = True
-    allow_corrections: bool = False
-    allow_interruptions: bool = False
-    turn_taking_policy: str = "surface5_sotopia_single_call_v1"
+    turn_taking_policy: str = "surface5_speech_or_leave_v1"
     termination_policy: Literal["first_leave"] = "first_leave"
     generation_mode: Literal["sotopia_single_call"] = "sotopia_single_call"
+    validation_policy: Literal["essential_v1"] = "essential_v1"
+    episode_max_attempts: Literal[1] = 1
+    output_repair_policy: Literal["disabled"] = "disabled"
     history_policy: Literal["full_canonical_asr"] = "full_canonical_asr"
     minimum_floor_gap_ms: int = Field(default=200, ge=0)
-    correction_min_stable_words: int = Field(default=8, ge=1)
-    interruption_min_stable_words: int = Field(default=12, ge=1)
     max_turns: int = Field(default=12, ge=1)
 
 
@@ -29,7 +28,9 @@ FRAME_MS = 40
 ASR_DECODE_INTERVAL_MS = 400
 ASR_WINDOW_MS = 3000
 INTERACTION_MODE = "surface5-full-duplex"
-SIMULATION_PROMPT_VERSION = "simulation_FDB_v7"
+SIMULATION_PROMPT_VERSION = "simulation_action_general_v1"
+BACKCHANNEL_PROMPT_VERSION = "simulation_action_FDB_v1"
+BACKCHANNEL_TRIGGER = "received_sentence_asr_with_next_sentence_v1"
 
 
 def runtime_options(values) -> dict:
@@ -41,8 +42,6 @@ def runtime_options(values) -> dict:
     return {
         "max_turns": get("max_turns", 12),
         "allow_backchannels": get("duplex_backchannels", True),
-        "allow_corrections": get("duplex_corrections", False),
-        "allow_interruptions": get("duplex_interruptions", False),
     }
 
 
@@ -60,6 +59,9 @@ def runtime_settings(max_turns: int = 12, **options) -> dict:
         "clock": "monotonic_elapsed_ms",
         "audio_capture": "live_pcm_sample_clock_v3",
         "simulation_prompt": SIMULATION_PROMPT_VERSION,
+        "backchannel_prompt": BACKCHANNEL_PROMPT_VERSION,
+        "backchannel_trigger": BACKCHANNEL_TRIGGER,
+        "backchannel_limit_per_utterance": 1,
         "evaluation_prompt": "evaluation_FDB_v1",
         "temporal_evaluation": "sentence_asr_delivery_v1",
         "backchannel_tts": backchannel_tts_settings(),

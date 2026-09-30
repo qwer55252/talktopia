@@ -19,7 +19,12 @@ from .actions import (
     StreamingObservation,
 )
 from .audio import AudioChunk, AudioFrame
-from .generation import AgentSessionContext, DuplexGenerationEngine, GeneratedAction
+from .generation import (
+    AgentSessionContext,
+    DuplexGenerationEngine,
+    GeneratedAction,
+    GenerationFailure,
+)
 from .speech_backends import (
     ASRUpdate,
     IncrementalTTS,
@@ -52,7 +57,12 @@ class AgentState:
 
 
 AgentOutput = (
-    GeneratedAction | HiddenSaid | AudioChunk | SpeechSynthesisFailure | ASRUpdate
+    GeneratedAction
+    | GenerationFailure
+    | HiddenSaid
+    | AudioChunk
+    | SpeechSynthesisFailure
+    | ASRUpdate
 )
 
 
@@ -338,7 +348,12 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
             self.state.last_llm_latency_ms = round((loop.time() - started) * 1000)
             if revision != self.state.observation_revision or self.state.left:
                 return
-            self._decision_observations[generated.decision.decision_id] = observation
+            decision_id = (
+                generated.decision_id
+                if isinstance(generated, GenerationFailure)
+                else generated.decision.decision_id
+            )
+            self._decision_observations[decision_id] = observation
             # The runtime checks this proposal before starting any TTS work.
             await self._outputs.put(generated)
         except asyncio.CancelledError:
@@ -369,9 +384,7 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         decision = generated.decision
         try:
             if decision.action_type == "backchanneling":
-                hidden = self.generation.make_backchannel(
-                    self._context, decision
-                )
+                hidden = self.generation.make_backchannel(self._context, decision)
             else:
                 hidden = self.generation.make_hidden_said(self._context, generated)
             if revision != self.state.observation_revision or self.state.left:

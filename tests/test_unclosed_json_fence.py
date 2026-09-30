@@ -60,12 +60,11 @@ def test_text_without_a_joint_action_cannot_bypass_contract(raw):
         parse(raw)
 
 
-def test_quotes_braces_and_backticks_inside_non_audio_argument_are_preserved():
+def test_quotes_braces_and_backticks_inside_speech_are_preserved():
     argument = 'Use {one} and say "yes"; ``` is a marker.'
     assert (
         parse(
-            json.dumps({"action_type": "action", "argument": argument, "to": []}),
-            actions=["action"],
+            json.dumps({"action_type": "speak", "argument": argument, "to": []}),
         ).argument
         == argument
     )
@@ -84,8 +83,8 @@ def test_schema_properties_wrapper_still_checks_action_mask():
     raw = json.dumps(
         {
             "properties": {
-                "action_type": "action",
-                "argument": "opens the door",
+                "action_type": "backchanneling",
+                "argument": "",
                 "to": [],
             }
         }

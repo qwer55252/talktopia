@@ -93,7 +93,8 @@ async def test_selected_episodes_preserve_full_population_and_resume_unfinished(
     ]
     assert all(
         row["status"] == "pending" and row["attempt_history"] == []
-        for row in summary["episodes"] if row["episode_id"] not in selected
+        for row in summary["episodes"]
+        if row["episode_id"] not in selected
     )
 
 
@@ -113,7 +114,9 @@ def test_invalid_episode_selection_fails_before_server_startup(
     with pytest.raises(ValueError, match="Unknown simulation episode IDs"):
         pipeline.preflight(args)
     with pytest.raises(SystemExit):
-        pipeline.parse_args(["--episode-id", "episode_0006", "--episode-id", "episode_0006"])
+        pipeline.parse_args(
+            ["--episode-id", "episode_0006", "--episode-id", "episode_0006"]
+        )
     with pytest.raises(SystemExit):
         pipeline.parse_args(["--stage", "reevaluate", "--episode-id", "episode_0006"])
 
@@ -216,3 +219,31 @@ def test_mode_defaults_and_fixed_limits():
 def test_removed_overrides_cannot_change_population_or_limits(args):
     with pytest.raises(SystemExit):
         pipeline.parse_args(args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode,expected_attempts", [("surface5-full-duplex", 1), ("round-robin", 3)]
+)
+async def test_failed_fdb_episode_is_not_restarted(
+    population, tmp_path, monkeypatch, mode, expected_attempts
+):
+    _, records = population
+    args = pipeline.parse_args(
+        ["--interaction-mode", mode, "--episode-id", "episode_0006"]
+    )
+    args.tag = "failed-attempt-policy"
+    calls = []
+
+    async def fail(record, artifact_dir, result_path):
+        calls.append(record["episode_id"])
+        raise RuntimeError("invalid action response")
+
+    assert await pipeline.run_simulation_batch(records, args, tmp_path, fail) == 1
+    assert calls == ["episode_0006"] * expected_attempts
+    summary = json.loads((tmp_path / "03_simulation.json").read_text())
+    row = next(e for e in summary["episodes"] if e["episode_id"] == "episode_0006")
+    assert (
+        row["status"] == "failed" and len(row["attempt_history"]) == expected_attempts
+    )
+    assert summary["total"] == 450

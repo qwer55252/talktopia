@@ -11,7 +11,7 @@ from talktopia.full_duplex import generation
 from talktopia.full_duplex.config import runtime_settings
 
 
-def test_simulation_preserves_sotopia_body_and_round_robin_guidance():
+def test_general_and_backchannel_prompts_preserve_sotopia_structure():
     directory = generation._PROMPT_PATH.parent
     original = (directory / "sotopia_action_v1.txt").read_text()
     body, output_instruction = original.split("\n\nPlease only generate", 1)
@@ -29,14 +29,11 @@ def test_simulation_preserves_sotopia_body_and_round_robin_guidance():
         'For a "speak" action, keep "argument" within 40 words; this is a maximum, not a target.'
         in prompt
     )
-    assert 'for "to", use [] for public actions' in prompt
-    assert (
-        'An "asr_partial" observation contains only the words recognized so far'
-        in prompt
-    )
-    assert 'set "argument" to "" for "backchanneling"' in prompt
+    assert 'use [] for "to"' in prompt
+    assert "asr_partial" not in prompt and "backchannel" not in prompt
     assert "only the words to be spoken aloud" in prompt
-    assert 'For "action" or "non-verbal communication"' in prompt
+    assert '"action"' not in prompt and '"non-verbal communication"' not in prompt
+    assert '"none"' not in prompt
     assert prompt.count("{history}") == 1
     for phrase in (
         "make a concrete opening",
@@ -45,6 +42,18 @@ def test_simulation_preserves_sotopia_body_and_round_robin_guidance():
         "settled point",
     ):
         assert phrase not in prompt
+    backchannel = generation._BACKCHANNEL_PROMPT
+    assert backchannel.startswith(body.split('\nNote: You can "leave"', 1)[0])
+    assert backchannel.endswith("Please only generate" + output_instruction)
+    assert backchannel == generation._BACKCHANNEL_PROMPT_PATH.read_text()
+    assert generation._BACKCHANNEL_PROMPT_PATH.stem == "simulation_action_FDB_v1"
+    assert generation._PROMPT_PATH.stem == "simulation_action_general_v1"
+    assert runtime_settings()["backchannel_prompt"] == "simulation_action_FDB_v1"
+    assert '"has_next_sentence" is true' in backchannel
+    assert '"none" or "backchanneling"' in backchannel
+    assert 'set "argument" to ""' in backchannel
+    assert "40 words" not in backchannel and '"leave"' not in backchannel
+    assert backchannel.count("{history}") == 1
 
 
 def test_fdb_evaluation_only_adds_timing_to_the_original_template():
