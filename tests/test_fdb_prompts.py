@@ -46,9 +46,9 @@ def test_general_and_backchannel_prompts_preserve_sotopia_structure():
     assert backchannel.startswith(body.split('\nNote: You can "leave"', 1)[0])
     assert backchannel.endswith("Please only generate" + output_instruction)
     assert backchannel == generation._BACKCHANNEL_PROMPT_PATH.read_text()
-    assert generation._BACKCHANNEL_PROMPT_PATH.stem == "simulation_action_FDB_v1"
+    assert generation._BACKCHANNEL_PROMPT_PATH.stem == "simulation_action_FDB_v2"
     assert generation._PROMPT_PATH.stem == "simulation_action_general_v1"
-    assert runtime_settings()["backchannel_prompt"] == "simulation_action_FDB_v1"
+    assert runtime_settings()["backchannel_prompt"] == "simulation_action_FDB_v2"
     assert '"has_next_sentence" is true' in backchannel
     assert '"none" or "backchanneling"' in backchannel
     assert 'set "argument" to ""' in backchannel

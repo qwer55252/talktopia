@@ -128,7 +128,7 @@ completed episodes using measurement counts, rather than averaging episode means
 
 The runtime loads two templates from `talktopia/full_duplex/prompts/`:
 `simulation_action_general_v1.txt` for opening and ordinary responses, and
-`simulation_action_FDB_v1.txt` for non-final sentence decisions. The general
+`simulation_action_FDB_v2.txt` for non-final sentence decisions. The general
 template preserves the body of `sotopia_action_v1.txt`, including the participant's
 freedom to leave, and retains the 40-word and recipient instructions. It contains
 no backchannel guidance. The FDB template keeps SOTOPIA's role, social goal,

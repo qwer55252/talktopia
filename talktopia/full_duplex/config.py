@@ -32,7 +32,7 @@ ASR_DECODE_INTERVAL_MS = 400
 ASR_WINDOW_MS = 3000
 INTERACTION_MODE = "surface5-full-duplex"
 SIMULATION_PROMPT_VERSION = "simulation_action_general_v1"
-BACKCHANNEL_PROMPT_VERSION = "simulation_action_FDB_v1"
+BACKCHANNEL_PROMPT_VERSION = "simulation_action_FDB_v2"
 BACKCHANNEL_TRIGGER = "received_sentence_asr_with_next_sentence_v1"
 
 
