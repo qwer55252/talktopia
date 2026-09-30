@@ -1,5 +1,9 @@
 /.venv
 /engine
+/Agent.md
+/AGENTS.md
+/agents.md
+/paper
 
 .pytest_cache/
 .ruff_cache/

@@ -176,6 +176,7 @@ def result_artifacts(result: dict[str, Any], run_dir: Path) -> dict[str, str]:
             "speech",
             "history",
             "conversation_audio",
+            "latency_report",
             "events",
         )
         if result.get(key)
@@ -231,6 +232,7 @@ async def run_episode_batch(
     summary_path,
     initial_summary,
     concurrency,
+    selected_episode_ids=None,
     max_attempts=1,
     validate_artifacts=result_artifacts,
     identity_keys=EPISODE_IDENTITY,
@@ -298,6 +300,12 @@ async def run_episode_batch(
         else:
             row["status"] = "pending"
     pending = [row for row in rows if row["status"] != "completed"]
+    if selected_episode_ids is not None:
+        selected = set(selected_episode_ids)
+        unknown = selected - {row["episode_id"] for row in rows}
+        if unknown:
+            raise ValueError(f"Unknown episode IDs: {sorted(unknown)}")
+        pending = [row for row in pending if row["episode_id"] in selected]
     if args.episode_limit:
         pending = pending[: args.episode_limit]
     if args.dry_run:
@@ -450,7 +458,7 @@ def speech_runtime() -> dict:
 
 
 def validate_run_inputs(run_dir: Path, db_path: Path, manifest_path: Path) -> dict:
-    from talktopia.full_duplex.config import runtime_settings
+    from talktopia.full_duplex.config import runtime_options, runtime_settings
     from talktopia.experiment import settings, validate_dataset
 
     config = json.loads((run_dir / "run_config.json").read_text())
@@ -470,10 +478,9 @@ def validate_run_inputs(run_dir: Path, db_path: Path, manifest_path: Path) -> di
             raise ValueError("Comparison settings changed; resume refused")
         if config.get("dataset_hashes") != validate_dataset(db_path):
             raise ValueError("Canonical dataset changed; resume refused")
-        if (
-            mode == "surface5-full-duplex"
-            and config.get("duplex_runtime") != runtime_settings()
-        ):
+        if mode == "surface5-full-duplex" and config.get(
+            "duplex_runtime"
+        ) != runtime_settings(**runtime_options(config)):
             raise ValueError("Duplex settings changed; resume refused")
     if file_hash(manifest_path) != config["manifest_sha256"]:
         raise ValueError("Frozen manifest changed; resume refused")
@@ -485,7 +492,7 @@ def save_run_config(args, run_dir, db_path, manifest_path, **extra) -> None:
         key: str(value.expanduser().resolve()) if isinstance(value, Path) else value
         for key, value in vars(args).items()
     }
-    from talktopia.full_duplex.config import runtime_settings
+    from talktopia.full_duplex.config import runtime_options, runtime_settings
     from talktopia.experiment import settings, validate_dataset, validate_manifest
 
     metadata = {
@@ -499,7 +506,7 @@ def save_run_config(args, run_dir, db_path, manifest_path, **extra) -> None:
             coverage=validate_manifest(read_manifest(manifest_path)),
         )
         if args.interaction_mode == "surface5-full-duplex":
-            metadata["duplex_runtime"] = runtime_settings()
+            metadata["duplex_runtime"] = runtime_settings(**runtime_options(args))
 
     write_json(
         run_dir / "run_config.json",

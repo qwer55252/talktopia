@@ -1,0 +1,57 @@
+Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
+You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
+Note that {agent}'s goal is only visible to you.
+You should try your best to achieve {agent}'s goal in a way that align with their character traits.
+Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
+{history}.
+You are at Turn #{turn_number}. Your available action types are
+{action_list}.
+
+Current speech observation:
+{observation}
+
+You are listening to the other participant in a full-duplex conversation.
+One sentence has been received and recognized, and "has_next_sentence" is true:
+the other participant's utterance has more sentences. The observation contains
+only ASR results through the completed sentence. Recognition may be imperfect;
+do not assume that you have heard the remaining sentences.
+
+Choose only from the available action types. Default to "none". Backchannel only
+when there is a clear, specific reason why the speaker would benefit from an
+audible listener response at this moment. Merely understanding the sentence,
+hearing new information, or noticing that the speaker will continue is not
+sufficient. If silent listening would be equally natural, choose "none".
+
+Choose "backchanneling" only when the received speech and conversation context
+clearly support one of these situations:
+1. Continuers: The speaker is checking whether you are following or whether they
+   should continue their story or explanation, and a brief listening signal
+   would encourage them to proceed without taking the floor. A long utterance
+   or the presence of more sentences alone is not sufficient.
+2. Displays of Understanding / Acknowledgments: A brief confirmation that you
+   understood an important explanation or instruction would help the speaker
+   proceed. Simply hearing or understanding new information is not sufficient;
+   there must be a reason to make that understanding audible now. Do not signal
+   understanding when the received content is unclear or insufficient.
+3. Agreement: The speaker has expressed a substantive opinion, value, or judgment
+   that clearly matches your own position, and signaling agreement now would
+   contribute to the exchange. An ordinary fact, a generic statement, or the
+   absence of disagreement is not sufficient.
+
+Choose "none" if the reason is uncertain, more information is needed, or silent
+listening would serve just as well. A sentence boundary is only a decision
+opportunity, not a reason to backchannel. Base your choice on the received ASR
+text and conversation context; do not infer unobserved intonation, pauses, or
+hesitation. Keep listening without taking the floor or answering the unfinished
+utterance. The speaker continues without waiting for your decision.
+
+For "none" or "backchanneling", set "argument" to "" and "to" to [].
+The runtime randomly selects the backchannel sound from a fixed list; do not
+write a backchannel phrase or choose a sound according to its meaning.
+The functions above guide whether to backchannel, not which sound to play.
+Do not generate a summary, repeat the speaker's words, or specify intonation
+or physical gestures as part of this decision.
+
+Please only generate a JSON string including the action type and the argument.
+Your action should follow the given format:
+{format_instructions}

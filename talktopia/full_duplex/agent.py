@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -13,14 +14,18 @@ from sotopia.database import AgentProfile
 
 from .actions import (
     DuplexAction,
-    DuplexActionDecision,
     DuplexActionType,
     DuplexObservation,
     HiddenSaid,
     StreamingObservation,
 )
 from .audio import AudioChunk, AudioFrame
-from .generation import AgentSessionContext, DuplexGenerationEngine
+from .generation import (
+    AgentSessionContext,
+    DuplexGenerationEngine,
+    GeneratedAction,
+    GenerationFailure,
+)
 from .speech_backends import (
     ASRUpdate,
     IncrementalTTS,
@@ -49,11 +54,16 @@ class AgentState:
     active_utterance: ActiveUtterance | None = None
     observation_revision: int = 0
     last_llm_latency_ms: int | None = None
-    work_stage: Literal["idle", "decision", "hidden_said", "closing", "tts"] = "idle"
+    work_stage: Literal["idle", "decision", "tts"] = "idle"
 
 
 AgentOutput = (
-    DuplexActionDecision | HiddenSaid | AudioChunk | SpeechSynthesisFailure | ASRUpdate
+    GeneratedAction
+    | GenerationFailure
+    | HiddenSaid
+    | AudioChunk
+    | SpeechSynthesisFailure
+    | ASRUpdate
 )
 
 
@@ -68,7 +78,6 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         asr: OnlineASR,
         tts: IncrementalTTS,
         voice_reference: Path,
-        history_entries: int,
     ) -> None:
         super().__init__(agent_profile=profile)
         self.model_name = generation.model_name
@@ -78,9 +87,6 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         self.voice_reference = voice_reference.expanduser().resolve()
         if not self.voice_reference.is_file():
             raise FileNotFoundError(self.voice_reference)
-        if history_entries < 1:
-            raise ValueError("history_entries must be positive")
-        self.history_entries = history_entries
         self.state = AgentState()
         self._context: AgentSessionContext | None = None
         self._outputs: asyncio.Queue[AgentOutput] = asyncio.Queue()
@@ -89,10 +95,10 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         self._background_errors: deque[tuple[str, BaseException]] = deque()
         self._background_changed = asyncio.Event()
         self._incoming_utterances: set[str] = set()
-        self._recent_turns: deque[str] = deque(maxlen=history_entries)
+        self._history: list[str] = []
         self._decision_observations: dict[str, StreamingObservation] = {}
-        self._backchannel_index = 0
         self._received_finals: dict[str, ASRUpdate] = {}
+        self._finalization_tasks: dict[str, asyncio.Task[ASRUpdate]] = {}
 
     def act(self, obs: DuplexObservation) -> DuplexAction:
         del obs
@@ -115,9 +121,9 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         self._background_changed = asyncio.Event()
         self._incoming_utterances.clear()
         self._received_finals.clear()
-        self._recent_turns.clear()
+        self._finalization_tasks.clear()
+        self._history.clear()
         self._decision_observations.clear()
-        self._backchannel_index = 0
         self._asr_relay_task = self._track_background_task(
             "asr",
             asyncio.create_task(
@@ -126,7 +132,9 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
             ),
         )
 
-    async def submit_observation(self, observation: StreamingObservation) -> None:
+    async def submit_observation(
+        self, observation: StreamingObservation, *, deadline: float | None = None
+    ) -> None:
         self._require_active()
         if self.state.left:
             return
@@ -142,7 +150,7 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         self._decision_task = self._track_background_task(
             "decision",
             asyncio.create_task(
-                self._respond(observation, revision),
+                self._respond(observation, revision, deadline=deadline),
                 name=f"surface5-decision-{self.agent_name}-{revision}",
             ),
         )
@@ -155,11 +163,38 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
             await self.asr.start_utterance(frame.utterance_id, self.agent_name)
             self._incoming_utterances.add(frame.utterance_id)
         await self.asr.push_audio(frame)
-        if frame.is_utterance_end:
-            final = await self.asr.finish_utterance(frame.utterance_id)
-            self._incoming_utterances.remove(frame.utterance_id)
-            self._received_finals[frame.utterance_id] = final
-            await self._outputs.put(final)
+
+    def finish_received_sentence(self, frame: AudioFrame) -> None:
+        # At a chunk boundary, is_utterance_end carries SpeechChunk.is_final.
+        self.asr.finish_sentence(
+            frame.utterance_id,
+            frame.chunk_index,
+            has_next_sentence=not frame.is_utterance_end,
+        )
+
+    def finish_received_audio(
+        self, utterance_id: str, *, cancelled: bool = False
+    ) -> None:
+        """Finalize recognition in the background after the last frame is delivered."""
+        if utterance_id in self._finalization_tasks:
+            raise ValueError("Audio was already finalized")
+        self._finalization_tasks[utterance_id] = self._track_background_task(
+            "final_asr",
+            asyncio.create_task(
+                self._finish_received_audio(utterance_id, cancelled=cancelled),
+                name=f"surface5-asr-final-{utterance_id}",
+            ),
+        )
+
+    async def _finish_received_audio(
+        self, utterance_id: str, *, cancelled: bool
+    ) -> ASRUpdate:
+        finalize = self.asr.cancel_utterance if cancelled else self.asr.finish_utterance
+        final = await finalize(utterance_id)
+        self._incoming_utterances.remove(utterance_id)
+        self._received_finals[utterance_id] = final
+        await self._outputs.put(final)
+        return final
 
     async def cancel_received_audio(self, utterance_id: str) -> ASRUpdate:
         self._require_active()
@@ -171,6 +206,8 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         return final
 
     async def finalize_received_audio(self, utterance_id: str) -> ASRUpdate | None:
+        if utterance_id in self._finalization_tasks:
+            return await self._finalization_tasks[utterance_id]
         if utterance_id in self._received_finals:
             return self._received_finals[utterance_id]
         if utterance_id in self._incoming_utterances:
@@ -266,20 +303,10 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         except KeyError as error:
             raise ValueError(f"unknown decision observation: {decision_id}") from error
 
-    def record_committed_action(
-        self,
-        actor: str,
-        action: DuplexAction,
-        *,
-        own_generated_text: str | None = None,
-    ) -> None:
-        """Append one complete commit using this agent's permitted text view."""
-
+    def record_observation(self, observation: DuplexObservation) -> None:
+        """Keep the complete canonical SOTOPIA view, including our own ASR."""
         self._require_active()
-        visible = action
-        if actor == self.agent_name and own_generated_text is not None:
-            visible = action.model_copy(update={"argument": own_generated_text})
-        self._recent_turns.append(f"{actor} {visible.to_natural_language()}")
+        self._history.append(observation.to_natural_language())
 
     async def stop_session(self) -> None:
         if not self.state.session_active:
@@ -288,6 +315,10 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
             self._decision_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._decision_task
+        for task in self._finalization_tasks.values():
+            task.cancel()
+        await asyncio.gather(*self._finalization_tasks.values(), return_exceptions=True)
+        self._finalization_tasks.clear()
         await self.asr.close()
         if self._asr_relay_task is not None and not self._asr_relay_task.done():
             with suppress(asyncio.CancelledError):
@@ -295,7 +326,7 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         await self.tts.close()
         self._incoming_utterances.clear()
         self._received_finals.clear()
-        self._recent_turns.clear()
+        self._history.clear()
         self._decision_observations.clear()
         self._background_errors.clear()
         self._background_changed.set()
@@ -308,65 +339,69 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         self,
         observation: StreamingObservation,
         revision: int,
+        *,
+        deadline: float | None = None,
     ) -> None:
         assert self._context is not None
+        # Cancelling the prior decision or scheduling this task can cross the limit.
+        if deadline is not None and time.monotonic() >= deadline:
+            return
         loop = asyncio.get_running_loop()
         started = loop.time()
-        recent_history = "\n\n".join(self._recent_turns)
         self.state.work_stage = "decision"
         try:
-            decision = await self.generation.decide_action(
-                self._context,
-                observation,
-                recent_history,
+            generated = await self.generation.generate_action(
+                self._context, observation, "\n".join(self._history)
             )
             self.state.last_llm_latency_ms = round((loop.time() - started) * 1000)
             if revision != self.state.observation_revision or self.state.left:
                 return
-            self._decision_observations[decision.decision_id] = observation
-            await self._outputs.put(decision)
-            if decision.action_type in {
-                "none",
-                "action",
-                "non-verbal communication",
-            }:
-                return
-            if decision.action_type == "leave" and observation.source != "peer_left":
-                return
+            decision_id = (
+                generated.decision_id
+                if isinstance(generated, GenerationFailure)
+                else generated.decision.decision_id
+            )
+            self._decision_observations[decision_id] = observation
+            # The runtime checks this proposal before starting any TTS work.
+            await self._outputs.put(generated)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if asyncio.current_task() is self._decision_task:
+                self.state.work_stage = "idle"
 
+    def start_speech(self, generated: GeneratedAction) -> None:
+        """Start only the proposal approved by the runtime's current floor state."""
+        self._require_active()
+        observation = self.decision_observation(generated.decision.decision_id)
+        if self.state.left or observation is not self.state.latest_observation:
+            raise ValueError("Cannot synthesize a superseded action")
+        if self.has_pending_generation:
+            raise RuntimeError("Cannot start TTS while another agent task is running")
+        self.state.work_stage = "tts"
+        self._decision_task = self._track_background_task(
+            "tts",
+            asyncio.create_task(
+                self._speak(generated, self.state.observation_revision),
+                name=f"surface5-tts-{generated.decision.decision_id}",
+            ),
+        )
+
+    async def _speak(self, generated: GeneratedAction, revision: int) -> None:
+        assert self._context is not None
+        decision = generated.decision
+        try:
             if decision.action_type == "backchanneling":
-                hidden = self.generation.make_backchannel(
-                    self._context,
-                    self._backchannel_index,
-                    decision,
-                )
-                self._backchannel_index += 1
-                action_type: DuplexActionType = "backchanneling"
-            elif decision.action_type == "leave":
-                self.state.work_stage = "closing"
-                hidden = await self.generation.generate_closing(
-                    self._context,
-                    recent_history,
-                    decision.decision_id,
-                )
-                action_type = "speak"
+                hidden = self.generation.make_backchannel(self._context, decision)
             else:
-                self.state.work_stage = "hidden_said"
-                hidden = await self.generation.generate_hidden_said(
-                    self._context,
-                    observation,
-                    decision,
-                    recent_history,
-                )
-                action_type = decision.action_type
-
+                hidden = self.generation.make_hidden_said(self._context, generated)
             if revision != self.state.observation_revision or self.state.left:
                 return
             chunks = self.generation.split_into_sentence_chunks(hidden)
             active = ActiveUtterance(
                 utterance_id=chunks[0].utterance_id,
                 decision_id=decision.decision_id,
-                action_type=action_type,
+                action_type=decision.action_type,
                 hidden_said=hidden,
             )
             self.state.active_utterance = active
@@ -374,7 +409,6 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
             for chunk in chunks:
                 if active.cancelled or revision != self.state.observation_revision:
                     return
-                self.state.work_stage = "tts"
                 audio = await self.tts.synthesize(chunk, self.voice_reference)
                 if isinstance(audio, SpeechSynthesisFailure):
                     if (
@@ -390,8 +424,6 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
                     return
                 active.synthesized_chunk_indexes.add(chunk.chunk_index)
                 await self._outputs.put(audio)
-        except asyncio.CancelledError:
-            raise
         finally:
             if asyncio.current_task() is self._decision_task:
                 self.state.work_stage = "idle"
@@ -404,12 +436,12 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         if not self.state.session_active:
             raise RuntimeError("agent session is not active")
 
-    def _track_background_task(
+    def _track_background_task[T](
         self,
         role: str,
-        task: asyncio.Task[None],
-    ) -> asyncio.Task[None]:
-        def record_completion(completed: asyncio.Task[None]) -> None:
+        task: asyncio.Task[T],
+    ) -> asyncio.Task[T]:
+        def record_completion(completed: asyncio.Task[T]) -> None:
             if not completed.cancelled():
                 error = completed.exception()
                 if error is not None:

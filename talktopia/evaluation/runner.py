@@ -55,6 +55,12 @@ def evaluation_artifacts(result: dict, run_dir: Path) -> dict[str, str]:
         and file_hash(Path(result["source_events"])) != result["source_events_sha256"]
     ):
         raise ValueError("Source events changed during evaluation")
+    if result.get("temporal_evaluation"):
+        if (
+            file_hash(Path(result["source_conversation_audio"]))
+            != result["source_conversation_audio_sha256"]
+        ):
+            raise ValueError("Source audio changed during temporal evaluation")
     return hashes
 
 
@@ -162,6 +168,15 @@ def evaluation_manifest(
                     if row.get("conversation_audio")
                     else None
                 ),
+                **(
+                    {
+                        "source_conversation_audio_sha256": file_hash(
+                            simulation_dir / row["conversation_audio"]
+                        )
+                    }
+                    if mode == "surface5-full-duplex" and row.get("conversation_audio")
+                    else {}
+                ),
             }
         )
     return records, {
@@ -225,6 +240,9 @@ async def run_evaluation_batch(records, args, run_dir) -> int:
                 "interaction_mode": record["interaction_mode"],
                 "source_events": record.get("source_events"),
                 "source_events_sha256": record.get("source_events_sha256"),
+                "source_conversation_audio_sha256": record.get(
+                    "source_conversation_audio_sha256"
+                ),
             }
         )
         await evaluate_episode(

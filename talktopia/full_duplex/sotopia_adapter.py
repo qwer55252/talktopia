@@ -16,6 +16,7 @@ from talktopia.speech_agent import AgentProfile
 from gymnasium.spaces.dict import Dict as GymDict
 from gymnasium.spaces.text import Text
 from sotopia.envs.parallel import LiteralSpace, ParallelSotopiaEnv
+from sotopia.envs.evaluators import RuleBasedTerminatedEvaluator
 
 from .actions import DuplexAction, DuplexActionType, DuplexObservation
 
@@ -81,7 +82,7 @@ class SemanticSnapshot:
 class SemanticCommit:
     actions: Mapping[str, DuplexAction]
     expected_turn_number: int
-    timestamp_ms: int
+    timestamp_ms: float
     origin: str
     utterance_ids: Mapping[str, str | None]
     metadata: Mapping[str, object]
@@ -113,7 +114,7 @@ class DuplexSotopiaEnv(ParallelSotopiaEnv):
             evaluators=[],
             terminal_evaluators=[],
             model_name="talktopia-full-duplex",
-            hide_unknown=True,
+            hide_unknown=False,
             include_turn_marker=False,
         )
 
@@ -213,6 +214,7 @@ class SotopiaSession:
         self._resolved = resolved
         self._seed = seed
         self._environment = DuplexSotopiaEnv(resolved.env_profile)
+        self._stale_evaluator = RuleBasedTerminatedEvaluator(max_stale_turn=2)
         self._lock = asyncio.Lock()
         self._latest: SemanticSnapshot | None = None
 
@@ -274,6 +276,17 @@ class SotopiaSession:
                 observations=observations,
             )
             return self._latest
+
+    def is_stale(self, actions: list[tuple[str, DuplexAction]]) -> bool:
+        """Apply SOTOPIA's stale-turn rule to actual actions, not peer placeholders."""
+        if self._latest is None:
+            raise RuntimeError("SOTOPIA session is not open")
+        result = self._stale_evaluator(
+            turn_number=0,
+            messages=[(speaker, action) for speaker, action in actions],
+            env=self._environment,
+        )
+        return bool(result[0][1][0][1])
 
     def close(self) -> None:
         if self._lock.locked():

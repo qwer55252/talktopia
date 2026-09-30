@@ -3,26 +3,20 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import time
 import wave
 from types import SimpleNamespace
 
 import httpx
 import pytest
 from openai import AsyncOpenAI
-from pydantic import ValidationError
 
 from talktopia import pipeline, utils
 from talktopia.full_duplex import episode as episode_module, generation
-from talktopia.full_duplex.actions import (
-    HiddenSaid,
-    DuplexActionDecision,
-    DuplexObservation,
-    StreamingObservation,
-)
 from talktopia.full_duplex.config import RuntimeConfig
 from talktopia.full_duplex.episode import run_with_timeout
 from talktopia.full_duplex.events import ActionCommitted, EpisodeEnded, read_events
-from talktopia.full_duplex.generation import AgentSessionContext, DuplexGenerationEngine
+from talktopia.full_duplex.speech_backends import WindowedASR
 from talktopia.speech_agent import AgentProfile
 
 
@@ -84,10 +78,12 @@ class FakeSpeech:
     def __init__(self):
         self.seeds = []
         self.asr_audio_lengths = []
+        self.tts_inputs = []
 
     def handle(self, request):
         if request.url.path.endswith("/audio/speech"):
             body = json.loads(request.content)
+            self.tts_inputs.append(body["input"])
             assert body["voice"].startswith("voice-agent-")
             self.seeds.append(body["seed"])
             return httpx.Response(
@@ -110,44 +106,129 @@ class FakeSpeech:
         )
 
 
+def joint_result(kwargs, action, text="Generated speech that is private until heard."):
+    argument = "" if action in {"none", "leave", "backchanneling"} else text
+    return kwargs["output_parser"].parse(
+        json.dumps({"action_type": action, "argument": argument, "to": []}),
+        context=kwargs["context"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_accepted_speech_preserves_generated_synthesized_and_live_pcm(
+    profiles, tmp_path, monkeypatch
+):
+    from sotopia.database import EpisodeLog
+    from talktopia.evaluation.evaluator import duplex_history
+    from talktopia.full_duplex.events import DecisionEvent
+    from talktopia.full_duplex.transcript import TranscriptBuilder
+
+    decisions = 0
+    original = "I need the other grand."
+    raw_response = (
+        '<think>Private raw diagnostic.</think>'
+        '{"argument":"I need the other grand."}'
+    )
+
+    async def generate(**kwargs):
+        nonlocal decisions
+        assert "Private raw diagnostic" not in kwargs["input_values"]["history"]
+        if json.loads(kwargs["input_values"]["observation"])["source"] == "asr_partial":
+            return joint_result(kwargs, "none")
+        decisions += 1
+        kwargs["responses"].append(raw_response)
+        return joint_result(kwargs, "speak" if decisions == 1 else "leave", original)
+
+    monkeypatch.setattr(generation, "generate_structured_action", generate)
+    args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
+    args.tag = "accepted-speech"
+    speech = FakeSpeech()
+    async with speech.client() as client:
+        resolved, agents = pipeline.build_episode(profiles, args, client, client)
+        result = await asyncio.wait_for(
+            pipeline.run_one_episode(resolved, agents, args, tmp_path, "episode_0001"),
+            10,
+        )
+    assert result["status"] == "completed"
+    assert speech.tts_inputs == [original]
+    events = read_events(tmp_path / result["events"])
+    assert all(
+        event.observation.source != "asr_partial"
+        for event in events
+        if isinstance(event, DecisionEvent)
+    )
+    spoken = [
+        e
+        for e in TranscriptBuilder.from_events(events).build()
+        if e.action_type == "speak"
+    ]
+    assert len(spoken) == 1
+    assert spoken[0].generated_text == original
+    assert spoken[0].synthesized_text == speech.tts_inputs[0]
+    assert (
+        spoken[0].received_text
+        == "Received words describing the proposed meeting time."
+    )
+    source = EpisodeLog.model_validate_json((tmp_path / result["original"]).read_text())
+    _, timed_history = duplex_history(source, tmp_path / result["events"])
+    assert "Private raw diagnostic" not in "\n".join(timed_history)
+    selected = next(
+        e for e in events if isinstance(e, DecisionEvent) and e.raw_responses
+    )
+    assert selected.raw_responses == (raw_response,)
+    legacy = selected.model_dump()
+    legacy.pop("raw_responses")
+    assert DecisionEvent.model_validate(legacy).raw_responses == ()
+    assert "Private raw diagnostic" not in (tmp_path / result["readable"]).read_text()
+    assert "nods" not in (tmp_path / result["readable"]).read_text()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "intervention", ["none", "backchanneling", "interruption", "correction"]
+    "intervention,cancel_delay",
+    [
+        ("none", 0.35),
+        ("backchanneling", 0.35),
+    ],
 )
 async def test_http_episode_limits_and_audible_history(
-    profiles, tmp_path, monkeypatch, intervention
+    profiles, tmp_path, monkeypatch, intervention, cancel_delay
 ):
     count = 0
     intervened = False
     histories = []
+    original_cancel_asr = WindowedASR.cancel_utterance
+
+    async def slow_cancel_asr(self, utterance_id):
+        await asyncio.sleep(cancel_delay)
+        return await original_cancel_asr(self, utterance_id)
+
+    monkeypatch.setattr(WindowedASR, "cancel_utterance", slow_cancel_asr)
 
     async def fake_generation(**kwargs):
         nonlocal count, intervened
         values = kwargs["input_values"]
-        if "available_actions" in values:
-            obs = json.loads(values["observation"])
-            histories.append(values["recent_history"])
-            if obs["source"] == "asr_partial":
-                if intervention != "none" and not intervened:
-                    intervened = True
-                    return json.dumps({"action_type": intervention})
-                return '{"action_type":"none"}'
-            count += 1
-            # Exercise both natural termination and a hard cutoff during closing.
-            return json.dumps({"action_type": "speak" if count <= 2 else "leave"})
-        return '{"text":"Generated speech that is private until heard."}'
+        obs = json.loads(values["observation"])
+        histories.append(values["history"])
+        if obs["source"] == "asr_partial":
+            assert "none" in kwargs["context"]["available_action_types"]
+            assert obs["has_next_sentence"] is True
+            assert obs["sentence_index"] == 0
+            if intervention != "none" and not intervened:
+                intervened = True
+                return joint_result(kwargs, intervention)
+            return joint_result(kwargs, "none")
+        if obs["source"] == "asr_final":
+            assert "none" not in kwargs["context"]["available_action_types"]
+            assert obs["has_next_sentence"] is False
+        count += 1
+        return joint_result(
+            kwargs,
+            "speak" if count <= 2 else "leave",
+            "Generated first sentence. Generated second sentence.",
+        )
 
-    monkeypatch.setattr(generation, "agenerate", fake_generation)
-    monkeypatch.setattr(
-        episode_module,
-        "RuntimeConfig",
-        lambda **kw: RuntimeConfig(
-            **kw,
-            realtime=False,
-            correction_min_stable_words=2,
-            interruption_min_stable_words=2,
-        ),
-    )
+    monkeypatch.setattr(generation, "generate_structured_action", fake_generation)
     args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
     args.tag = "test-duplex"
     speech = FakeSpeech()
@@ -163,7 +244,16 @@ async def test_http_episode_limits_and_audible_history(
     assert [event.turn_number for event in commits] == list(range(1, len(commits) + 1))
     assert events[-1].status == "completed"
     assert len([event for event in events if isinstance(event, EpisodeEnded)]) == 1
-    assert result["end_reason"] == "explicit_leave_handshake"
+    assert result["end_reason"] == "agent_left"
+    assert (
+        sum(
+            action.action_type == "leave"
+            for event in commits
+            for action in event.actions.values()
+        )
+        == 1
+    )
+    assert any(action.action_type == "leave" for action in commits[-1].actions.values())
     saved = json.loads((tmp_path / result["original"]).read_text())
     assert len(saved["models"]) == 3
     from sotopia.database import EpisodeLog
@@ -176,6 +266,8 @@ async def test_http_episode_limits_and_audible_history(
     ]
     assert "Generated speech" not in json.dumps(saved["messages"])
     assert "Received words" in json.dumps(saved["messages"])
+    assert all("Generated speech" not in history for history in histories)
+    assert "Received words" in histories[-1]
     assert all(
         not agent.state.session_active and not agent.has_pending_generation
         for agent in agents
@@ -200,35 +292,38 @@ async def test_http_episode_limits_and_audible_history(
             for event in commits
             for action in event.actions.values()
         )
-    if intervention in {"correction", "interruption"}:
-        assert any(
-            event.event_type == "floor" and event.change == "transferred"
-            for event in events
-        )
-        assert any(
-            event.event_type == "speech_lifecycle" and event.phase == "cancelled"
-            for event in events
-        )
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("last_action", ["speak", "leave"])
 async def test_exactly_twelve_commits_with_continuing_agents(
-    profiles, tmp_path, monkeypatch
+    profiles, tmp_path, monkeypatch, last_action
 ):
-    async def generate(**kwargs):
-        values = kwargs["input_values"]
-        if "available_actions" in values:
-            obs = json.loads(values["observation"])
-            return json.dumps(
-                {"action_type": "none" if obs["source"] == "asr_partial" else "speak"}
-            )
-        return '{"text":"We can meet tomorrow morning."}'
+    decisions = 0
 
-    monkeypatch.setattr(generation, "agenerate", generate)
+    async def generate(**kwargs):
+        nonlocal decisions
+        obs = json.loads(kwargs["input_values"]["observation"])
+        if obs["source"] == "asr_partial":
+            return joint_result(kwargs, "none")
+        decisions += 1
+        return joint_result(
+            kwargs,
+            last_action if decisions == 12 else "speak",
+            "We can meet tomorrow morning.",
+        )
+
+    from talktopia.full_duplex.speech_client import SpeechClient
+
+    async def short_speech(self, text, reference, seed):
+        return (1000).to_bytes(2, "little") * 4800
+
+    monkeypatch.setattr(SpeechClient, "synthesize", short_speech)
+    monkeypatch.setattr(generation, "generate_structured_action", generate)
     monkeypatch.setattr(
         episode_module,
         "RuntimeConfig",
-        lambda **kw: RuntimeConfig(**kw, realtime=False),
+        lambda **kw: RuntimeConfig(**kw),
     )
     args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
     args.tag = "test-duplex"
@@ -239,7 +334,11 @@ async def test_exactly_twelve_commits_with_continuing_agents(
             resolved, agents, args, tmp_path, "episode_0001"
         )
     assert result["turns"] == 12
-    assert result["end_reason"] == "max_turns"
+    assert result["budget_turns"] == 12
+    assert result["end_reason"] == (
+        "agent_left" if last_action == "leave" else "max_turns"
+    )
+    assert decisions == 12
     assert (
         len(
             [
@@ -250,46 +349,6 @@ async def test_exactly_twelve_commits_with_continuing_agents(
         )
         == 12
     )
-
-
-@pytest.mark.asyncio
-async def test_word_limit_retries_whole_utterance_and_closing(monkeypatch):
-    context = AgentSessionContext(
-        episode_id="episode",
-        agent_name="Alice",
-        peer_name="Bob",
-        scenario="Meet tomorrow.",
-        self_background="A shopkeeper.",
-        private_goal="Agree on a time.",
-    )
-    observation = StreamingObservation(
-        canonical=DuplexObservation(
-            last_turn="Hello",
-            turn_number=0,
-            available_actions=["speak"],
-            observation_id="obs",
-        ),
-        source="reset",
-    )
-    decision = DuplexActionDecision(decision_id="decision", action_type="speak")
-    forty = " ".join(["word"] * 50)
-    calls = []
-
-    async def generate(**kwargs):
-        calls.append(kwargs)
-        return json.dumps({"text": forty + (" excess" if len(calls) % 2 else "")})
-
-    monkeypatch.setattr(generation, "agenerate", generate)
-    engine = DuplexGenerationEngine("fake", max_attempts=2)
-    hidden = await engine.generate_hidden_said(context, observation, decision, "")
-    closing = await engine.generate_closing(context, "", "closing-decision")
-    assert hidden.text == closing.text == forty
-    assert len(calls) == 4
-    assert all(call["input_values"]["max_words"] == "40" for call in calls)
-    with pytest.raises(ValidationError, match="at most 50"):
-        HiddenSaid(
-            hidden_said_id="h", decision_id="d", speaker="Alice", text=forty + " excess"
-        )
 
 
 @pytest.mark.asyncio
@@ -327,50 +386,62 @@ def test_defaults_and_invalid_timeout():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["timeout", "generation", "cancel"])
-async def test_failed_episode_has_one_terminal_event_and_stops_tasks(
-    profiles, tmp_path, monkeypatch, failure
+@pytest.mark.parametrize("ending", ["time_limit", "late_start", "cancel"])
+async def test_waiting_decision_stops_without_inventing_a_final_utterance(
+    profiles, tmp_path, monkeypatch, ending
 ):
     waiting = asyncio.Event()
 
     async def generate(**kwargs):
         waiting.set()
-        if failure == "generation":
-            raise RuntimeError("generation unavailable")
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(generation, "agenerate", generate)
+    monkeypatch.setattr(generation, "generate_structured_action", generate)
     args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
     args.tag = "test-duplex"
-    if failure == "timeout":
+    if ending != "cancel":
         monkeypatch.setattr(pipeline, "EPISODE_TIMEOUT_S", 0.03)
+    if ending == "late_start":
+        from talktopia.full_duplex.agent import CascadedDuplexAgent
+
+        original_respond = CascadedDuplexAgent._respond
+
+        async def delayed_respond(self, *args, **kwargs):
+            # Simulate scheduling work that crosses the limit before the LLM call.
+            time.sleep(0.05)
+            await original_respond(self, *args, **kwargs)
+
+        monkeypatch.setattr(CascadedDuplexAgent, "_respond", delayed_respond)
     speech = FakeSpeech()
     async with speech.client() as client:
         resolved, agents = pipeline.build_episode(profiles, args, client, client)
         task = asyncio.create_task(
             pipeline.run_one_episode(resolved, agents, args, tmp_path, "episode_0001")
         )
-        await waiting.wait()
-        if failure == "cancel":
+        if ending != "late_start":
+            await waiting.wait()
+        if ending == "cancel":
             task.cancel()
-        error = (
-            asyncio.CancelledError
-            if failure == "cancel"
-            else (TimeoutError if failure == "timeout" else RuntimeError)
-        )
-        with pytest.raises(error):
-            await task
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            result = await asyncio.wait_for(task, 2)
+            assert result["status"] == "completed"
+            assert result["end_reason"] == "time_limit"
+            assert result["budget_turns"] == 0
     events = read_events(tmp_path / "simulation/events/episode_0001.jsonl")
     terminal = [event for event in events if isinstance(event, EpisodeEnded)]
     assert len(terminal) == 1
-    assert terminal[0].status == ("cancelled" if failure == "cancel" else "failed")
+    assert terminal[0].status == ("cancelled" if ending == "cancel" else "completed")
     assert all(
         not agent.state.session_active and not agent.has_pending_generation
         for agent in agents
     )
-    if failure == "timeout":
-        assert terminal[0].reason == "episode_timeout"
-        assert (tmp_path / "simulation/diagnostics/episode_0001.json").is_file()
+    assert waiting.is_set() == (ending != "late_start")
+    if ending != "cancel":
+        assert terminal[0].reason == "time_limit"
+        assert not any(isinstance(event, ActionCommitted) for event in events)
+        assert not (tmp_path / "simulation/diagnostics/episode_0001.json").exists()
 
 
 def test_existing_journal_is_not_overwritten(tmp_path):

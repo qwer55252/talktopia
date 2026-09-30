@@ -1,4 +1,4 @@
-"""PCM routing and deterministic stereo artifact writing."""
+"""PCM routing and live stereo capture on a continuous sample clock."""
 
 from __future__ import annotations
 
@@ -126,8 +126,21 @@ class AudioRouter:
         return any(self._queues.values())
 
 
+@dataclass(frozen=True, slots=True)
+class CapturePosition:
+    start_sample: int
+    clock_anchor_ms: float
+    clock_anchor_sample: int
+    underrun_ms: float
+
+
 class StereoWavWriter:
-    """Write fixed left/right source channels, padding idle channels with silence."""
+    """Capture the delivered PCM bus without turning callback jitter into clicks.
+
+    An active stream follows the sample clock anchored at its first delivery.
+    Idle time and stalls longer than one frame re-anchor it to measured time.
+    Only acknowledged frames enter this writer, during the live episode.
+    """
 
     def __init__(
         self,
@@ -140,36 +153,72 @@ class StereoWavWriter:
         if len(set(sources)) != 2:
             raise ValueError("StereoWavWriter requires two distinct sources")
         self._sources = sources
+        self.sample_rate_hz = sample_rate_hz
+        self.frame_ms = frame_ms
         self._bytes_per_tick = sample_rate_hz * frame_ms // 1000 * 2
-        output_path = path.expanduser()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        self._wave = wave.open(str(output_path), "wb")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._wave = wave.open(str(path), "wb")
         self._wave.setnchannels(2)
         self._wave.setsampwidth(2)
         self._wave.setframerate(sample_rate_hz)
+        self.samples_written = 0
         self._closed = False
+        self._clock_anchor_ms: float | None = None
+        self._clock_anchor_sample = 0
 
-    def write_tick(self, frames: Mapping[str, AudioFrame | None]) -> None:
+    def silence_until(self, timestamp_ms: float) -> None:
+        # An empty transport queue is real waiting, not callback jitter.
+        self._clock_anchor_ms = None
+        target = round(timestamp_ms * self.sample_rate_hz / 1000)
+        missing = max(0, target - self.samples_written)
+        while missing:
+            count = min(missing, self.sample_rate_hz)
+            self._wave.writeframesraw(b"\x00" * (count * 4))
+            self.samples_written += count
+            missing -= count
+
+    def write_tick(
+        self, frames: Mapping[str, AudioFrame | None], *, timestamp_ms: float
+    ) -> CapturePosition:
         if self._closed:
             raise RuntimeError("stereo WAV writer is closed")
-        unknown = set(frames) - set(self._sources)
-        if unknown:
-            raise ValueError(f"unknown stereo channel sources: {sorted(unknown)}")
-
-        channels: list[bytes] = []
-        for source in self._sources:
-            frame = frames.get(source)
-            pcm = frame.pcm_s16le if frame is not None else b""
-            if len(pcm) > self._bytes_per_tick:
-                raise ValueError("audio frame exceeds one configured tick")
-            channels.append(pcm.ljust(self._bytes_per_tick, b"\x00"))
-
-        interleaved = bytearray(self._bytes_per_tick * 2)
-        for offset in range(0, self._bytes_per_tick, 2):
-            target = offset * 2
-            interleaved[target : target + 2] = channels[0][offset : offset + 2]
-            interleaved[target + 2 : target + 4] = channels[1][offset : offset + 2]
+        if set(frames) - set(self._sources):
+            raise ValueError("Unknown stereo source")
+        gap_ms = timestamp_ms - self.samples_written * 1000 / self.sample_rate_hz
+        underrun_ms = 0.0
+        if self._clock_anchor_ms is None or gap_ms > self.frame_ms:
+            if self._clock_anchor_ms is not None:
+                underrun_ms = gap_ms
+            self.silence_until(timestamp_ms)
+            self._clock_anchor_ms = timestamp_ms
+            self._clock_anchor_sample = self.samples_written
+        start_sample = self.samples_written
+        size = max(
+            (len(frame.pcm_s16le) for frame in frames.values() if frame),
+            default=0,
+        )
+        if size > self._bytes_per_tick:
+            raise ValueError("Audio frame exceeds one configured tick")
+        channels = [
+            (frames[source].pcm_s16le if frames.get(source) else b"").ljust(
+                size, b"\x00"
+            )
+            for source in self._sources
+        ]
+        interleaved = bytearray(size * 2)
+        for offset in range(0, size, 2):
+            interleaved[offset * 2 : offset * 2 + 2] = channels[0][offset : offset + 2]
+            interleaved[offset * 2 + 2 : offset * 2 + 4] = channels[1][
+                offset : offset + 2
+            ]
         self._wave.writeframesraw(bytes(interleaved))
+        self.samples_written += size // 2
+        return CapturePosition(
+            start_sample=start_sample,
+            clock_anchor_ms=self._clock_anchor_ms,
+            clock_anchor_sample=self._clock_anchor_sample,
+            underrun_ms=underrun_ms,
+        )
 
     def close(self) -> None:
         if not self._closed:

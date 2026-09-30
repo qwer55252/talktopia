@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Literal, TypeVar, cast
 from uuid import uuid4
@@ -21,14 +22,16 @@ from .actions import (
 
 
 class EventBase(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
-    schema_version: Literal["surface5-event/v1"] = "surface5-event/v1"
+    schema_version: Literal["surface5-event/v1", "surface5-event/v2"] = (
+        "surface5-event/v2"
+    )
     event_type: str
     event_id: str = Field(min_length=1)
     episode_id: str = Field(min_length=1)
     sequence: int = Field(ge=0)
-    timestamp_ms: int = Field(ge=0)
+    timestamp_ms: float = Field(ge=0)
     causation_id: str | None = None
     correlation_id: str | None = None
 
@@ -47,7 +50,7 @@ class EpisodeEnded(EventBase):
     event_type: Literal["episode_ended"] = "episode_ended"
     status: Literal["completed", "cancelled", "failed"]
     reason: str
-    duration_ms: int = Field(ge=0)
+    duration_ms: float = Field(ge=0)
     error_type: str | None = None
     error_message: str | None = None
 
@@ -61,6 +64,9 @@ class DecisionEvent(EventBase):
     decision: DuplexActionDecision | None
     attempt: int = Field(ge=1)
     validation_errors: tuple[str, ...] = ()
+    request_started_ms: float | None = None
+    generation_fallback: bool = False
+    raw_responses: tuple[str | None, ...] = ()
 
 
 class HiddenSaidCreated(EventBase):
@@ -75,7 +81,7 @@ class SpeechChunkSynthesized(EventBase):
     event_type: Literal["speech_chunk_synthesized"] = "speech_chunk_synthesized"
     speaker: str = Field(min_length=1)
     chunk: SpeechChunk
-    pcm_duration_ms: int = Field(gt=0)
+    pcm_duration_ms: float = Field(gt=0)
     pcm_sha256: str = Field(min_length=1)
     attempt: int = Field(default=1, ge=1)
 
@@ -98,9 +104,10 @@ class AudioDeliveryEvent(EventBase):
     chunk_index: int = Field(ge=0)
     delivered_frames: int = Field(ge=0)
     planned_frames: int = Field(ge=0)
-    start_ms: int = Field(ge=0)
-    end_ms: int = Field(ge=0)
+    start_ms: float = Field(ge=0)
+    end_ms: float = Field(ge=0)
     delivered_pcm_sha256: str = Field(min_length=1)
+    frame_spans: tuple[dict[str, float | int | str], ...] = ()
 
 
 class SpeechLifecycleEvent(EventBase):
@@ -130,6 +137,22 @@ class ASRUpdateEvent(EventBase):
     is_final: bool
     is_stable: bool
     revision_id: int = Field(ge=0)
+    sentence_texts: dict[int, str] = Field(default_factory=dict)
+    sentence_index: int | None = Field(default=None, ge=0)
+    has_next_sentence: bool | None = None
+
+
+class ResponseLatencyEvent(EventBase):
+    event_type: Literal["response_latency"] = "response_latency"
+    kind: Literal["normal_response", "backchannel"]
+    speaker: str
+    utterance_id: str
+    decision_id: str
+    observation_id: str
+    peer_utterance_id: str
+    origin_ms: float = Field(ge=0)
+    first_audio_ms: float = Field(ge=0)
+    latency_ms: float = Field(ge=0)
 
 
 class ActionCommitted(EventBase):
@@ -155,6 +178,7 @@ SurfaceEvent = (
     | FloorEvent
     | ASRUpdateEvent
     | ActionCommitted
+    | ResponseLatencyEvent
 )
 
 _EVENT_CLASSES: dict[str, type[EventBase]] = {
@@ -171,6 +195,7 @@ _EVENT_CLASSES: dict[str, type[EventBase]] = {
         FloorEvent,
         ASRUpdateEvent,
         ActionCommitted,
+        ResponseLatencyEvent,
     )
 }
 _EventT = TypeVar("_EventT", bound=EventBase)
@@ -185,14 +210,18 @@ class EventWriter:
         self.path = path.expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.episode_id = episode_id
+        self.started_ns = time.monotonic_ns()
         self._sequence = 0
         self._file = self.path.open("x", encoding="utf-8")
         self._closed = False
 
+    def now_ms(self) -> float:
+        return (time.monotonic_ns() - self.started_ns) / 1_000_000
+
     def emit(
         self,
         event_class: type[_EventT],
-        timestamp_ms: int,
+        timestamp_ms: float,
         **payload: object,
     ) -> _EventT:
         if self._closed:
@@ -264,6 +293,7 @@ __all__ = [
     "EventWriter",
     "FloorEvent",
     "HiddenSaidCreated",
+    "ResponseLatencyEvent",
     "SpeechChunkSynthesized",
     "SpeechSynthesisFailed",
     "SpeechLifecycleEvent",

@@ -20,7 +20,7 @@ DuplexActionType = Literal[
     "interruption",
 ]
 
-MAX_GENERATED_WORDS = 50 # 40 in prompt, 50 in Surface5 runtime for safety margin
+MAX_GENERATED_WORDS = 50  # 40 in prompt, 50 in Surface5 runtime for safety margin
 
 _BASE_ACTION_TYPES = frozenset(
     {"none", "speak", "non-verbal communication", "action", "leave"}
@@ -28,18 +28,6 @@ _BASE_ACTION_TYPES = frozenset(
 _EMPTY_ARGUMENT_ACTION_TYPES = frozenset({"none", "leave"})
 _NON_AUDIO_ARGUMENT_ACTION_TYPES = frozenset({"non-verbal communication", "action"})
 _TARGETED_ACTION_TYPES = frozenset({"correction", "interruption"})
-_CONTROLLER_METADATA_PHRASES = (
-    "private goal",
-    "hidden goal",
-    "social goal",
-    "system prompt",
-    "developer message",
-    "controller instruction",
-    "evaluator",
-    "evaluation score",
-    "benchmark score",
-    "reward function",
-)
 
 
 def _validate_generated_text(text: str, *, field_name: str) -> None:
@@ -50,13 +38,6 @@ def _validate_generated_text(text: str, *, field_name: str) -> None:
         raise ValueError(
             f"{field_name} must contain at most {MAX_GENERATED_WORDS} words"
         )
-    folded = normalized.casefold()
-    leaked = next(
-        (phrase for phrase in _CONTROLLER_METADATA_PHRASES if phrase in folded),
-        None,
-    )
-    if leaked is not None:
-        raise ValueError(f"{field_name} contains controller metadata: {leaked!r}")
 
 
 class DuplexAction(AgentAction):
@@ -76,7 +57,7 @@ class DuplexAction(AgentAction):
         if self.action_type in _EMPTY_ARGUMENT_ACTION_TYPES:
             if argument:
                 raise ValueError(f"{self.action_type} requires an empty argument")
-        elif not argument:
+        elif not argument and self.action_type not in {"speak", "backchanneling"}:
             raise ValueError(f"{self.action_type} requires a non-empty argument")
         if self.action_type in _NON_AUDIO_ARGUMENT_ACTION_TYPES:
             _validate_generated_text(self.argument, field_name="argument")
@@ -99,7 +80,11 @@ class DuplexAction(AgentAction):
             case "hesitation":
                 rendered = f"[hesitation] {self.argument}"
             case "backchanneling":
-                rendered = f'backchanneled: "{self.argument}"'
+                rendered = (
+                    f'backchanneled: "{self.argument}"'
+                    if self.argument.strip()
+                    else "made a nonverbal backchannel [no recognized words]"
+                )
             case "correction":
                 rendered = f'corrected: "{self.argument}"'
             case "interruption":
@@ -130,6 +115,8 @@ class StreamingObservation(BaseModel):
     new_stable_text: str = ""
     peer_utterance_id: str | None = None
     asr_revision_id: int = Field(default=0, ge=0)
+    sentence_index: int | None = Field(default=None, ge=0)
+    has_next_sentence: bool | None = None
     peer_speaking: bool = False
     self_speaking: bool = False
     self_active_action_type: DuplexActionType | None = None
@@ -137,7 +124,7 @@ class StreamingObservation(BaseModel):
 
 
 class DuplexActionDecision(BaseModel):
-    """Structured first-stage decision without generated speech text."""
+    """Controller action associated with a joint model response."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 

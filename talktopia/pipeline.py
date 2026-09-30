@@ -82,6 +82,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=INTERACTION_MODES,
         help="Conversation mode; new simulations default to round-robin.",
     )
+    for feature, default in (("backchannels", True),):
+        parser.add_argument(
+            f"--duplex-{feature}",
+            action=argparse.BooleanOptionalAction,
+            default=default,
+            help=f"Allow {feature} in Surface5 (default: {default}).",
+        )
     parser.set_defaults(
         max_turns=MAX_TURNS,
         episode_timeout_s=EPISODE_TIMEOUT_S,
@@ -116,6 +123,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Maximum unfinished episodes per model pair this invocation; 0 means all 450.",
     )
     parser.add_argument(
+        "--episode-id",
+        dest="episode_ids",
+        action="append",
+        help="Simulate only this canonical episode ID; repeat to select several. The full manifest is retained.",
+    )
+    parser.add_argument(
         "--bad-output-process-model",
         default=models["agent2"],
         help="Local model used by SOTOPIA to repair malformed model output.",
@@ -147,6 +160,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.episode_limit < 0:
         parser.error("--episode-limit must be nonnegative")
+    if args.episode_ids:
+        if len(set(args.episode_ids)) != len(args.episode_ids):
+            parser.error("--episode-id values must be distinct")
+        if args.stage == "reevaluate":
+            parser.error(
+                "--episode-id selects simulations; use --reeval-episode-id for evaluation"
+            )
     if args.resume_run:
         allowed = {
             "--resume-run",
@@ -205,6 +225,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--seed must be nonnegative")
     if args.stage != "reevaluate" and args.interaction_mode is None:
         args.interaction_mode = "round-robin"
+    if args.interaction_mode == "round-robin" and (not args.duplex_backchannels):
+        parser.error(
+            "Duplex action controls require --interaction-mode surface5-full-duplex"
+        )
     evaluation.validate_arguments(parser, args)
     if args.stage in {"all", "simulate"} and not args.dry_run:
         for kind in ("asr", "tts"):
@@ -321,6 +345,8 @@ async def run_simulation_batch(
     concurrency = args.batch_size
     if concurrency_limit is not None:
         concurrency = min(concurrency, concurrency_limit)
+    from talktopia.full_duplex.episode import summarize_latencies
+
     return await utils.run_episode_batch(
         records,
         args,
@@ -336,7 +362,8 @@ async def run_simulation_batch(
             "coverage": validate_manifest(records),
         },
         concurrency=concurrency,
-        max_attempts=3,
+        selected_episode_ids=getattr(args, "episode_ids", None),
+        max_attempts=1 if args.interaction_mode == "surface5-full-duplex" else 3,
         validate_artifacts=result_artifacts,
         error_fields={
             "conversation_audio": None,
@@ -344,6 +371,9 @@ async def run_simulation_batch(
             "interaction_mode": args.interaction_mode,
         },
         attempt_fields=("speech_worker",),
+        on_checkpoint=summarize_latencies
+        if args.interaction_mode == "surface5-full-duplex"
+        else None,
     )
 
 
@@ -617,7 +647,7 @@ def build_duplex_episode(
         ASR_DECODE_INTERVAL_MS,
         ASR_WINDOW_MS,
     )
-    from talktopia.full_duplex.episode import RuntimeConfig, profile_name
+    from talktopia.full_duplex.episode import profile_name
     from talktopia.full_duplex.generation import DuplexGenerationEngine
     from talktopia.full_duplex.speech_backends import SentenceTTS, WindowedASR
     from talktopia.full_duplex.speech_client import SpeechClient
@@ -652,7 +682,7 @@ def build_duplex_episode(
                 profile=profile,
                 generation=DuplexGenerationEngine(
                     getattr(args, f"agent{index}_model"),
-                    max_attempts=RuntimeConfig().generation_max_attempts,
+                    seed=args.seed,
                 ),
                 asr=WindowedASR(
                     speech,
@@ -661,7 +691,6 @@ def build_duplex_episode(
                 ),
                 tts=SentenceTTS(speech, source_agent=profile_name(profile)),
                 voice_reference=reference,
-                history_entries=RuntimeConfig().history_entries,
             )
         )
     return resolved, agents
@@ -680,11 +709,13 @@ async def run_duplex_episode(
     import time
 
     from sotopia.database import EpisodeLog
+    from talktopia.evaluation.temporal import timed_messages
     from talktopia.full_duplex.audio import AudioRouter, StereoWavWriter
     from talktopia.full_duplex.config import (
         FRAME_MS,
         INTERACTION_MODE,
         SAMPLE_RATE_HZ,
+        runtime_options,
     )
     from talktopia.full_duplex.episode import (
         RuntimeConfig,
@@ -698,7 +729,10 @@ async def run_duplex_episode(
         read_events,
     )
     from talktopia.full_duplex.generation import AgentSessionContext
-    from talktopia.full_duplex.rendering import render_sotopia_messages
+    from talktopia.full_duplex.rendering import (
+        render_episode_for_humans,
+        render_sotopia_messages,
+    )
     from talktopia.full_duplex.runtime import DuplexRuntime
     from talktopia.full_duplex.sotopia_adapter import SotopiaSession
     from talktopia.full_duplex.transcript import TranscriptBuilder
@@ -711,6 +745,7 @@ async def run_duplex_episode(
     original_path = base / "original" / f"{episode_id}.json"
     readable_path = base / "readable" / f"{episode_id}.md"
     timeout_path = base / "diagnostics" / f"{episode_id}.json"
+    latency_path = base / "latency" / f"{episode_id}.json"
     names = tuple(agent.agent_name for agent in agent_list)
     agents = tuple(agent_list)
     session = SotopiaSession(resolved, seed=args.seed)
@@ -723,11 +758,12 @@ async def run_duplex_episode(
         event_writer=writer,
         audio_router=AudioRouter(names),
         stereo_writer=stereo,
-        config=RuntimeConfig(max_turns=args.max_turns),
+        config=RuntimeConfig(**runtime_options(args)),
         model_names=tuple(agent.model_name for agent in agents),
         seed=args.seed,
         sample_rate_hz=SAMPLE_RATE_HZ,
         frame_ms=FRAME_MS,
+        deadline=deadline,
     )
     opened = False
     started = time.monotonic()
@@ -746,6 +782,16 @@ async def run_duplex_episode(
         snapshot = session.open(agents)
         opened = True
         ended = await runtime.run(snapshot)
+        write_json(
+            latency_path,
+            {
+                "clock": "monotonic_elapsed_ms",
+                "normal_response": "peer last audio delivery end to response first audio delivery start",
+                "backchannel": "completed-sentence ASR first LLM request to backchannel first audio delivery start",
+                "statistics": runtime.latency_summary(),
+                "samples_ms": runtime.latencies,
+            },
+        )
         events = read_events(events_path)
         transcript = TranscriptBuilder.from_events(events)
         entries = transcript.build()
@@ -764,7 +810,10 @@ async def run_duplex_episode(
         if args.push_to_db:
             episode.save()
         write_json(original_path, episode.model_dump(mode="json"))
-        _, turns = episode.render_for_humans()
+        readable_episode = episode.model_copy(
+            update={"messages": timed_messages(episode, commits, entries, events)}
+        )
+        _, turns = render_episode_for_humans(readable_episode)
         readable_path.parent.mkdir(parents=True, exist_ok=True)
         readable_path.write_text(
             "# Speech conversation\n\nEvaluation: not performed.\n\n"
@@ -774,7 +823,7 @@ async def run_duplex_episode(
         )
         writer.emit(
             EpisodeEnded,
-            runtime.state.now_ms,
+            runtime.now_ms,
             status="completed",
             reason=ended.reason,
             duration_ms=ended.duration_ms,
@@ -791,6 +840,8 @@ async def run_duplex_episode(
             "opener": "agent1",
             "end_reason": ended.reason,
             "duration_ms": ended.duration_ms,
+            "latency": runtime.latency_summary(),
+            "latency_report": str(latency_path.relative_to(run_dir)),
             "wall_seconds": time.monotonic() - started,
             "episode_pk": episode.pk or None,
             "evaluation_status": "not_performed",
@@ -801,11 +852,6 @@ async def run_duplex_episode(
             "conversation_audio": str(wav_path.relative_to(run_dir)),
         }
     except BaseException as exc:
-        timed_out = (
-            isinstance(exc, asyncio.CancelledError)
-            and deadline is not None
-            and time.monotonic() >= deadline
-        )
         write_json(
             timeout_path,
             {
@@ -817,12 +863,10 @@ async def run_duplex_episode(
         )
         writer.emit(
             EpisodeEnded,
-            runtime.state.now_ms,
-            status="cancelled"
-            if isinstance(exc, asyncio.CancelledError) and not timed_out
-            else "failed",
-            reason="episode_timeout" if timed_out else "episode_error",
-            duration_ms=runtime.state.now_ms,
+            runtime.now_ms,
+            status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+            reason="episode_error",
+            duration_ms=runtime.now_ms,
             error_type=type(exc).__name__,
             error_message=safe_error(exc),
         )
@@ -856,19 +900,22 @@ def build_episode(record, args, asr_client, tts_client, tts_semaphore=None):
 async def run_one_episode(
     resolved, agents, args, run_dir, episode_id, *, artifact_dir=None
 ):
-    run = (
-        run_round_robin_episode
-        if args.interaction_mode == "round-robin"
-        else run_duplex_episode
-    )
+    if args.interaction_mode == "surface5-full-duplex":
+        return await run_duplex_episode(
+            resolved,
+            agents,
+            args,
+            run_dir,
+            episode_id,
+            artifact_dir=artifact_dir,
+            deadline=time.monotonic() + EPISODE_TIMEOUT_S,
+        )
     timeout = asyncio.timeout(EPISODE_TIMEOUT_S)
     try:
-        deadline = time.monotonic() + EPISODE_TIMEOUT_S
-        options = {"artifact_dir": artifact_dir}
-        if args.interaction_mode == "surface5-full-duplex":
-            options["deadline"] = deadline
         async with timeout:
-            return await run(resolved, agents, args, run_dir, episode_id, **options)
+            return await run_round_robin_episode(
+                resolved, agents, args, run_dir, episode_id, artifact_dir=artifact_dir
+            )
     except TimeoutError:
         if not timeout.expired():
             raise
@@ -927,10 +974,16 @@ async def stage_3_simulate(
                 record["speech_worker"] = worker
                 async with (
                     AsyncOpenAI(
-                        base_url=url, api_key=asr_key, timeout=120, max_retries=0
+                        base_url=url,
+                        api_key=asr_key,
+                        timeout=120,
+                        max_retries=0,
                     ) as asr_client,
                     AsyncOpenAI(
-                        base_url=url, api_key=tts_key, timeout=120, max_retries=0
+                        base_url=url,
+                        api_key=tts_key,
+                        timeout=120,
+                        max_retries=0,
                     ) as tts_client,
                 ):
                     resolved, agents = build_episode(
@@ -950,10 +1003,16 @@ async def stage_3_simulate(
         )
     async with (
         AsyncOpenAI(
-            base_url=args.asr_base_url, api_key=asr_key, timeout=120, max_retries=2
+            base_url=args.asr_base_url,
+            api_key=asr_key,
+            timeout=120,
+            max_retries=0 if args.interaction_mode == "surface5-full-duplex" else 2,
         ) as asr_client,
         AsyncOpenAI(
-            base_url=args.tts_base_url, api_key=tts_key, timeout=120, max_retries=0
+            base_url=args.tts_base_url,
+            api_key=tts_key,
+            timeout=120,
+            max_retries=0,
         ) as tts_client,
     ):
         # Wait here, before the HTTP timeout starts, instead of filling the TTS
@@ -1009,13 +1068,18 @@ def preflight(args):
         if args.resume_run:
             manifest_path = args.resume_run / "02_sampled_characters.json"
             validate_run_inputs(args.resume_run, db_path, manifest_path)
-            validate_manifest(read_manifest(manifest_path))
+            records = read_manifest(manifest_path)
+            validate_manifest(records)
         else:
             manifest = (
                 read_manifest(args.sample_manifest) if args.sample_manifest else None
             )
             profiles = stage_1_sample_env_profiles(args, manifest)
-            stage_2_sample_characters(profiles, args, manifest)
+            records = stage_2_sample_characters(profiles, args, manifest)
+        requested = set(getattr(args, "episode_ids", None) or [])
+        unknown = requested - {row["episode_id"] for row in records}
+        if unknown:
+            raise ValueError(f"Unknown simulation episode IDs: {sorted(unknown)}")
     return db_path
 
 
@@ -1387,7 +1451,7 @@ async def run_matrix(args, run_dir: Path, db_path: Path, records: list) -> int:
                         f"{pair['pair_id']}: worker stopped unexpectedly; see {child_dir / 'worker.log'}"
                     )
                 if sim["pending"]:
-                    if not args.episode_limit:
+                    if not args.episode_limit and not args.episode_ids:
                         raise RuntimeError(
                             f"{pair['pair_id']}: unexpected unfinished simulations"
                         )
@@ -1430,7 +1494,7 @@ async def run_matrix(args, run_dir: Path, db_path: Path, records: list) -> int:
                 pair.pop("pid", None)
                 checkpoint()
                 matrix_report(run_dir, state)
-            if args.episode_limit:
+            if args.episode_limit or args.episode_ids:
                 # Partial pairs are resumed only on the next invocation.
                 processed.add(pair["pair_id"])
 

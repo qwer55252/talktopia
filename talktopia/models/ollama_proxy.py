@@ -92,8 +92,10 @@ def deepseek_answer_prompt(messages: list[dict[str, Any]]) -> str:
             case _:
                 raise ValueError("Unsupported role in DeepSeek answer-only request")
     return (
-        "<｜begin▁of▁sentence｜>" + "\n\n".join(system)
-        + "".join(conversation) + "<think>\n</think>\n"
+        "<｜begin▁of▁sentence｜>"
+        + "\n\n".join(system)
+        + "".join(conversation)
+        + "<think>\n</think>\n"
     )
 
 
@@ -112,7 +114,8 @@ def forward_deepseek_answer(
         "stream": False,
         "options": {
             key: payload[key]
-            for key in ("temperature", "top_p", "seed") if key in payload
+            for key in ("temperature", "top_p", "seed")
+            if key in payload
         },
     }
     if payload.get("max_tokens") is not None:
@@ -125,20 +128,37 @@ def forward_deepseek_answer(
     status, response = forward_json(f"{endpoint}/api/generate", request, timeout)
     if status != 200:
         return status, response
+    return _answer_only_completion(payload, response, "DeepSeek")
+
+
+def _answer_only_completion(
+    payload: dict[str, Any], response: dict[str, Any], model_label: str
+) -> tuple[int, dict[str, Any]]:
+    """Adapt one native answer without hiding unexpected reasoning tokens."""
     content = response.get("response", "")
     if response.get("thinking") or "<think>" in content or "</think>" in content:
-        return 502, {"error": "DeepSeek emitted reasoning despite the empty-think prefix"}
+        return 502, {
+            "error": f"{model_label} emitted reasoning despite the empty-think prefix"
+        }
     return 200, {
         "id": f"chatcmpl-{time.time_ns()}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": payload["model"],
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
-                     "finish_reason": "length" if response.get("done_reason") == "length" else "stop"}],
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "length"
+                if response.get("done_reason") == "length"
+                else "stop",
+            }
+        ],
         "usage": {
             "prompt_tokens": response.get("prompt_eval_count", 0),
             "completion_tokens": response.get("eval_count", 0),
-            "total_tokens": response.get("prompt_eval_count", 0) + response.get("eval_count", 0),
+            "total_tokens": response.get("prompt_eval_count", 0)
+            + response.get("eval_count", 0),
         },
         "talktopia_model_proxy": {
             "reasoning_mode": "empty_think_prefill",
@@ -146,6 +166,120 @@ def forward_deepseek_answer(
             "generation_seconds": response.get("eval_duration", 0) / 1e9,
         },
     }
+
+
+def use_qwen_schema_raw(payload: dict[str, Any]) -> bool:
+    """Work around Qwen's answer-only chat path ignoring the JSON grammar."""
+    if payload.get("model") != "qwen3.5:9b" or payload.get("stream"):
+        return False
+    # Ollama 0.31.1 gives the nested reasoning object precedence, even when
+    # effort is empty. Do not accidentally override explicit reasoning requests.
+    reasoning = payload.get("reasoning")
+    if reasoning is not None:
+        if not isinstance(reasoning, dict):
+            return False
+        effort = reasoning.get("effort", "")
+    else:
+        effort = payload.get("reasoning_effort")
+    if effort != "none":
+        return False
+    response_format = payload.get("response_format")
+    if not isinstance(response_format, dict) or str(
+        response_format.get("type", "")
+    ).strip().lower() not in {"json_schema", "json_object"}:
+        return False
+    # These requests need chat rendering or response fields the raw adapter
+    # cannot preserve. Leave their existing upstream route unchanged.
+    if any(
+        payload.get(key)
+        for key in (
+            "tools",
+            "tool_choice",
+            "functions",
+            "function_call",
+            "logprobs",
+            "top_logprobs",
+            "_debug_render_only",
+            "modalities",
+            "audio",
+        )
+    ):
+        return False
+    messages = payload.get("messages")
+    return (
+        isinstance(messages, list)
+        and bool(messages)
+        and all(
+            isinstance(message, dict)
+            and set(message).issubset({"role", "content"})
+            and message.get("role") in {"system", "user", "assistant"}
+            and isinstance(message.get("content"), str)
+            for message in messages
+        )
+        and messages[-1]["role"] == "user"
+    )
+
+
+def qwen_answer_prompt(messages: list[dict[str, Any]]) -> str:
+    """Match the Qwen3.5 chat renderer's text-only, no-thinking prefix."""
+    return (
+        "".join(
+            f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n"
+            for message in messages
+        )
+        + "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
+
+
+def forward_qwen_schema_answer(
+    endpoint: str, payload: dict[str, Any], timeout: int
+) -> tuple[int, dict[str, Any]]:
+    if not use_qwen_schema_raw(payload):
+        raise ValueError(
+            "Qwen raw generation requires a text-only structured answer request"
+        )
+    response_format = payload["response_format"]
+    if response_format["type"].strip().lower() == "json_object":
+        native_format = "json"
+    else:
+        wrapper = response_format.get("json_schema")
+        if not isinstance(wrapper, dict) or not isinstance(wrapper.get("schema"), dict):
+            raise ValueError("Qwen structured response requires a JSON schema object")
+        native_format = wrapper["schema"]
+    # Mirror FromChatRequest, not the model's native sampling defaults:
+    # https://github.com/ollama/ollama/blob/v0.31.1/openai/openai.go#L538-L588
+    options = {
+        key: payload[key] if payload.get(key) is not None else 1.0
+        for key in ("temperature", "top_p")
+    }
+    for key in ("seed", "frequency_penalty", "presence_penalty"):
+        if payload.get(key) is not None:
+            options[key] = payload[key]
+    if payload.get("max_tokens") is not None:
+        options["num_predict"] = payload["max_tokens"]
+    stop = payload.get("stop")
+    if isinstance(stop, str):
+        options["stop"] = [stop]
+    elif isinstance(stop, list):
+        options["stop"] = [item for item in stop if isinstance(item, str)]
+    request = {
+        "model": payload["model"],
+        "prompt": qwen_answer_prompt(payload["messages"]),
+        "raw": True,
+        "think": False,
+        "stream": False,
+        "format": native_format,
+        "options": options,
+    }
+    status, response = forward_json(f"{endpoint}/api/generate", request, timeout)
+    if status != 200:
+        return status, response
+    status, completion = _answer_only_completion(payload, response, "Qwen")
+    if status == 200:
+        # Match Ollama's chat adapter for every native finish reason, while
+        # leaving the pre-existing DeepSeek conversion unchanged.
+        completion["choices"][0]["finish_reason"] = response.get("done_reason") or None
+    return status, completion
 
 
 class OllamaProxyHandler(BaseHTTPRequestHandler):
@@ -205,8 +339,17 @@ class OllamaProxyHandler(BaseHTTPRequestHandler):
         apply_model_defaults(payload, ollama_model)
 
         try:
-            if ollama_model == "deepseek-r1:8b" and payload.get("reasoning_effort") == "none":
-                status, response = forward_deepseek_answer(endpoint["url"], payload, timeout=600)
+            if (
+                ollama_model == "deepseek-r1:8b"
+                and payload.get("reasoning_effort") == "none"
+            ):
+                status, response = forward_deepseek_answer(
+                    endpoint["url"], payload, timeout=600
+                )
+            elif use_qwen_schema_raw(payload):
+                status, response = forward_qwen_schema_answer(
+                    endpoint["url"], payload, timeout=600
+                )
             else:
                 status, response = forward_json(
                     f"{endpoint['url']}/v1/chat/completions", payload, timeout=600
@@ -225,10 +368,17 @@ class OllamaProxyHandler(BaseHTTPRequestHandler):
                     }
                 )
                 if response["talktopia_model_proxy"].get("reasoning_mode"):
-                    self.log_message("answer_only %s", json.dumps({
-                        **response["talktopia_model_proxy"],
-                        "completion_tokens": response.get("usage", {}).get("completion_tokens"),
-                    }))
+                    self.log_message(
+                        "answer_only %s",
+                        json.dumps(
+                            {
+                                **response["talktopia_model_proxy"],
+                                "completion_tokens": response.get("usage", {}).get(
+                                    "completion_tokens"
+                                ),
+                            }
+                        ),
+                    )
         json_response(self, status, response)
 
 

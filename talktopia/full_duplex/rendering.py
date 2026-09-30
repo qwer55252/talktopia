@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
+from sotopia.database import AgentProfile, EpisodeLog
+
 from .actions import DuplexAction, DuplexObservation
 from .events import ActionCommitted
 from .transcript import TranscriptEntry
@@ -14,10 +16,10 @@ _AUDIBLE_ACTION_TYPES = frozenset(
 )
 
 
-def _timestamp(timestamp_ms: int | None) -> str:
+def _timestamp(timestamp_ms: float | None) -> str:
     if timestamp_ms is None:
         return "--:--.---"
-    minutes, remainder = divmod(timestamp_ms, 60_000)
+    minutes, remainder = divmod(round(timestamp_ms), 60_000)
     seconds, milliseconds = divmod(remainder, 1_000)
     return f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
 
@@ -64,7 +66,20 @@ def render_agent_history(
             text = entry.received_text
         else:
             continue
-        if not text and entry.action_type in _AUDIBLE_ACTION_TYPES:
+        if entry.action_type == "backchanneling":
+            text = entry.received_text
+        nonverbal_backchannel = (
+            entry.action_type == "backchanneling"
+            and not entry.received_text.strip()
+            and bool(entry.sentences)
+        )
+        if nonverbal_backchannel:
+            text = ""
+        if (
+            not text
+            and entry.action_type in _AUDIBLE_ACTION_TYPES
+            and not nonverbal_backchannel
+        ):
             continue
         rendered = (
             DuplexAction(
@@ -99,7 +114,7 @@ def render_sotopia_messages(
     for commit in sorted(committed_events, key=lambda event: event.sequence):
         turn: list[tuple[str, str, str]] = []
         for actor, action in commit.actions.items():
-            if action.action_type == "none":
+            if action.action_type == "none" and commit.metadata.get("actor") != actor:
                 continue
             rendered_action = action
             if action.action_type in _AUDIBLE_ACTION_TYPES:
@@ -109,9 +124,9 @@ def render_sotopia_messages(
                         f"audible commit {commit.commit_id} has no transcript entry "
                         f"for {actor}"
                     )
-                if not entry.received_text.strip():
+                if not entry.sentences:
                     raise ValueError(
-                        f"audible commit {commit.commit_id} has empty ASR final text"
+                        f"audible commit {commit.commit_id} has no delivered sentence evidence"
                     )
                 rendered_action = action.model_copy(
                     update={"argument": entry.received_text}
@@ -122,8 +137,30 @@ def render_sotopia_messages(
     return messages
 
 
+def render_episode_for_humans(
+    source: EpisodeLog,
+) -> tuple[list[AgentProfile], list[str]]:
+    """Keep SOTOPIA's presentation without dropping real Surface5 pass actions."""
+    profiles, rendered = source.render_for_humans()
+    turns = [rendered[0]]
+    for turn in source.messages[1:]:
+        lines: list[str] = []
+        for sender, receiver, message in turn:
+            if receiver != "Environment":
+                continue
+            if sender == "Environment":
+                lines.append(message)
+            elif "said:" in message:
+                lines.append(f"{sender} {message}")
+            else:
+                lines.append(f"{sender}: {message}")
+        turns.append("\n".join(lines))
+    return profiles, turns + rendered[-2:]
+
+
 __all__ = [
     "render_agent_history",
+    "render_episode_for_humans",
     "render_markdown",
     "render_sotopia_messages",
 ]

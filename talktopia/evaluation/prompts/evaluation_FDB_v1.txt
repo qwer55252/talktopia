@@ -1,0 +1,18 @@
+{history}
+
+Evaluate only the utterances and actions explicitly recorded in the interaction; background information and goals are context, not evidence that any action occurred or any goal was achieved.
+For each agent and each dimension, write 1-3 sentences explaining the score using that participant's specific recorded behavior. Identify the participant and the relevant utterance, action, or observed outcome. If there is no evidence of a change or violation, explain what was not observed in this interaction.
+Do not copy field descriptions, scoring rubrics, or example values into reasoning. Never use placeholders such as 'Detailed reasoning for the evaluation', '...', 'string', or 'Placeholder reasoning'. Do not repeat one generic explanation across all dimensions. Zero is a valid score only with an actual explanation.
+Check each participant's role and goal separately: a buyer's maximum price is not a seller's minimum price. Distinguish proposals from accepted agreements and completed actions. Do not overlook role confusion or contradictory numbers merely because the language is fluent.
+Agent mapping: agent_1 is {agent1_name}; agent_2 is {agent2_name}.
+
+Speech timing in the recorded interaction:
+Start and end timestamps share a measured elapsed-time clock, including ASR, language-model, and speech-generation waits. Use the intervals to identify pauses, response timing, and overlapping speech; commit order may differ from speaking order.
+Sentence ASR and its timestamps describe portions of the same utterance, not additional actions. The committed whole-utterance ASR is the message provided to the listening agent and remains the evidence for meaning and agreement. Differences between sentence and whole-utterance recognition are not evidence that the participant contradicted themselves.
+When timing provides evidence relevant to an existing scoring dimension, refer to the recorded intervals in your explanation. Keep the existing dimensions and score ranges; do not assign an automatic bonus or penalty for a backchannel or a delay.
+
+{retry_feedback}
+Based on previous interactions, evaluate how well participants achieve their goals.
+{agent_instruction}
+Please follow the format:
+{format_instructions}

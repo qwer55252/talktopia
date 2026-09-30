@@ -24,6 +24,13 @@ from typing import Any, Sequence
 from talktopia.models.config import (
     ASR_REPO,
     ASR_REVISION,
+    ASR_WITHOUT_TIMESTAMPS,
+    BACKCHANNEL_TTS_TAGS,
+    BACKCHANNEL_TAG_DURATION_S,
+    BACKCHANNEL_TARGET_RMS,
+    BACKCHANNEL_MAX_GAIN,
+    BACKCHANNEL_GAIN_PEAK,
+    BACKCHANNEL_MIN_RMS,
     TTS_REPO,
     TTS_REVISION,
     TTS_BATCH_SIZE,
@@ -423,6 +430,15 @@ class SpeechBackend:
                     ref_audio=str(voice["wav_path"]),
                     ref_text=voice["voice_reference_text"],
                 )
+        durations = [
+            BACKCHANNEL_TAG_DURATION_S if item.text in BACKCHANNEL_TTS_TAGS else None
+            for item in requests
+        ]
+        duration_kwargs = {}
+        if any(duration is not None for duration in durations):
+            duration_kwargs["duration"] = (
+                durations[0] if requests[0].seed is not None else durations
+            )
         if requests[0].seed is not None:
             if len(requests) != 1:
                 raise ValueError("Seeded TTS requests must be synthesized individually")
@@ -433,20 +449,53 @@ class SpeechBackend:
                 text=item.text,
                 language="English",
                 voice_clone_prompt=self.prompts[item.voice_id],
+                **duration_kwargs,
             )
         else:
             audios = self.tts.generate(
                 text=[item.text for item in requests],
                 language="English",
                 voice_clone_prompt=[self.prompts[item.voice_id] for item in requests],
+                **duration_kwargs,
             )
         results = []
-        for audio in audios:
+        for item, audio in zip(requests, audios, strict=True):
             samples = self.np.asarray(audio, dtype=self.np.float32).reshape(-1)
             if not len(samples):
                 raise EmptyAudioError("OmniVoice returned empty audio")
             if not self.np.isfinite(samples).all():
                 raise RuntimeError("OmniVoice returned non-finite audio")
+            if item.text in BACKCHANNEL_TTS_TAGS:
+                rms = float(
+                    self.np.sqrt(self.np.mean(samples.astype(self.np.float64) ** 2))
+                )
+                if rms < BACKCHANNEL_MIN_RMS:
+                    # Do not turn near-silent model output into amplified noise.
+                    raise EmptyAudioError(
+                        f"OmniVoice backchannel is near-silent (RMS={rms:.6f})"
+                    )
+                peak = float(self.np.max(self.np.abs(samples)))
+                # Boost the whole clip uniformly; the peak ceiling limits only
+                # added gain. Already-loud backchannels retain their waveform.
+                gain = max(
+                    1.0,
+                    min(
+                        BACKCHANNEL_TARGET_RMS / rms,
+                        BACKCHANNEL_MAX_GAIN,
+                        BACKCHANNEL_GAIN_PEAK / peak,
+                    ),
+                )
+                samples = samples * gain
+                logging.info(
+                    "Backchannel volume: voice=%s seed=%s rms_before=%.6f "
+                    "rms_after=%.6f gain=%.6f peak_after=%.6f",
+                    item.voice_id,
+                    item.seed,
+                    rms,
+                    rms * gain,
+                    gain,
+                    peak * gain,
+                )
             pcm = (self.np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
             result = io.BytesIO()
             with wave.open(result, "wb") as wav:
@@ -481,9 +530,9 @@ class SpeechBackend:
             )
             if not timestamps:
                 return ""
-            samples = self.np.concatenate(
-                [samples[item["start"] : item["end"]] for item in timestamps]
-            )
+            # VAD gates silence only. Trimming even the leading padding can
+            # cause Whisper to stop after the first sentence of a short clip.
+            # Keep the entire resampled waveform, including pauses, for ASR.
             segments, _ = self.asr.transcribe(
                 samples,
                 language="en",
@@ -491,6 +540,9 @@ class SpeechBackend:
                 best_of=1,
                 condition_on_previous_text=False,
                 vad_filter=False,
+                # This API returns text. Dialogue timing comes from delivered
+                # PCM, not Whisper's generated timestamp tokens.
+                without_timestamps=ASR_WITHOUT_TIMESTAMPS,
             )
             return " ".join(segment.text.strip() for segment in segments).strip()
 

@@ -25,6 +25,9 @@ class ASRUpdate(BaseModel):
     is_final: bool
     is_stable: bool
     revision_id: int = Field(ge=0)
+    sentence_texts: dict[int, str] = Field(default_factory=dict)
+    sentence_index: int | None = Field(default=None, ge=0)
+    has_next_sentence: bool | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -49,6 +52,10 @@ class OnlineASR(Protocol):
     async def start_utterance(self, utterance_id: str, listener: str) -> None: ...
 
     async def push_audio(self, frame: AudioFrame) -> None: ...
+
+    def finish_sentence(
+        self, utterance_id: str, chunk_index: int, *, has_next_sentence: bool
+    ) -> None: ...
 
     def updates(self) -> AsyncIterator[ASRUpdate]: ...
 
@@ -79,10 +86,13 @@ class _ASRSession:
     stable_words: tuple[str, ...] = ()
     last_decode_size: int = 0
     decode_task: asyncio.Task[None] | None = None
+    chunk_pcm: dict[int, bytearray] = field(default_factory=dict)
+    chunk_tasks: dict[int, asyncio.Task[str]] = field(default_factory=dict)
+    receiving_complete: bool = False
 
 
 class WindowedASR:
-    """Expose only common-prefix stable partials from delivered PCM."""
+    """Recognize delivered PCM, with ordered updates at sentence boundaries."""
 
     def __init__(
         self,
@@ -122,13 +132,20 @@ class WindowedASR:
         session = self._sessions.get(frame.utterance_id)
         if session is None:
             raise ValueError(f"ASR utterance is not active: {frame.utterance_id}")
-        session.pcm.extend(frame.pcm_s16le)
-        enough_new_audio = (
-            len(session.pcm) - session.last_decode_size >= self._bytes_per_interval
-        )
+        # A failed decoder rejects the next frame before any PCM is accepted.
         if session.decode_task is not None and session.decode_task.done():
             session.decode_task.result()
             session.decode_task = None
+        for task in session.chunk_tasks.values():
+            if task.done():
+                task.result()
+        session.pcm.extend(frame.pcm_s16le)
+        session.chunk_pcm.setdefault(frame.chunk_index, bytearray()).extend(
+            frame.pcm_s16le
+        )
+        enough_new_audio = (
+            len(session.pcm) - session.last_decode_size >= self._bytes_per_interval
+        )
         if enough_new_audio and (
             session.decode_task is None or session.decode_task.done()
         ):
@@ -138,6 +155,61 @@ class WindowedASR:
                 self._decode_partial(frame.utterance_id, session, snapshot),
                 name=f"surface5-asr-partial-{frame.utterance_id}",
             )
+
+    def finish_sentence(
+        self, utterance_id: str, chunk_index: int, *, has_next_sentence: bool
+    ) -> None:
+        """Start ASR after the sentence's last frame has finished delivery."""
+        self._require_open()
+        session = self._sessions[utterance_id]
+        if chunk_index in session.chunk_tasks:
+            raise ValueError("Sentence audio was already finalized")
+        if not has_next_sentence:
+            session.receiving_complete = True
+        session.chunk_tasks[chunk_index] = asyncio.create_task(
+            self._decode_sentence(
+                utterance_id, session, chunk_index, has_next_sentence
+            ),
+            name=f"surface5-asr-sentence-{utterance_id}-{chunk_index}",
+        )
+
+    async def _decode_sentence(
+        self,
+        utterance_id: str,
+        session: _ASRSession,
+        chunk_index: int,
+        has_next_sentence: bool,
+    ) -> str:
+        text = await self.worker.decode(
+            bytes(session.chunk_pcm[chunk_index]), self.sample_rate_hz
+        )
+        if has_next_sentence:
+            # Finish earlier sentence results first, even if ASR completes out of order.
+            sentence_texts = {
+                index: await session.chunk_tasks[index]
+                for index in sorted(session.chunk_tasks)
+                if index < chunk_index
+            }
+            sentence_texts[chunk_index] = text
+            if (
+                self._sessions.get(utterance_id) is session
+                and not session.receiving_complete
+            ):
+                session.revision_id += 1
+                self._updates.put_nowait(
+                    ASRUpdate(
+                        utterance_id=utterance_id,
+                        listener=session.listener,
+                        text=" ".join(sentence_texts.values()).strip(),
+                        is_final=False,
+                        is_stable=True,
+                        revision_id=session.revision_id,
+                        sentence_texts=sentence_texts,
+                        sentence_index=chunk_index,
+                        has_next_sentence=True,
+                    )
+                )
+        return text
 
     async def updates(self) -> AsyncIterator[ASRUpdate]:
         while True:
@@ -161,6 +233,11 @@ class WindowedASR:
             for session in self._sessions.values()
             if session.decode_task is not None and not session.decode_task.done()
         ]
+        tasks.extend(
+            task
+            for session in self._sessions.values()
+            for task in session.chunk_tasks.values()
+        )
         for task in tasks:
             task.cancel()
         if tasks:
@@ -206,10 +283,21 @@ class WindowedASR:
         session = self._sessions.get(utterance_id)
         if session is None:
             raise ValueError(f"ASR utterance is not active: {utterance_id}")
+        session.receiving_complete = True
         if session.decode_task is not None:
             await session.decode_task
+        for index, chunk_pcm in session.chunk_pcm.items():
+            if index not in session.chunk_tasks:
+                session.chunk_tasks[index] = asyncio.create_task(
+                    self.worker.decode(bytes(chunk_pcm), self.sample_rate_hz)
+                )
+        sentence_texts = {
+            index: await task for index, task in session.chunk_tasks.items()
+        }
         pcm = bytes(session.pcm)
-        if not pcm:
+        if len(sentence_texts) == 1:
+            text = next(iter(sentence_texts.values()))
+        elif not pcm:
             text = ""
         else:
             text = await self.worker.decode(pcm, self.sample_rate_hz)
@@ -221,6 +309,8 @@ class WindowedASR:
             is_final=True,
             is_stable=True,
             revision_id=session.revision_id,
+            sentence_texts=sentence_texts,
+            has_next_sentence=False,
         )
         self._sessions.pop(utterance_id, None)
         self.buffers.pop(utterance_id, None)

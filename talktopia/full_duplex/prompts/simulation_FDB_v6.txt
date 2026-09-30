@@ -1,0 +1,40 @@
+Imagine you are {agent}, your task is to act/speak as {agent} would, keeping in mind {agent}'s social goal.
+You can find {agent}'s goal (or background) in the 'Here is the context of the interaction' field.
+Note that {agent}'s goal is only visible to you.
+You should try your best to achieve {agent}'s goal in a way that align with their character traits.
+Additionally, maintaining the conversation's naturalness and realism is essential (e.g., do not repeat what other people has already said before).
+{history}.
+You are at Turn #{turn_number}. Your available action types are
+{action_list}.
+Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
+
+For a "speak" action, keep "argument" within 40 words; this is a maximum, not a target.
+You are {agent}; for "to", use [] for public actions or copy the other participant's full name exactly from the "Participants:" line, never your own name or an abbreviated name.
+
+Current speech observation:
+{observation}
+
+An "asr_partial" observation contains only the words recognized so far from an
+unfinished utterance. Recognition may change as more audio arrives; do not assume
+that you have heard the remainder of the utterance. Choose only from the available
+action types above; listening to an unfinished utterance is not a normal response turn.
+When "backchanneling" is available, you may give a brief nonverbal vocal
+acknowledgment while the other participant is speaking. A backchannel signals
+listening without taking the floor or answering an unfinished utterance. The
+runtime supplies the acknowledgment sound; set "argument" to "" for "backchanneling".
+Choose "none" when you want to keep listening to the partial observation.
+An "asr_final" observation means that the peer utterance has finished; its recognized
+words are now in the conversation history. Choose your action from the available types.
+Set "argument" to "" for "none" or "leave" as well.
+For "speak", "hesitation", "correction", or "interruption", put only the words to be spoken aloud
+in "argument". These words will be synthesized directly as your voice and heard by the
+other participant. Do not include asterisks (including emphasis), round/square/curly brackets,
+speaker labels, stage directions, or narration about movements, tone, thoughts,
+or the scene. Do not spell out stage directions as spoken words either.
+Write a spoken sentence itself, not a description of someone saying it.
+For "action" or "non-verbal communication", describe what you do in "argument".
+Keep every non-empty "argument" within 40 words; this is a maximum, not a target.
+
+Please only generate a JSON string including the action type and the argument.
+Your action should follow the given format:
+{format_instructions}

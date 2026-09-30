@@ -7,7 +7,7 @@ import io
 import wave
 from pathlib import Path
 
-from openai import APIError, AsyncOpenAI
+from openai import APIConnectionError, APIError, AsyncOpenAI
 
 from talktopia.speech_agent import read_pcm_wav
 from talktopia.utils import safe_error
@@ -18,6 +18,26 @@ class SpeechClientError(RuntimeError):
         self.code = code
         self.error_type = error_type
         super().__init__(message)
+
+
+async def _request_with_retry(request, **kwargs):
+    """Retry transport failures once; empty TTS has its own seed retry."""
+    for attempt in range(2):
+        try:
+            return await request(**kwargs)
+        except APIError as error:
+            body = error.body if isinstance(error.body, dict) else {}
+            detail = body.get("detail", body)
+            empty_audio = (
+                isinstance(detail, dict) and detail.get("code") == "empty_audio"
+            )
+            status = getattr(error, "status_code", None)
+            transient = isinstance(error, APIConnectionError) or (
+                status is not None and (status in {408, 409, 429} or status >= 500)
+            )
+            if attempt == 1 or empty_audio or not transient:
+                raise
+            await asyncio.sleep(0.25)
 
 
 def pcm_wav(pcm: bytes, sample_rate_hz: int) -> bytes:
@@ -58,7 +78,8 @@ class SpeechClient:
 
     async def decode(self, pcm: bytes, sample_rate_hz: int) -> str:
         try:
-            response = await self.asr_client.audio.transcriptions.create(
+            response = await _request_with_retry(
+                self.asr_client.audio.transcriptions.create,
                 model=self.asr_model,
                 file=("received.wav", pcm_wav(pcm, sample_rate_hz), "audio/wav"),
                 language=self.asr_language,
@@ -76,7 +97,8 @@ class SpeechClient:
             raise ValueError("TTS reference differs from the agent's profile voice")
         try:
             async with self.tts_semaphore:
-                response = await self.tts_client.audio.speech.create(
+                response = await _request_with_retry(
+                    self.tts_client.audio.speech.create,
                     model=self.tts_model,
                     input=text,
                     voice=self.voice_id,

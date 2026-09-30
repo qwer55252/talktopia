@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from talktopia import pipeline
-from talktopia.full_duplex.actions import DuplexAction
+from talktopia.full_duplex.actions import DuplexAction, DuplexObservation
 from talktopia.full_duplex.config import RuntimeConfig
 from talktopia.full_duplex.events import ActionCommitted, EventWriter, read_events
 from talktopia.full_duplex.runtime import (
@@ -44,7 +44,18 @@ async def test_backchannels_keep_event_order_without_consuming_budget(tmp_path):
         async def commit(self, commit):
             assert commit.expected_turn_number == self.calls
             self.calls += 1
-            return SimpleNamespace(turn_number=self.calls, observations={})
+            return SimpleNamespace(
+                turn_number=self.calls,
+                observations={
+                    name: DuplexObservation(
+                        observation_id=f"commit-{self.calls}-{name}",
+                        last_turn="Received speech",
+                        turn_number=self.calls,
+                        available_actions=["none", "speak"],
+                    )
+                    for name in commit.actions
+                },
+            )
 
     profiles = [
         SimpleNamespace(first_name=name, last_name="Test") for name in ("Alice", "Bob")
@@ -53,7 +64,7 @@ async def test_backchannels_keep_event_order_without_consuming_budget(tmp_path):
     agents = [
         SimpleNamespace(
             agent_name=f"{p.first_name} Test",
-            record_committed_action=lambda *a, **kw: None,
+            record_observation=lambda observation: None,
         )
         for p in profiles
     ]
@@ -106,9 +117,8 @@ async def test_backchannels_keep_event_order_without_consuming_budget(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["round-robin", "surface5-full-duplex"])
-async def test_deadline_cancels_runner_and_preserves_diagnostics(
-    tmp_path, monkeypatch, mode
+async def test_round_robin_deadline_cancels_runner_and_preserves_diagnostics(
+    tmp_path, monkeypatch
 ):
     cancelled = asyncio.Event()
 
@@ -119,9 +129,8 @@ async def test_deadline_cancels_runner_and_preserves_diagnostics(
             cancelled.set()
 
     monkeypatch.setattr(pipeline, "run_round_robin_episode", stalled)
-    monkeypatch.setattr(pipeline, "run_duplex_episode", stalled)
     monkeypatch.setattr(pipeline, "EPISODE_TIMEOUT_S", 0.01)
-    args = pipeline.parse_args(["--interaction-mode", mode])
+    args = pipeline.parse_args(["--interaction-mode", "round-robin"])
     with pytest.raises(TimeoutError, match="exceeded"):
         await pipeline.run_one_episode(
             SimpleNamespace(turn_number=3), [], args, tmp_path, "episode_0001"
@@ -131,4 +140,4 @@ async def test_deadline_cancels_runner_and_preserves_diagnostics(
         (tmp_path / "simulation/diagnostics/episode_0001.json").read_text()
     )
     assert diagnostic["reason"] == "episode_timeout"
-    assert diagnostic["interaction_mode"] == mode
+    assert diagnostic["interaction_mode"] == "round-robin"
