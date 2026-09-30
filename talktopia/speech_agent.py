@@ -25,12 +25,12 @@ from talktopia.models.config import (
     ASR_REPO,
     ASR_REVISION,
     ASR_WITHOUT_TIMESTAMPS,
-    CONFIRMATION_TTS_TAG,
-    CONFIRMATION_TTS_DURATION_S,
-    CONFIRMATION_TARGET_RMS,
-    CONFIRMATION_MAX_GAIN,
-    CONFIRMATION_GAIN_PEAK,
-    CONFIRMATION_MIN_RMS,
+    BACKCHANNEL_TTS_TAGS,
+    BACKCHANNEL_TAG_DURATION_S,
+    BACKCHANNEL_TARGET_RMS,
+    BACKCHANNEL_MAX_GAIN,
+    BACKCHANNEL_GAIN_PEAK,
+    BACKCHANNEL_MIN_RMS,
     TTS_REPO,
     TTS_REVISION,
     TTS_BATCH_SIZE,
@@ -431,7 +431,7 @@ class SpeechBackend:
                     ref_text=voice["voice_reference_text"],
                 )
         durations = [
-            CONFIRMATION_TTS_DURATION_S if item.text == CONFIRMATION_TTS_TAG else None
+            BACKCHANNEL_TAG_DURATION_S if item.text in BACKCHANNEL_TTS_TAGS else None
             for item in requests
         ]
         duration_kwargs = {}
@@ -465,29 +465,29 @@ class SpeechBackend:
                 raise EmptyAudioError("OmniVoice returned empty audio")
             if not self.np.isfinite(samples).all():
                 raise RuntimeError("OmniVoice returned non-finite audio")
-            if item.text == CONFIRMATION_TTS_TAG:
+            if item.text in BACKCHANNEL_TTS_TAGS:
                 rms = float(
                     self.np.sqrt(self.np.mean(samples.astype(self.np.float64) ** 2))
                 )
-                if rms < CONFIRMATION_MIN_RMS:
+                if rms < BACKCHANNEL_MIN_RMS:
                     # Do not turn near-silent model output into amplified noise.
                     raise EmptyAudioError(
-                        f"OmniVoice confirmation is near-silent (RMS={rms:.6f})"
+                        f"OmniVoice backchannel is near-silent (RMS={rms:.6f})"
                     )
                 peak = float(self.np.max(self.np.abs(samples)))
                 # Boost the whole clip uniformly; the peak ceiling limits only
-                # added gain. Already-loud confirmations retain their waveform.
+                # added gain. Already-loud backchannels retain their waveform.
                 gain = max(
                     1.0,
                     min(
-                        CONFIRMATION_TARGET_RMS / rms,
-                        CONFIRMATION_MAX_GAIN,
-                        CONFIRMATION_GAIN_PEAK / peak,
+                        BACKCHANNEL_TARGET_RMS / rms,
+                        BACKCHANNEL_MAX_GAIN,
+                        BACKCHANNEL_GAIN_PEAK / peak,
                     ),
                 )
                 samples = samples * gain
                 logging.info(
-                    "Confirmation volume: voice=%s seed=%s rms_before=%.6f "
+                    "Backchannel volume: voice=%s seed=%s rms_before=%.6f "
                     "rms_after=%.6f gain=%.6f peak_after=%.6f",
                     item.voice_id,
                     item.seed,

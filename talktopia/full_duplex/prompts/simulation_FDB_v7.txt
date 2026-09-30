@@ -18,10 +18,10 @@ An "asr_partial" observation contains only the words recognized so far from an
 unfinished utterance. Recognition may change as more audio arrives; do not assume
 that you have heard the remainder of the utterance. Choose only from the available
 action types above; listening to an unfinished utterance is not a normal response turn.
-When "backchanneling" is available, you may give a brief nonverbal vocal
-acknowledgment while the other participant is speaking. A backchannel signals
+When "backchanneling" is available, you may give a brief listener response
+while the other participant is speaking. A backchannel signals
 listening without taking the floor or answering an unfinished utterance. The
-runtime supplies the acknowledgment sound; set "argument" to "" for "backchanneling".
+runtime randomly selects the sound from a fixed list; set "argument" to "" for "backchanneling".
 Choose "none" when you want to keep listening to the partial observation.
 An "asr_final" observation means that the peer utterance has finished; its recognized
 words are now in the conversation history. Choose your action from the available types.
@@ -29,7 +29,7 @@ Set "argument" to "" for "none" or "leave" as well.
 The speech channel uses English-only ASR. Write spoken arguments in English.
 Write monetary amounts in spoken words rather than compact dollar abbreviations
 such as "$1k"; preserve the amount you intend to communicate.
-For "speak", "hesitation", "correction", or "interruption", put only the words to be spoken aloud
+For "speak", put only the words to be spoken aloud
 in "argument". These words will be synthesized directly as your voice and heard by the
 other participant. Do not include asterisks (including emphasis), round/square/curly brackets,
 speaker labels, stage directions, or narration about movements, tone, thoughts,

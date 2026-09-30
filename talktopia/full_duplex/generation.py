@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 import time
 import unicodedata
@@ -25,7 +26,7 @@ from sotopia.generation_utils import PydanticOutputParser
 from sotopia.generation_utils import generate as sotopia_generation
 from sotopia.messages import AgentAction
 
-from talktopia.models.config import CONFIRMATION_TTS_TAG as BACKCHANNEL_TTS_TEXT
+from talktopia.models.config import BACKCHANNEL_TTS_INPUTS
 from talktopia.speech_agent import prepare_tts_text, resolve_recipient_names
 
 from .actions import (
@@ -404,10 +405,11 @@ class Surface5ActionOutputParser(PydanticOutputParser[_JointAction]):
 class DuplexGenerationEngine:
     """Generate action and argument together, with SOTOPIA's one repair attempt."""
 
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, model_name: str, *, seed: int = 0) -> None:
         if not model_name.strip():
             raise ValueError("model_name must not be blank")
         self.model_name = model_name
+        self.seed = seed
         self._decision_sequence = 0
         self._hidden_sequence = 0
         self._decision_audits: dict[str, tuple[int, tuple[str, ...]]] = {}
@@ -544,10 +546,17 @@ class DuplexGenerationEngine:
     ) -> HiddenSaid:
         if decision.action_type != "backchanneling":
             raise ValueError("backchannel text requires a backchanneling decision")
+        # Pick independently of dialogue meaning and other agents' scheduling.
+        # The same run/episode/agent/decision reproduces the same uniform draw.
+        identity = (
+            f"surface5-backchannel-v1\0{self.seed}\0{session.episode_id}\0"
+            f"{session.agent_name}\0{decision.decision_id}"
+        )
+        text = random.Random(identity).choice(BACKCHANNEL_TTS_INPUTS)
         hidden = self._hidden_said(
             session=session,
             decision_id=decision.decision_id,
-            text=BACKCHANNEL_TTS_TEXT,
+            text=text,
         )
         self._hidden_attempts[hidden.hidden_said_id] = self.decision_audit(
             decision.decision_id

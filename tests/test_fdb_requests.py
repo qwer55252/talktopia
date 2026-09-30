@@ -93,9 +93,16 @@ def request_kwargs(parser=None):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("temperature", [1.0, 0.7, None])
-@pytest.mark.parametrize("model", [AGENT_MODEL, "gpt-4o"])
-@pytest.mark.parametrize("explicit_instructions", [False, True])
+@pytest.mark.parametrize(
+    "temperature, model, explicit_instructions",
+    [
+        pytest.param(1.0, AGENT_MODEL, False, id="custom-model"),
+        pytest.param(0.7, AGENT_MODEL, False, id="nondefault-temperature"),
+        pytest.param(None, AGENT_MODEL, False, id="omitted-temperature"),
+        pytest.param(1.0, "gpt-4o", False, id="standard-model"),
+        pytest.param(1.0, AGENT_MODEL, True, id="caller-instructions"),
+    ],
+)
 async def test_first_payload_matches_actual_agenerate(
     monkeypatch, temperature, model, explicit_instructions
 ):

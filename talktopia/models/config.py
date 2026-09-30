@@ -18,7 +18,7 @@ PROXY_BASE_URL = f"http://{PROXY_HOST}:{PROXY_PORT}/v1"
 SPEECH_HOST = os.environ.get("TALKTOPIA_SPEECH_HOST", "127.0.0.1")
 SPEECH_PORT = int(os.environ.get("TALKTOPIA_SPEECH_PORT", "18086"))
 SPEECH_BASE_URL = f"http://{SPEECH_HOST}:{SPEECH_PORT}/v1"
-SPEECH_PROTOCOL = "surface5-http-v5"
+SPEECH_PROTOCOL = "surface5-http-v6"
 SPEECH_GPU = os.environ.get("TALKTOPIA_SPEECH_GPU", "1")
 ASR_REPO = "Systran/faster-whisper-small.en"
 ASR_REVISION = "d1d751a5f8271d482d14ca55d9e2deeebbae577f"
@@ -26,12 +26,21 @@ ASR_WITHOUT_TIMESTAMPS = True
 ASR_VAD_MODE = "speech_presence_only"
 TTS_REPO = "k2-fsa/OmniVoice"
 TTS_REVISION = "c5fdb5ccb189668d56333f77ba2629f4cd7535f4"
-CONFIRMATION_TTS_TAG = "[confirmation-en]"
-CONFIRMATION_TTS_DURATION_S = 0.6
-CONFIRMATION_TARGET_RMS = 0.05
-CONFIRMATION_MAX_GAIN = 8.0
-CONFIRMATION_GAIN_PEAK = 0.8
-CONFIRMATION_MIN_RMS = 0.001
+BACKCHANNEL_TTS_INPUTS = (
+    "yeah",
+    "[confirmation-en]",
+    "Uh-huh",
+    "Mm-hmm",
+    "Yep",
+)
+BACKCHANNEL_TTS_TAGS = frozenset(
+    text for text in BACKCHANNEL_TTS_INPUTS if text.startswith("[")
+)
+BACKCHANNEL_TAG_DURATION_S = 0.6
+BACKCHANNEL_TARGET_RMS = 0.05
+BACKCHANNEL_MAX_GAIN = 8.0
+BACKCHANNEL_GAIN_PEAK = 0.8
+BACKCHANNEL_MIN_RMS = 0.001
 
 
 OLLAMA_NUM_PARALLEL = int(os.environ.get("OLLAMA_NUM_PARALLEL", "2"))
@@ -69,16 +78,19 @@ if len({(spec["host"], spec["port"]) for spec in SPEECH_ENDPOINTS.values()}) != 
     raise ValueError("Speech worker ports must be distinct")
 
 
-def confirmation_tts_settings() -> dict[str, object]:
+def backchannel_tts_settings() -> dict[str, object]:
     return {
-        "input": CONFIRMATION_TTS_TAG,
-        "duration_s": CONFIRMATION_TTS_DURATION_S,
+        "inputs": list(BACKCHANNEL_TTS_INPUTS),
+        "selection": "uniform_per_decision_v1",
+        "seed_fields": ["run_seed", "episode_id", "agent_name", "decision_id"],
+        "tag_duration_s": BACKCHANNEL_TAG_DURATION_S,
         "volume": {
             "policy": "whole_clip_rms_boost_v1",
-            "target_rms": CONFIRMATION_TARGET_RMS,
-            "max_gain": CONFIRMATION_MAX_GAIN,
-            "gain_peak_ceiling": CONFIRMATION_GAIN_PEAK,
-            "minimum_rms": CONFIRMATION_MIN_RMS,
+            "applies_to": "exact_nonverbal_tags",
+            "target_rms": BACKCHANNEL_TARGET_RMS,
+            "max_gain": BACKCHANNEL_MAX_GAIN,
+            "gain_peak_ceiling": BACKCHANNEL_GAIN_PEAK,
+            "minimum_rms": BACKCHANNEL_MIN_RMS,
         },
     }
 

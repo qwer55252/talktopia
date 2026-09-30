@@ -212,12 +212,16 @@ def test_speech_health_publishes_and_checks_decoder_policy(monkeypatch, tmp_path
     backend = SimpleNamespace(voices={})
     with TestClient(servers.create_speech_app(backend=backend, db=tmp_path)) as client:
         health = client.get("/health").json()
-    assert health["speech_protocol"] == SPEECH_PROTOCOL == "surface5-http-v5"
+    assert health["speech_protocol"] == SPEECH_PROTOCOL == "surface5-http-v6"
     assert health["asr_without_timestamps"] is True
     assert health["asr_vad_mode"] == "speech_presence_only"
     monkeypatch.setattr(servers, "database_path", lambda: tmp_path)
     monkeypatch.setattr(servers, "get_json", lambda *args, **kwargs: health)
     assert servers.speech_health()["asr_without_timestamps"] is True
+    health["speech_protocol"] = "surface5-http-v5"
+    with pytest.raises(ValueError, match="Incompatible speech service"):
+        servers.speech_health()
+    health["speech_protocol"] = SPEECH_PROTOCOL
     health["asr_without_timestamps"] = False
     with pytest.raises(ValueError, match="Incompatible speech service"):
         servers.speech_health()

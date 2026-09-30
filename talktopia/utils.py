@@ -232,6 +232,7 @@ async def run_episode_batch(
     summary_path,
     initial_summary,
     concurrency,
+    selected_episode_ids=None,
     max_attempts=1,
     validate_artifacts=result_artifacts,
     identity_keys=EPISODE_IDENTITY,
@@ -299,6 +300,12 @@ async def run_episode_batch(
         else:
             row["status"] = "pending"
     pending = [row for row in rows if row["status"] != "completed"]
+    if selected_episode_ids is not None:
+        selected = set(selected_episode_ids)
+        unknown = selected - {row["episode_id"] for row in rows}
+        if unknown:
+            raise ValueError(f"Unknown episode IDs: {sorted(unknown)}")
+        pending = [row for row in pending if row["episode_id"] in selected]
     if args.episode_limit:
         pending = pending[: args.episode_limit]
     if args.dry_run:

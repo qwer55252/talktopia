@@ -69,7 +69,7 @@ async def run_timed_episode(profiles, tmp_path, monkeypatch, *, late_backchannel
         )
 
     async def synthesize(self, text, reference, seed):
-        backchannel = text == generation.BACKCHANNEL_TTS_TEXT
+        backchannel = text in generation.BACKCHANNEL_TTS_INPUTS
         await asyncio.sleep(2.8 if backchannel and late_backchannel else 0.09)
         count = 4800 if backchannel else 28800
         sample = 2000 if backchannel else 1000
@@ -336,12 +336,6 @@ def test_action_controls_and_weighted_latency_summary():
     summarize_latencies(summary)
     assert summary["latency"]["normal_response"] == {"count": 4, "mean_ms": 40}
     assert summary["latency"]["backchannel"]["mean_ms"] is None
-
-
-def test_prompt_is_the_versioned_appendix_text():
-    text = generation._PROMPT_PATH.read_text()
-    assert generation.SIMULATION_PROMPT_VERSION == "simulation_FDB_v7"
-    assert generation._ACTION_PROMPT == text
 
 
 def test_temporal_evaluation_requires_recorded_sidecars():

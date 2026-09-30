@@ -2,8 +2,8 @@
 /engine
 /Agent.md
 /AGENTS.md
+/agents.md
 /paper
-/tests/*
 
 .pytest_cache/
 .ruff_cache/

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from talktopia.experiment import UNCOUNTED_ACTIONS
-from talktopia.models.config import confirmation_tts_settings
+from talktopia.models.config import backchannel_tts_settings
 
 import asyncio
 import hashlib
@@ -490,7 +490,7 @@ class DuplexRuntime:
                 "allow_backchannels": self.config.allow_backchannels,
                 "allow_corrections": self.config.allow_corrections,
                 "allow_interruptions": self.config.allow_interruptions,
-                "backchannel_tts": confirmation_tts_settings(),
+                "backchannel_tts": backchannel_tts_settings(),
                 "seed": self.seed,
                 "max_turns": self.config.max_turns,
             },

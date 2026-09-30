@@ -20,11 +20,13 @@ def test_resume_uses_saved_mode_and_rejects_changed_limits(tmp_path, mode):
         "input_fingerprints": {},
         "tag": "saved-run",
         "database_path": str(tmp_path / "db"),
+        "episode_ids": ["episode_0006", "episode_0011"],
     }
     config = tmp_path / "run_config.json"
     config.write_text(json.dumps(saved))
     result = utils.restore_run(args, path_fields=(), overrides={})
     assert result.interaction_mode == mode and result.episode_limit == 1
+    assert result.episode_ids == saved["episode_ids"]
     for field, value in [("max_turns", 99), ("episode_timeout_s", 999)]:
         config.write_text(json.dumps({**saved, field: value}))
         with pytest.raises(ValueError, match="12 budget turns and 120"):

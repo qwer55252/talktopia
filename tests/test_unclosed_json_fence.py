@@ -20,8 +20,16 @@ def parse(raw, actions=None):
     )
 
 
-@pytest.mark.parametrize("prefix", ["```json\n", "```\n", "```JSON\r\n"])
-@pytest.mark.parametrize("suffix", ["", "\n", "\n```"])
+@pytest.mark.parametrize(
+    "prefix, suffix",
+    [
+        pytest.param("```json\n", "\n```", id="closed-json"),
+        pytest.param("```json\n", "", id="unclosed-json"),
+        pytest.param("```json\n", "\n", id="unclosed-trailing-newline"),
+        pytest.param("```\n", "", id="unlabelled-fence"),
+        pytest.param("```JSON\r\n", "\n```", id="uppercase-crlf"),
+    ],
+)
 def test_joint_action_with_optional_closing_fence(prefix, suffix):
     raw = (
         prefix

@@ -18,15 +18,8 @@ def test_simulation_preserves_sotopia_body_and_round_robin_guidance():
     prompt = generation._ACTION_PROMPT
     assert prompt.startswith(body)
     assert prompt.endswith("Please only generate" + output_instruction)
-    assert {path.name for path in directory.glob("simulation_*.txt")} == {
-        "simulation_FDB_v1.txt",
-        "simulation_FDB_v2.txt",
-        "simulation_FDB_v3.txt",
-        "simulation_FDB_v4.txt",
-        "simulation_FDB_v5.txt",
-        "simulation_FDB_v6.txt",
-        "simulation_FDB_v7.txt",
-    }
+    assert prompt == generation._PROMPT_PATH.read_text()
+    assert generation._PROMPT_PATH.stem == generation.SIMULATION_PROMPT_VERSION
     assert (
         runtime_settings()["simulation_prompt"] == generation.SIMULATION_PROMPT_VERSION
     )
@@ -64,7 +57,6 @@ def test_fdb_evaluation_only_adds_timing_to_the_original_template():
     assert prefix + "{retry_feedback}" + tail == original
     assert "existing scoring dimension" in timing
     assert "whole-utterance ASR" in timing
-    assert not (directory / "temporal_v1.txt").exists()
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ from talktopia.full_duplex.generation import (
     DuplexGenerationEngine,
     _action_model,
 )
+from talktopia.models.config import BACKCHANNEL_TTS_INPUTS
 
 MODEL = "custom/local-agent@http://127.0.0.1:18083/v1"
 REPAIR_MODEL = "custom/local-repair@http://127.0.0.1:18084/v1"
@@ -137,7 +138,7 @@ async def test_action_and_argument_share_one_actual_model_call(
         assert engine.non_audio_argument_attempt(generated.decision.decision_id) == 1
     elif action_type == "backchanneling":
         hidden = engine.make_backchannel(session, generated.decision)
-        assert hidden.text == "[confirmation-en]"
+        assert hidden.text in BACKCHANNEL_TTS_INPUTS
         assert engine.hidden_said_attempt(hidden.hidden_said_id) == 1
     assert len(calls) == 1
     assert calls[0]["temperature"] == 1.0
@@ -154,6 +155,45 @@ async def test_action_and_argument_share_one_actual_model_call(
     assert "40 words" in prompt
     assert "peer_utterance_id" not in prompt
     assert "target_utterance_id" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_backchannel_selection_is_seeded_and_independent_of_dialogue_meaning(
+    monkeypatch,
+):
+    count = 32
+    calls = mock_completions(
+        monkeypatch,
+        [{"action_type": "backchanneling", "argument": "", "to": []}] * (count * 4),
+    )
+    session = make_context()
+
+    async def select(seed, context, history):
+        engine = DuplexGenerationEngine(MODEL, seed=seed)
+        selected = []
+        for _ in range(count):
+            generated = await engine.generate_action(
+                context, make_observation(["backchanneling"]), history
+            )
+            hidden = engine.make_backchannel(context, generated.decision)
+            selected.append(hidden.text)
+            assert [chunk.text for chunk in engine.split_into_sentence_chunks(hidden)] == [
+                hidden.text
+            ]
+        return selected
+
+    first = await select(17, session, "They agree with the proposal.")
+    replay = await select(17, session, "They agree with the proposal.")
+    different_context = await select(
+        17,
+        replace(session, private_goal="Reject the proposal."),
+        "They disagree and ask a question.",
+    )
+    different_seed = await select(18, session, "They agree with the proposal.")
+    assert first == replay == different_context
+    assert different_seed != first
+    assert set(first) == set(BACKCHANNEL_TTS_INPUTS)
+    assert len(calls) == count * 4  # Choosing the sound never calls the LLM.
 
 
 @pytest.mark.asyncio
@@ -512,17 +552,22 @@ async def test_non_audio_descriptions_keep_markup(monkeypatch, action_type):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "original, repaired",
+    "action_type, original, repaired",
     [
-        ("I *need* to keep the *other* grand.", "I need to keep the other grand."),
-        ("**smiles** We can meet tomorrow.", "We can meet tomorrow."),
-        ("I can meet (tomorrow).", "I can meet tomorrow."),
-        ("[waves] Hello.", "Hello."),
-        ("{sighs} We can meet tomorrow.", "We can meet tomorrow."),
+        # Cover each markup form on speak, then the shared guard on other actions.
+        (
+            "speak",
+            "I *need* to keep the *other* grand.",
+            "I need to keep the other grand.",
+        ),
+        ("speak", "**smiles** We can meet tomorrow.", "We can meet tomorrow."),
+        ("speak", "I can meet (tomorrow).", "I can meet tomorrow."),
+        ("speak", "[waves] Hello.", "Hello."),
+        ("speak", "{sighs} We can meet tomorrow.", "We can meet tomorrow."),
+        ("hesitation", "[waves] Hello.", "Hello."),
+        ("correction", "[waves] Hello.", "Hello."),
+        ("interruption", "[waves] Hello.", "Hello."),
     ],
-)
-@pytest.mark.parametrize(
-    "action_type", ["speak", "hesitation", "correction", "interruption"]
 )
 async def test_marked_speech_uses_existing_repair_without_deleting_words(
     monkeypatch, original, repaired, action_type
@@ -539,6 +584,7 @@ async def test_marked_speech_uses_existing_repair_without_deleting_words(
         make_context(), make_observation([action_type], peer_utterance_id="peer-1"), ""
     )
     assert not generated.fallback and generated.argument == repaired
+    assert generated.decision.action_type == action_type
     assert len(calls) == 2
     assert "asterisks" in engine.decision_audit(generated.decision.decision_id)[1][0]
     hidden = engine.make_hidden_said(make_context(), generated)
@@ -824,10 +870,14 @@ async def test_inaudible_speech_uses_repair_or_none(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "action_type", ["speak", "hesitation", "correction", "interruption"]
-)
-@pytest.mark.parametrize(
-    "original", ["Family first—但不多聊那回事。", "Please help. Спасибо."]
+    "action_type, original",
+    [
+        ("speak", "Family first—但不多聊那回事。"),
+        ("speak", "Please help. Спасибо."),
+        ("hesitation", "Please help. Спасибо."),
+        ("correction", "Please help. Спасибо."),
+        ("interruption", "Please help. Спасибо."),
+    ],
 )
 async def test_non_latin_speech_uses_existing_repair_with_error_feedback(
     monkeypatch, action_type, original
@@ -845,6 +895,7 @@ async def test_non_latin_speech_uses_existing_repair_with_error_feedback(
         make_context(), make_observation([action_type], peer_utterance_id="peer-1"), ""
     )
     assert not generated.fallback and generated.argument == repaired
+    assert generated.decision.action_type == action_type
     assert len(calls) == 2
     assert (
         "The previous action failed validation"

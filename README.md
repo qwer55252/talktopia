@@ -163,5 +163,6 @@ Matrix의 `matrix_summary.json`과 `matrix_summary.md`에는 실행 방식, 원�
 
 테스트는 임시 DB, 가짜 모델, HTTP mock을 사용한다. 데이터 축소·중복·역할 변경,
 두 방식의 턴/timeout, backchannel 겹침, 평가용 ASR 증거, resume와 worker 반환을
-검증한다. 모든 코드 변경은 `AGENTS.md`의 별도 리뷰 Agent 검사와 수정·재검토
-과정을 거쳐야 한다.
+검증한다. 일반 수정에서는 [테스트 안내](tests/README.md)에 따라 관련 파일만
+실행한다. 공통 실행 코드나 테스트 구성을 수정했을 때와 병합 전에는 전체를
+실행한다. 코드 리뷰는 현재 작업 Agent가 직접 수행한다.

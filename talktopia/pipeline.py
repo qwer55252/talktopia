@@ -127,6 +127,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Maximum unfinished episodes per model pair this invocation; 0 means all 450.",
     )
     parser.add_argument(
+        "--episode-id",
+        dest="episode_ids",
+        action="append",
+        help="Simulate only this canonical episode ID; repeat to select several. The full manifest is retained.",
+    )
+    parser.add_argument(
         "--bad-output-process-model",
         default=models["agent2"],
         help="Local model used by SOTOPIA to repair malformed model output.",
@@ -158,6 +164,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.episode_limit < 0:
         parser.error("--episode-limit must be nonnegative")
+    if args.episode_ids:
+        if len(set(args.episode_ids)) != len(args.episode_ids):
+            parser.error("--episode-id values must be distinct")
+        if args.stage == "reevaluate":
+            parser.error("--episode-id selects simulations; use --reeval-episode-id for evaluation")
     if args.resume_run:
         allowed = {
             "--resume-run",
@@ -357,6 +368,7 @@ async def run_simulation_batch(
             "coverage": validate_manifest(records),
         },
         concurrency=concurrency,
+        selected_episode_ids=getattr(args, "episode_ids", None),
         max_attempts=3,
         validate_artifacts=result_artifacts,
         error_fields={
@@ -676,6 +688,7 @@ def build_duplex_episode(
                 profile=profile,
                 generation=DuplexGenerationEngine(
                     getattr(args, f"agent{index}_model"),
+                    seed=args.seed,
                 ),
                 asr=WindowedASR(
                     speech,
@@ -1048,13 +1061,18 @@ def preflight(args):
         if args.resume_run:
             manifest_path = args.resume_run / "02_sampled_characters.json"
             validate_run_inputs(args.resume_run, db_path, manifest_path)
-            validate_manifest(read_manifest(manifest_path))
+            records = read_manifest(manifest_path)
+            validate_manifest(records)
         else:
             manifest = (
                 read_manifest(args.sample_manifest) if args.sample_manifest else None
             )
             profiles = stage_1_sample_env_profiles(args, manifest)
-            stage_2_sample_characters(profiles, args, manifest)
+            records = stage_2_sample_characters(profiles, args, manifest)
+        requested = set(getattr(args, "episode_ids", None) or [])
+        unknown = requested - {row["episode_id"] for row in records}
+        if unknown:
+            raise ValueError(f"Unknown simulation episode IDs: {sorted(unknown)}")
     return db_path
 
 
@@ -1426,7 +1444,7 @@ async def run_matrix(args, run_dir: Path, db_path: Path, records: list) -> int:
                         f"{pair['pair_id']}: worker stopped unexpectedly; see {child_dir / 'worker.log'}"
                     )
                 if sim["pending"]:
-                    if not args.episode_limit:
+                    if not args.episode_limit and not args.episode_ids:
                         raise RuntimeError(
                             f"{pair['pair_id']}: unexpected unfinished simulations"
                         )
@@ -1469,7 +1487,7 @@ async def run_matrix(args, run_dir: Path, db_path: Path, records: list) -> int:
                 pair.pop("pid", None)
                 checkpoint()
                 matrix_report(run_dir, state)
-            if args.episode_limit:
+            if args.episode_limit or args.episode_ids:
                 # Partial pairs are resumed only on the next invocation.
                 processed.add(pair["pair_id"])
 
