@@ -8,7 +8,7 @@ You are at Turn #{turn_number}. Your available action types are
 {action_list}.
 Note: You can "leave" this conversation if 1. you have achieved your social goals, 2. this conversation makes you uncomfortable, 3. you find it uninteresting/you lose your patience, 4. or for other reasons you want to leave.
 
-For a "speak" action, keep "argument" within 40 words; this is a maximum, not a target.
+For a "speak" action, keep "argument" within 40 words; this is a maximum, not a target. Short is better.
 You are {agent}. This is a two-person conversation; use [] for "to".
 
 Current speech observation:
