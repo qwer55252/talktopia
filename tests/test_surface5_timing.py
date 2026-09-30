@@ -398,13 +398,17 @@ async def test_active_audio_failure_keeps_capture_and_stops_tasks(
     async def decode(self, pcm, rate):
         if failure == "final_asr":
             raise RuntimeError("final ASR unavailable")
+        if failure == "timeout":
+            # The episode's time limit must not hide a real ASR request timeout.
+            await asyncio.sleep(0.2)
+            raise TimeoutError("ASR request timed out")
         await asyncio.Event().wait()
 
     monkeypatch.setattr(CascadedDuplexAgent, "receive_audio", receive)
     monkeypatch.setattr(generation, "generate_structured_action", generate)
     monkeypatch.setattr(SpeechClient, "synthesize", synthesize)
     monkeypatch.setattr(SpeechClient, "decode", decode)
-    if failure == "timeout":
+    if failure in {"timeout", "cancel"}:
         monkeypatch.setattr(pipeline, "EPISODE_TIMEOUT_S", 0.15)
     args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
     args.tag = "failed-live-audio"
@@ -416,6 +420,7 @@ async def test_active_audio_failure_keeps_capture_and_stops_tasks(
         )
         await receiving.wait()
         if failure == "cancel":
+            await asyncio.sleep(0.2)  # External cancellation after the soft limit.
             task.cancel()
         error = {
             "cancel": asyncio.CancelledError,

@@ -117,9 +117,8 @@ async def test_backchannels_keep_event_order_without_consuming_budget(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["round-robin", "surface5-full-duplex"])
-async def test_deadline_cancels_runner_and_preserves_diagnostics(
-    tmp_path, monkeypatch, mode
+async def test_round_robin_deadline_cancels_runner_and_preserves_diagnostics(
+    tmp_path, monkeypatch
 ):
     cancelled = asyncio.Event()
 
@@ -130,9 +129,8 @@ async def test_deadline_cancels_runner_and_preserves_diagnostics(
             cancelled.set()
 
     monkeypatch.setattr(pipeline, "run_round_robin_episode", stalled)
-    monkeypatch.setattr(pipeline, "run_duplex_episode", stalled)
     monkeypatch.setattr(pipeline, "EPISODE_TIMEOUT_S", 0.01)
-    args = pipeline.parse_args(["--interaction-mode", mode])
+    args = pipeline.parse_args(["--interaction-mode", "round-robin"])
     with pytest.raises(TimeoutError, match="exceeded"):
         await pipeline.run_one_episode(
             SimpleNamespace(turn_number=3), [], args, tmp_path, "episode_0001"
@@ -142,4 +140,4 @@ async def test_deadline_cancels_runner_and_preserves_diagnostics(
         (tmp_path / "simulation/diagnostics/episode_0001.json").read_text()
     )
     assert diagnostic["reason"] == "episode_timeout"
-    assert diagnostic["interaction_mode"] == mode
+    assert diagnostic["interaction_mode"] == "round-robin"

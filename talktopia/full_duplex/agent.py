@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -131,7 +132,9 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
             ),
         )
 
-    async def submit_observation(self, observation: StreamingObservation) -> None:
+    async def submit_observation(
+        self, observation: StreamingObservation, *, deadline: float | None = None
+    ) -> None:
         self._require_active()
         if self.state.left:
             return
@@ -147,7 +150,7 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         self._decision_task = self._track_background_task(
             "decision",
             asyncio.create_task(
-                self._respond(observation, revision),
+                self._respond(observation, revision, deadline=deadline),
                 name=f"surface5-decision-{self.agent_name}-{revision}",
             ),
         )
@@ -336,8 +339,13 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
         self,
         observation: StreamingObservation,
         revision: int,
+        *,
+        deadline: float | None = None,
     ) -> None:
         assert self._context is not None
+        # Cancelling the prior decision or scheduling this task can cross the limit.
+        if deadline is not None and time.monotonic() >= deadline:
+            return
         loop = asyncio.get_running_loop()
         started = loop.time()
         self.state.work_stage = "decision"

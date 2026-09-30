@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import time
 import wave
 from types import SimpleNamespace
 
@@ -385,9 +386,9 @@ def test_defaults_and_invalid_timeout():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["timeout", "cancel"])
-async def test_failed_episode_has_one_terminal_event_and_stops_tasks(
-    profiles, tmp_path, monkeypatch, failure
+@pytest.mark.parametrize("ending", ["time_limit", "late_start", "cancel"])
+async def test_waiting_decision_stops_without_inventing_a_final_utterance(
+    profiles, tmp_path, monkeypatch, ending
 ):
     waiting = asyncio.Event()
 
@@ -398,31 +399,49 @@ async def test_failed_episode_has_one_terminal_event_and_stops_tasks(
     monkeypatch.setattr(generation, "generate_structured_action", generate)
     args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
     args.tag = "test-duplex"
-    if failure == "timeout":
+    if ending != "cancel":
         monkeypatch.setattr(pipeline, "EPISODE_TIMEOUT_S", 0.03)
+    if ending == "late_start":
+        from talktopia.full_duplex.agent import CascadedDuplexAgent
+
+        original_respond = CascadedDuplexAgent._respond
+
+        async def delayed_respond(self, *args, **kwargs):
+            # Simulate scheduling work that crosses the limit before the LLM call.
+            time.sleep(0.05)
+            await original_respond(self, *args, **kwargs)
+
+        monkeypatch.setattr(CascadedDuplexAgent, "_respond", delayed_respond)
     speech = FakeSpeech()
     async with speech.client() as client:
         resolved, agents = pipeline.build_episode(profiles, args, client, client)
         task = asyncio.create_task(
             pipeline.run_one_episode(resolved, agents, args, tmp_path, "episode_0001")
         )
-        await waiting.wait()
-        if failure == "cancel":
+        if ending != "late_start":
+            await waiting.wait()
+        if ending == "cancel":
             task.cancel()
-        error = asyncio.CancelledError if failure == "cancel" else TimeoutError
-        with pytest.raises(error):
-            await task
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            result = await asyncio.wait_for(task, 2)
+            assert result["status"] == "completed"
+            assert result["end_reason"] == "time_limit"
+            assert result["budget_turns"] == 0
     events = read_events(tmp_path / "simulation/events/episode_0001.jsonl")
     terminal = [event for event in events if isinstance(event, EpisodeEnded)]
     assert len(terminal) == 1
-    assert terminal[0].status == ("cancelled" if failure == "cancel" else "failed")
+    assert terminal[0].status == ("cancelled" if ending == "cancel" else "completed")
     assert all(
         not agent.state.session_active and not agent.has_pending_generation
         for agent in agents
     )
-    if failure == "timeout":
-        assert terminal[0].reason == "episode_timeout"
-        assert (tmp_path / "simulation/diagnostics/episode_0001.json").is_file()
+    assert waiting.is_set() == (ending != "late_start")
+    if ending != "cancel":
+        assert terminal[0].reason == "time_limit"
+        assert not any(isinstance(event, ActionCommitted) for event in events)
+        assert not (tmp_path / "simulation/diagnostics/episode_0001.json").exists()
 
 
 def test_existing_journal_is_not_overwritten(tmp_path):

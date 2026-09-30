@@ -14,6 +14,9 @@ class RuntimeConfig(BaseModel):
     allow_backchannels: bool = True
     turn_taking_policy: str = "surface5_speech_or_leave_v1"
     termination_policy: Literal["first_leave"] = "first_leave"
+    time_limit_policy: Literal["finish_selected_speech_v1"] = (
+        "finish_selected_speech_v1"
+    )
     generation_mode: Literal["sotopia_single_call"] = "sotopia_single_call"
     validation_policy: Literal["essential_v1"] = "essential_v1"
     episode_max_attempts: Literal[1] = 1

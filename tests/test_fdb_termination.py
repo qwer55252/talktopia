@@ -1,4 +1,4 @@
-"""Exercise a first-leave request at the runtime boundary during active work."""
+"""Exercise leave and time-limit termination during active speech work."""
 
 import asyncio
 import json
@@ -21,6 +21,107 @@ from talktopia.full_duplex.events import (
 )
 from talktopia.full_duplex.runtime import DuplexRuntime
 from talktopia.full_duplex.speech_client import SpeechClient
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["audio", "tts", "asr", "overlap", "commit"])
+async def test_time_limit_finishes_selected_speech_and_final_asr(
+    profiles, tmp_path, monkeypatch, stage
+):
+    from sotopia.database import EpisodeLog
+    from talktopia.evaluation.evaluator import duplex_history
+    from talktopia.full_duplex.sotopia_adapter import SotopiaSession
+    from talktopia.full_duplex.transcript import TranscriptBuilder
+
+    requests = []
+    with_backchannel = stage in {"overlap", "commit"}
+    text = "First sentence. Final sentence."
+    if with_backchannel:
+        text = "First sentence. Second sentence. Final sentence."
+
+    async def generate(**kwargs):
+        observation = json.loads(kwargs["input_values"]["observation"])
+        requests.append(observation)
+        if observation["source"] == "asr_partial":
+            return joint_result(kwargs, "backchanneling")
+        return joint_result(kwargs, "speak", text)
+
+    async def synthesize(self, sentence, reference, seed):
+        if stage == "tts":
+            await asyncio.sleep(0.2)
+        duration = {"tts": 0.1, "asr": 0.02}.get(stage, 0.2)
+        sample = 1000
+        if sentence == "yeah":
+            duration, sample = (1.2 if stage == "commit" else 0.6), 2000
+        return sample.to_bytes(2, "little") * round(24000 * duration)
+
+    async def decode(self, pcm, rate):
+        if stage == "asr":
+            await asyncio.sleep(0.2)
+        return "Yeah." if pcm[:2] == (2000).to_bytes(2, "little") else "Heard spoken words."
+
+    monkeypatch.setattr(generation, "generate_structured_action", generate)
+    monkeypatch.setattr(generation, "BACKCHANNEL_TTS_INPUTS", ("yeah",))
+    monkeypatch.setattr(SpeechClient, "synthesize", synthesize)
+    monkeypatch.setattr(SpeechClient, "decode", decode)
+    if stage == "commit":
+        original_commit = SotopiaSession.commit
+
+        async def slow_commit(self, commit):
+            # Final ASR arrives before the limit, but its commit finishes after it.
+            await asyncio.sleep(0.3)
+            return await original_commit(self, commit)
+
+        monkeypatch.setattr(SotopiaSession, "commit", slow_commit)
+    time_limit = {"overlap": 0.35, "commit": 0.75}.get(stage, 0.12)
+    monkeypatch.setattr(pipeline, "EPISODE_TIMEOUT_S", time_limit)
+    args = pipeline.parse_args(["--interaction-mode", "surface5-full-duplex"])
+    args.tag = "finish-last-speech"
+    if with_backchannel:
+        # Reaching the action budget while draining must not cut the backchannel.
+        args.max_turns = 1
+    async with FakeSpeech().client() as client:
+        resolved, agents = pipeline.build_episode(profiles, args, client, client)
+        result = await asyncio.wait_for(
+            pipeline.run_one_episode(resolved, agents, args, tmp_path, "episode_0001"),
+            3,
+        )
+    assert result["status"] == "completed" and result["end_reason"] == "time_limit"
+    assert result["duration_ms"] > time_limit * 1000 and result["budget_turns"] == 1
+    assert result["action_counts"] == (
+        {"speak": 1, "backchanneling": 1} if with_backchannel else {"speak": 1}
+    )
+    assert [r["source"] for r in requests] == (
+        ["reset", "asr_partial"] if with_backchannel else ["reset"]
+    )
+    events = read_events(tmp_path / result["events"])
+    assert events[0].run_config["time_limit_policy"] == "finish_selected_speech_v1"
+    deliveries = [e for e in events if isinstance(e, AudioDeliveryEvent)]
+    assert len(deliveries) == (4 if with_backchannel else 2)
+    assert all(e.delivered_frames == e.planned_frames for e in deliveries)
+    assert not any(
+        e.event_type == "speech_lifecycle" and e.phase == "cancelled" for e in events
+    )
+    entries = TranscriptBuilder.from_events(events).build()
+    assert all(entry.completed and entry.commit_id for entry in entries)
+    speech = next(entry for entry in entries if entry.action_type == "speak")
+    assert speech.generated_text == text
+    assert len(speech.sentences) == (3 if with_backchannel else 2)
+    if stage == "commit":
+        final = next(
+            e for e in events if isinstance(e, ASRUpdateEvent)
+            and e.is_final and e.utterance_id == speech.utterance_id
+        )
+        committed = next(
+            e for e in events if isinstance(e, ActionCommitted)
+            and e.commit_id == speech.commit_id
+        )
+        assert final.timestamp_ms < time_limit * 1000 < committed.timestamp_ms
+    source = EpisodeLog.model_validate_json((tmp_path / result["original"]).read_text())
+    _, history = duplex_history(source, tmp_path / result["events"])
+    assert "Heard spoken words." in "\n".join(history)
+    assert events[-1].status == "completed" and events[-1].reason == "time_limit"
+    assert all(not agent.state.session_active for agent in agents)
 
 
 @pytest.mark.asyncio

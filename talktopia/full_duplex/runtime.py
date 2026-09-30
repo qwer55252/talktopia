@@ -7,6 +7,7 @@ from talktopia.models.config import backchannel_tts_settings
 
 import asyncio
 import hashlib
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Literal
@@ -93,6 +94,7 @@ class RuntimeState:
     budget_turns: int = 0
     action_counts: dict[str, int] = field(default_factory=dict)
     stopping: bool = False
+    time_limit_reached: bool = False
     end_reason: str | None = None
 
 
@@ -118,6 +120,7 @@ class RuntimeLivenessSnapshot(BaseModel):
     now_ms: float
     leave_phase: LeavePhase
     stopping: bool
+    time_limit_reached: bool
     audio_pending: bool
     floor_utterances: dict[str, str]
     active_utterances: dict[str, str]
@@ -287,6 +290,7 @@ class DuplexRuntime:
         seed: int = 0,
         sample_rate_hz: int = 24_000,
         frame_ms: int = 40,
+        deadline: float | None = None,
     ) -> None:
         names = tuple(agent.agent_name for agent in agents)
         if len(set(names)) != 2:
@@ -303,6 +307,7 @@ class DuplexRuntime:
         self.seed = seed
         self.sample_rate_hz = sample_rate_hz
         self.frame_ms = frame_ms
+        self.deadline = deadline
         opener = select_opening_agent(resolved, event_writer.episode_id)
         self.state = RuntimeState(
             episode_id=event_writer.episode_id,
@@ -350,6 +355,21 @@ class DuplexRuntime:
             }
             for kind, values in self.latencies.items()
         }
+
+    def _at_time_limit(self) -> bool:
+        return self.deadline is not None and time.monotonic() >= self.deadline
+
+    async def _begin_time_limit_finish(self) -> None:
+        if self.state.time_limit_reached or not self._at_time_limit():
+            return
+        self.state.time_limit_reached = True
+        self.state.deferred_observations.clear()
+        for agent in self.agents:
+            # Selected speech may still be in TTS, playback, or final ASR.
+            # Cancel only decisions that have not yet produced selected speech.
+            decision = self._pending_decisions.get(agent.agent_name)
+            if decision is None or decision.action_type not in _SPOKEN_ACTIONS:
+                await agent.cancel_speech("episode_time_limit")
 
     async def _pump_audio(self) -> None:
         while not self._audio_stopping:
@@ -428,6 +448,7 @@ class DuplexRuntime:
                 "episode_max_attempts": self.config.episode_max_attempts,
                 "history_policy": self.config.history_policy,
                 "termination_policy": self.config.termination_policy,
+                "time_limit_policy": self.config.time_limit_policy,
                 "allow_backchannels": self.config.allow_backchannels,
                 "backchannel_tts": backchannel_tts_settings(),
                 "seed": self.seed,
@@ -435,15 +456,26 @@ class DuplexRuntime:
             },
         )
         try:
-            await self._agents[self.state.opener_agent].submit_observation(
-                initial_streams[self.state.opener_agent]
-            )
+            if not self._at_time_limit():
+                await self._agents[self.state.opener_agent].submit_observation(
+                    initial_streams[self.state.opener_agent], deadline=self.deadline
+                )
             self._audio_task = asyncio.create_task(
                 self._pump_audio(), name="surface5-live-audio"
             )
             while self.state.leave_phase != "completed":
-                agent_name, output = await self._next_output()
-                await self.handle_agent_output(agent_name, output)
+                await self._begin_time_limit_finish()
+                if (
+                    self.state.time_limit_reached
+                    and not self._pending_decisions
+                    and not self._utterances
+                ):
+                    self.state.end_reason = "time_limit"
+                    self.state.leave_phase = "completed"
+                    break
+                output = await self._next_output()
+                if output is not None:
+                    await self.handle_agent_output(*output)
             await self._stop_audio()
             assert self.state.end_reason is not None
             await self._finish_delivered_audio(self.state.end_reason)
@@ -485,6 +517,7 @@ class DuplexRuntime:
             await self._cancel_output_waiters()
 
     async def handle_agent_output(self, agent: str, output: AgentOutput) -> None:
+        await self._begin_time_limit_finish()
         if isinstance(output, GenerationFailure):
             observation = self._agents[agent].decision_observation(output.decision_id)
             self.event_writer.emit(
@@ -499,7 +532,7 @@ class DuplexRuntime:
                 validation_errors=(output.error,),
                 raw_responses=output.raw_responses,
             )
-            if observation.source == "asr_partial":
+            if self._at_time_limit() or observation.source == "asr_partial":
                 return
             raise RuntimeError(f"Action generation failed for {agent}: {output.error}")
         if isinstance(output, GeneratedAction):
@@ -620,6 +653,8 @@ class DuplexRuntime:
     ) -> str | None:
         if self.state.stopping or self.state.leave_phase != "active":
             return "episode_stopping"
+        if self._at_time_limit():
+            return "episode_time_limit"
         latest = self.state.latest_observations[agent]
         if latest.canonical.observation_id != observation.canonical.observation_id:
             return "a newer observation superseded this decision"
@@ -1036,7 +1071,8 @@ class DuplexRuntime:
 
     async def _handle_asr_partial(self, update: ASRUpdate) -> None:
         if (
-            not update.is_stable
+            self._at_time_limit()
+            or not update.is_stable
             or update.has_next_sentence is not True
             or update.sentence_index is None
             or update.utterance_id not in self._utterances
@@ -1061,6 +1097,8 @@ class DuplexRuntime:
             return
 
         await self._discard_unstarted_superseded_speech(update.listener)
+        if self._at_time_limit():
+            return
 
         available = self.floor.available_actions(update.listener, self.state)
         if "backchanneling" not in available:
@@ -1080,7 +1118,9 @@ class DuplexRuntime:
         )
         self._last_dispatched_sentence[update.utterance_id] = update.sentence_index
         self.state.latest_observations[update.listener] = observation
-        await self._agents[update.listener].submit_observation(observation)
+        await self._agents[update.listener].submit_observation(
+            observation, deadline=self.deadline
+        )
 
     async def _discard_unstarted_superseded_speech(
         self,
@@ -1180,7 +1220,9 @@ class DuplexRuntime:
         metadata: dict[str, object],
     ) -> None:
         assert self._snapshot is not None
-        if self.state.budget_turns >= self.config.max_turns:
+        if self.state.budget_turns >= self.config.max_turns and not (
+            self.state.time_limit_reached and action.action_type in UNCOUNTED_ACTIONS
+        ):
             raise TurnLimitReached
         peer = self._peer(actor)
         actions = {
@@ -1232,6 +1274,7 @@ class DuplexRuntime:
         if (
             self.state.budget_turns >= self.config.max_turns
             and action.action_type != "leave"
+            and not self._at_time_limit()
         ):
             raise TurnLimitReached
 
@@ -1289,6 +1332,7 @@ class DuplexRuntime:
         if (
             self.state.stopping
             or listener in self.state.left_agents
+            or self._at_time_limit()
         ):
             return
         canonical = self._snapshot.observations[listener]
@@ -1326,7 +1370,9 @@ class DuplexRuntime:
             peer_speaking=speaker in self.state.active_utterances.values(),
         )
         self.state.latest_observations[listener] = observation
-        await self._agents[listener].submit_observation(observation)
+        await self._agents[listener].submit_observation(
+            observation, deadline=self.deadline
+        )
 
     def _has_active_auxiliary(self, agent: str) -> bool:
         pending = self._pending_decisions.get(agent)
@@ -1348,6 +1394,7 @@ class DuplexRuntime:
             agent in self.state.left_agents
             or self.state.stopping
             or self.state.leave_phase != "active"
+            or self._at_time_limit()
         ):
             return False
         if self._has_active_auxiliary(agent):
@@ -1367,7 +1414,9 @@ class DuplexRuntime:
             ),
         )
         self.state.latest_observations[agent] = observation
-        await self._agents[agent].submit_observation(observation)
+        await self._agents[agent].submit_observation(
+            observation, deadline=self.deadline
+        )
         return True
 
     def _response_actions(self, agent: str) -> list[DuplexActionType]:
@@ -1412,6 +1461,7 @@ class DuplexRuntime:
             now_ms=self.now_ms,
             leave_phase=self.state.leave_phase,
             stopping=self.state.stopping,
+            time_limit_reached=self.state.time_limit_reached,
             audio_pending=self.audio_router.has_pending(),
             floor_utterances=dict(self.state.floor_utterances),
             active_utterances=dict(self.state.active_utterances),
@@ -1469,7 +1519,7 @@ class DuplexRuntime:
             self_active_action_type=active.action_type if active is not None else None,
         )
 
-    async def _next_output(self) -> tuple[str, AgentOutput]:
+    async def _next_output(self) -> tuple[str, AgentOutput] | None:
         while not self._ready_outputs:
             self._ensure_output_tasks()
             waiters = set(self._output_tasks.values())
@@ -1478,7 +1528,14 @@ class DuplexRuntime:
             done, _pending = await asyncio.wait(
                 waiters,
                 return_when=asyncio.FIRST_COMPLETED,
+                timeout=(
+                    max(0, self.deadline - time.monotonic())
+                    if self.deadline is not None and not self.state.time_limit_reached
+                    else None
+                ),
             )
+            if not done:
+                return None
             if self._audio_task in done:
                 self._audio_task.result()
                 raise RuntimeError("Live audio loop ended unexpectedly")

@@ -762,6 +762,7 @@ async def run_duplex_episode(
         seed=args.seed,
         sample_rate_hz=SAMPLE_RATE_HZ,
         frame_ms=FRAME_MS,
+        deadline=deadline,
     )
     opened = False
     started = time.monotonic()
@@ -847,11 +848,6 @@ async def run_duplex_episode(
             "conversation_audio": str(wav_path.relative_to(run_dir)),
         }
     except BaseException as exc:
-        timed_out = (
-            isinstance(exc, asyncio.CancelledError)
-            and deadline is not None
-            and time.monotonic() >= deadline
-        )
         write_json(
             timeout_path,
             {
@@ -864,10 +860,8 @@ async def run_duplex_episode(
         writer.emit(
             EpisodeEnded,
             runtime.now_ms,
-            status="cancelled"
-            if isinstance(exc, asyncio.CancelledError) and not timed_out
-            else "failed",
-            reason="episode_timeout" if timed_out else "episode_error",
+            status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+            reason="episode_error",
             duration_ms=runtime.now_ms,
             error_type=type(exc).__name__,
             error_message=safe_error(exc),
@@ -902,19 +896,22 @@ def build_episode(record, args, asr_client, tts_client, tts_semaphore=None):
 async def run_one_episode(
     resolved, agents, args, run_dir, episode_id, *, artifact_dir=None
 ):
-    run = (
-        run_round_robin_episode
-        if args.interaction_mode == "round-robin"
-        else run_duplex_episode
-    )
+    if args.interaction_mode == "surface5-full-duplex":
+        return await run_duplex_episode(
+            resolved,
+            agents,
+            args,
+            run_dir,
+            episode_id,
+            artifact_dir=artifact_dir,
+            deadline=time.monotonic() + EPISODE_TIMEOUT_S,
+        )
     timeout = asyncio.timeout(EPISODE_TIMEOUT_S)
     try:
-        deadline = time.monotonic() + EPISODE_TIMEOUT_S
-        options = {"artifact_dir": artifact_dir}
-        if args.interaction_mode == "surface5-full-duplex":
-            options["deadline"] = deadline
         async with timeout:
-            return await run(resolved, agents, args, run_dir, episode_id, **options)
+            return await run_round_robin_episode(
+                resolved, agents, args, run_dir, episode_id, artifact_dir=artifact_dir
+            )
     except TimeoutError:
         if not timeout.expired():
             raise
