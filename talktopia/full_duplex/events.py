@@ -138,6 +138,8 @@ class ASRUpdateEvent(EventBase):
     is_stable: bool
     revision_id: int = Field(ge=0)
     sentence_texts: dict[int, str] = Field(default_factory=dict)
+    sentence_index: int | None = Field(default=None, ge=0)
+    has_next_sentence: bool | None = None
 
 
 class ResponseLatencyEvent(EventBase):

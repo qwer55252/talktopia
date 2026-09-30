@@ -134,6 +134,8 @@ class StreamingObservation(BaseModel):
     new_stable_text: str = ""
     peer_utterance_id: str | None = None
     asr_revision_id: int = Field(default=0, ge=0)
+    sentence_index: int | None = Field(default=None, ge=0)
+    has_next_sentence: bool | None = None
     peer_speaking: bool = False
     self_speaking: bool = False
     self_active_action_type: DuplexActionType | None = None

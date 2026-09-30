@@ -649,6 +649,8 @@ class DuplexRuntime:
                 is_stable=output.is_stable,
                 revision_id=output.revision_id,
                 sentence_texts=output.sentence_texts,
+                sentence_index=output.sentence_index,
+                has_next_sentence=output.has_next_sentence,
             )
             self._latest_asr_event[output.utterance_id] = event
             if output.is_final:
@@ -918,6 +920,8 @@ class DuplexRuntime:
                     self._emit_open_delivery_prefixes(
                         frame.utterance_id, chunk_index=frame.chunk_index
                     )
+                    listener = self._utterances[frame.utterance_id].listener
+                    self._agents[listener].finish_received_sentence(frame)
                 if not frame.is_utterance_end:
                     continue
                 utterance = self._utterances[frame.utterance_id]

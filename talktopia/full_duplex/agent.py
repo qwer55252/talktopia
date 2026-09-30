@@ -151,6 +151,14 @@ class CascadedDuplexAgent(BaseAgent[DuplexObservation, DuplexAction]):
             self._incoming_utterances.add(frame.utterance_id)
         await self.asr.push_audio(frame)
 
+    def finish_received_sentence(self, frame: AudioFrame) -> None:
+        # At a chunk boundary, is_utterance_end carries SpeechChunk.is_final.
+        self.asr.finish_sentence(
+            frame.utterance_id,
+            frame.chunk_index,
+            has_next_sentence=not frame.is_utterance_end,
+        )
+
     def finish_received_audio(
         self, utterance_id: str, *, cancelled: bool = False
     ) -> None:
